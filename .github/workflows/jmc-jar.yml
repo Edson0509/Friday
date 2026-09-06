@@ -234,13 +234,16 @@ jobs:
           #   -32603（issue #10 崩溃点），必须不再出现
           # - virtualThreadTool 必须报出虚拟线程存在性与 pinning 分析（issue #11：
           #   JMC 管线丢弃 Thread.virtual 字段时旧实现只会回 "no data"）
+          # || true：Quarkus 在 stdin EOF 后不退出，java 由 timeout 兜底击杀并返回
+          # 124——命令替换作为管道末成员会把 124 传给 bash -e 直接失败。杀进程是
+          # 预期路径（响应早已写入 stdout 被捕获），真实断言在下方 grep。
           resp=$(
             (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0"}}}'; \
              echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'; \
              echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"threadCpu","arguments":{"jfr_file_path":"fixture.jfr"}}}'; \
              echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"virtualThreadTool","arguments":{"jfr_file_path":"fixture.jfr"}}}'; sleep 90) \
               | timeout 150 java --enable-preview -jar jmc-mcp-1.0.0.jar 2>/dev/null
-          )
+          ) || true
           # || true：grep 无匹配时命令替换的退出码会让 bash -e 提前退出，
           # 掩盖真实原因；交由下方的显式空值断言给出可读错误。
           tcpu=$(echo "$resp" | grep '"id":2' || true)
