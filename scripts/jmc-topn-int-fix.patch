@@ -1,0 +1,91 @@
+diff --git a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ObjectStatisticsTool.java b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ObjectStatisticsTool.java
+index 3197d86..6edbe95 100644
+--- a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ObjectStatisticsTool.java
++++ b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ObjectStatisticsTool.java
+@@ -28,14 +28,14 @@ public final class ObjectStatisticsTool {
+             @ToolArg(name = "jfr_file_path", description = "Absolute or relative path to the .jfr recording file") String jfrFilePath,
+             @ToolArg(name = "start_time", required = false, description = "Optional start time in ISO-8601 format") String startTime,
+             @ToolArg(name = "end_time", required = false, description = "Optional end time in ISO-8601 format") String endTime,
+-            @ToolArg(name = "top_n", required = false, description = "Number of top classes to return (default 10)") int topN
++            @ToolArg(name = "top_n", required = false, description = "Number of top classes to return (default 10)") Integer topN
+     ) {
+         try {
+             ObjectStatisticsResult result = appService.analyze(
+                     jfrFilePath,
+                     startTime,
+                     endTime,
+-                    topN
++                    topN != null ? topN : 10
+             );
+             String markdown = formatMarkdown(result);
+             return ToolResponse.success(markdown);
+diff --git a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadContentionTool.java b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadContentionTool.java
+index 469c447..877aee9 100644
+--- a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadContentionTool.java
++++ b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadContentionTool.java
+@@ -28,10 +28,10 @@ public final class ThreadContentionTool {
+             @ToolArg(name = "jfr_file_path", description = "Absolute or relative path to the .jfr recording file") String jfrFilePath,
+             @ToolArg(name = "start_time", required = false, description = "Optional start time in ISO-8601 format") String startTime,
+             @ToolArg(name = "end_time", required = false, description = "Optional end time in ISO-8601 format") String endTime,
+-            @ToolArg(name = "top_n", required = false, description = "Number of top contention sites to return (default 10)") int topN
++            @ToolArg(name = "top_n", required = false, description = "Number of top contention sites to return (default 10)") Integer topN
+     ) {
+         try {
+-            ThreadContentionResult result = appService.analyze(jfrFilePath, startTime, endTime, topN);
++            ThreadContentionResult result = appService.analyze(jfrFilePath, startTime, endTime, topN != null ? topN : 10);
+             String markdown = formatMarkdown(result);
+             return ToolResponse.success(markdown);
+         } catch (Exception e) {
+diff --git a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadCpuTool.java b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadCpuTool.java
+index 77514c7..c7cb716 100644
+--- a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadCpuTool.java
++++ b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadCpuTool.java
+@@ -32,10 +32,10 @@ public final class ThreadCpuTool {
+             @ToolArg(name = "start_time", required = false, description = "Optional start time in ISO-8601 format") String startTime,
+             @ToolArg(name = "end_time", required = false, description = "Optional end time in ISO-8601 format") String endTime,
+             @ToolArg(name = "package_prefix", required = false, description = "Optional package prefix to filter stack traces (e.g., 'com.mycompany')") String packagePrefix,
+-            @ToolArg(name = "top_n", required = false, description = "Number of top hot threads to return (default 10)") int topN
++            @ToolArg(name = "top_n", required = false, description = "Number of top hot threads to return (default 10)") Integer topN
+     ) {
+         try {
+-            ThreadCpuResult result = appService.analyze(jfrFilePath, startTime, endTime, packagePrefix, topN);
++            ThreadCpuResult result = appService.analyze(jfrFilePath, startTime, endTime, packagePrefix, topN != null ? topN : 10);
+             String markdown = formatMarkdown(result);
+             return ToolResponse.success(markdown);
+         } catch (Exception e) {
+diff --git a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadPoolAnalysisTool.java b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadPoolAnalysisTool.java
+index 0f40058..185d207 100644
+--- a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadPoolAnalysisTool.java
++++ b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/ThreadPoolAnalysisTool.java
+@@ -29,11 +29,11 @@ public final class ThreadPoolAnalysisTool {
+             @ToolArg(name = "jfr_file_path", description = "Absolute or relative path to the .jfr recording file") String jfrFilePath,
+             @ToolArg(name = "start_time", required = false, description = "Optional start time in ISO-8601 format") String startTime,
+             @ToolArg(name = "end_time", required = false, description = "Optional end time in ISO-8601 format") String endTime,
+-            @ToolArg(name = "top_n", required = false, description = "Number of top pools to return (default 10)") int topN
++            @ToolArg(name = "top_n", required = false, description = "Number of top pools to return (default 10)") Integer topN
+     ) {
+         try {
+             ThreadPoolAnalysisResult result = appService.analyze(
+-                    jfrFilePath, startTime, endTime, topN
++                    jfrFilePath, startTime, endTime, topN != null ? topN : 10
+             );
+             String markdown = formatMarkdown(result);
+             return ToolResponse.success(markdown);
+diff --git a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VMOperationsTool.java b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VMOperationsTool.java
+index beac2a8..4920109 100644
+--- a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VMOperationsTool.java
++++ b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VMOperationsTool.java
+@@ -29,11 +29,11 @@ public final class VMOperationsTool {
+             @ToolArg(name = "jfr_file_path", description = "Absolute or relative path to the .jfr recording file") String jfrFilePath,
+             @ToolArg(name = "start_time", required = false, description = "Optional start time in ISO-8601 format (e.g., 2023-10-27T10:00:00Z)") String startTime,
+             @ToolArg(name = "end_time", required = false, description = "Optional end time in ISO-8601 format (e.g., 2023-10-27T10:05:00Z)") String endTime,
+-            @ToolArg(name = "top_n", required = false, description = "Number of top VM operations to return (default 10)") int topN
++            @ToolArg(name = "top_n", required = false, description = "Number of top VM operations to return (default 10)") Integer topN
+ 
+     ) {
+         try {
+-            VmOperationsResult result = appService.analyze(jfrFilePath, startTime, endTime, topN);
++            VmOperationsResult result = appService.analyze(jfrFilePath, startTime, endTime, topN != null ? topN : 10);
+             String markdown = formatMarkdown(result);
+             return ToolResponse.success(markdown);
+         } catch (Exception e) {

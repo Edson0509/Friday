@@ -549,7 +549,7 @@ pub fn register_all(
         ("jfr_exceptions", "异常抛出统计：按异常类统计次数与栈。args 可选：top_n/start_time/end_time。", mapping::JfrProxyKind::Exceptions, QUERY),
         ("jfr_errors", "严重错误分析：OutOfMemoryError/StackOverflowError 等按严重度分类。args 可选：top_n/start_time/end_time。", mapping::JfrProxyKind::Errors, QUERY),
         ("jfr_safepoints", "safepoint 分析：GC 外 STW 暂停（vm operation 耗时），延迟毛刺定位。args 可选：top_n/start_time/end_time。", mapping::JfrProxyKind::Safepoints, QUERY),
-        ("jfr_virtual_threads", "虚拟线程分析：pinning 位点与执行失败（目标 JDK 21+）。args 可选：top_n/start_time/end_time。", mapping::JfrProxyKind::VirtualThreads, QUERY),
+        ("jfr_virtual_threads", "虚拟线程分析（JDK 21+）：虚拟线程存在性与规模（distinct 计数、按事件类型活动分布，基于 Thread.virtual 标志）、pinning 位点/原因/载体线程/总耗时、提交失败。无 pinning 也能判断虚拟线程是否在用。args 可选：top_n/start_time/end_time。", mapping::JfrProxyKind::VirtualThreads, QUERY),
         ("jfr_stack_trace_search", "跨 13 类事件全栈正则搜索（非截断栈）。找人/找路径利器。args 必填：class_pattern；可选 event_type/limit/start_time/end_time。", mapping::JfrProxyKind::StackTraceSearch, HEAVY),
         ("jfr_correlate", "跨维度相关性引擎：锁↔IO↔热点方法关联成瓶颈链。args 可选：dimension/top_n/start_time/end_time。", mapping::JfrProxyKind::Correlate, HEAVY),
         ("jfr_request_waterfall", "线程时序瀑布：按时间顺序串联 锁→IO→CPU→异常 事件。args 必填：thread_name；可选 max_events/start_time/end_time。", mapping::JfrProxyKind::RequestWaterfall, HEAVY),

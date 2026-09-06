@@ -53,19 +53,6 @@ impl JfrProxyKind {
             JfrProxyKind::RequestWaterfall => "smartRequestWaterfall",
         }
     }
-
-    /// 上游 bug 标记（issue #10）：threadCpu / threadContention / virtualThreadTool
-    /// 的 top_n 声明为原始 int 且 required=false（上游 6 处同病，Friday 代理的 3 处），
-    /// 缺省或显式 null 时 Quarkus invoker 对 null 拆箱 → NPE → -32603 Internal error。
-    /// build_proxy 按上游文档默认值注入 top_n=10 兜底。
-    /// ⚠ 上游根治（PR 或构建期补丁）落地后本兜底应移除——
-    /// 见 docs/superpowers/specs/2026-09-04-jmc-error-classification-followups.md §3.1。
-    pub fn needs_top_n_default(&self) -> bool {
-        matches!(
-            self,
-            JfrProxyKind::ThreadCpu | JfrProxyKind::ThreadContention | JfrProxyKind::VirtualThreads
-        )
-    }
 }
 
 /// jfr_record 参数校验：duration_secs（10..=600，默认 60）+ settings 白名单（默认 profile）。
@@ -108,17 +95,14 @@ pub fn jfr_start_command(
 /// 代理工具：local_path → jfr_file_path + args 透传合并；路径与 async 为 handler
 /// 权威值，合并后强制写入（透传对象不得覆盖）；async 固定 false（禁用上游后台
 /// 任务模式，靠 Friday 超时分层，spec §3.2）。
+/// 上游 top_n 原始 int 拆箱 NPE 已由构建期补丁根治（jmc-topn-int-fix.patch /
+/// jmc-virtual-threads-fix.patch，issue #10），无需再注入默认值。
 pub fn build_proxy(kind: JfrProxyKind, local_path: &str, extra: Option<&Value>) -> (String, Value) {
     let mut map = serde_json::Map::new();
     if let Some(Value::Object(extra)) = extra {
         for (k, v) in extra {
             map.insert(k.clone(), v.clone());
         }
-    }
-    // 上游 bug 兜底（issue #10）：受影响工具缺省/显式 null 的 top_n 会被上游拆箱 NPE，
-    // 强制注入文档默认值 10；显式传值不覆盖。
-    if kind.needs_top_n_default() && map.get("top_n").map(|v| v.is_null()).unwrap_or(true) {
-        map.insert("top_n".to_string(), json!(10));
     }
     // 最后强制覆盖：路径由 handler 解析（local_path 是唯一来源）；async 压回 false
     map.insert("jfr_file_path".to_string(), json!(local_path));
@@ -219,36 +203,23 @@ mod tests {
         assert_eq!(args.as_object().unwrap().len(), 2);
     }
 
-    /// issue #10 回归：受影响工具（threadCpu 等）缺省 top_n 时必须注入默认值 10，
-    /// 显式传值不覆盖，显式 null 视同缺省（上游对 null 同样拆箱 NPE）。
+    /// issue #10 根治回归：上游 top_n 拆箱 NPE 已由构建期补丁修复
+    /// （jmc-topn-int-fix.patch / jmc-virtual-threads-fix.patch），
+    /// build_proxy 不再注入 top_n 默认值——缺省透传（上游 Integer + 判空兜底）。
     #[test]
-    fn test_build_proxy_injects_top_n_default_for_affected_kinds() {
-        // 缺省 → 注入 10
-        let (name, args) = build_proxy(JfrProxyKind::ThreadCpu, "/tmp/a.jfr", None);
-        assert_eq!(name, "threadCpu");
-        assert_eq!(args["top_n"], 10);
-        // 显式传值 → 不覆盖
-        let (_, args) = build_proxy(
-            JfrProxyKind::ThreadCpu,
-            "/tmp/a.jfr",
-            Some(&json!({"top_n": 5})),
+    fn test_build_proxy_no_top_n_injection_after_upstream_fix() {
+        let (_, args) = build_proxy(JfrProxyKind::ThreadCpu, "/tmp/a.jfr", None);
+        assert!(
+            args.get("top_n").is_none(),
+            "top_n must not be injected anymore (upstream patch handles the default)"
         );
+        let (_, args) = build_proxy(JfrProxyKind::VirtualThreads, "/tmp/a.jfr", Some(&json!({"top_n": null})));
+        assert!(
+            args.get("top_n").map(|v| v.is_null()).unwrap_or(false),
+            "explicit null must be passed through untouched (upstream handles it)"
+        );
+        let (_, args) = build_proxy(JfrProxyKind::ThreadContention, "/tmp/a.jfr", Some(&json!({"top_n": 5})));
         assert_eq!(args["top_n"], 5);
-        // 显式 null → 视同缺省，替换为 10
-        let (_, args) = build_proxy(
-            JfrProxyKind::ThreadCpu,
-            "/tmp/a.jfr",
-            Some(&json!({"top_n": null})),
-        );
-        assert_eq!(args["top_n"], 10);
-        // 其余两个受影响 kind 同样注入
-        let (_, args) = build_proxy(JfrProxyKind::ThreadContention, "/tmp/a.jfr", None);
-        assert_eq!(args["top_n"], 10);
-        let (_, args) = build_proxy(JfrProxyKind::VirtualThreads, "/tmp/a.jfr", None);
-        assert_eq!(args["top_n"], 10);
-        // 不受影响 kind（上游用 Integer 判空）不注入
-        let (_, args) = build_proxy(JfrProxyKind::HotMethods, "/tmp/a.jfr", None);
-        assert!(args.get("top_n").is_none(), "unaffected kinds must not get top_n injected");
     }
 
     #[test]

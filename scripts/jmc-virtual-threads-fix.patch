@@ -1,0 +1,728 @@
+diff --git a/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadEventCount.java b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadEventCount.java
+new file mode 100644
+index 0000000..d07a18f
+--- /dev/null
++++ b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadEventCount.java
+@@ -0,0 +1,8 @@
++package io.github.deplague.jmcmcp.domain.model;
++
++/**
++ * Number of JFR events attributed to a virtual thread, by event type.
++ * Used to describe virtual thread activity (e.g. on-CPU execution samples).
++ */
++public record VirtualThreadEventCount(String eventType, long count) {
++}
+diff --git a/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadTally.java b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadTally.java
+new file mode 100644
+index 0000000..d354150
+--- /dev/null
++++ b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadTally.java
+@@ -0,0 +1,8 @@
++package io.github.deplague.jmcmcp.domain.model;
++
++/**
++ * A label/count pair used for virtual thread breakdowns
++ * (pinning reasons, carrier threads).
++ */
++public record VirtualThreadTally(String label, long count) {
++}
+diff --git a/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadsResult.java b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadsResult.java
+index 91dde0a..f0abe61 100644
+--- a/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadsResult.java
++++ b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/model/VirtualThreadsResult.java
+@@ -4,13 +4,48 @@ import java.util.List;
+ 
+ /**
+  * Result of virtual thread analysis.
++ *
++ * <p>Friday patch (issue #11): extended beyond pinning/failure counts with
++ * presence and activity data derived from the {@code Thread.virtual} flag
++ * that every JDK 21+ recording carries on its thread constants.</p>
++ *
++ * @param virtualFieldPresent    whether any thread constant in the recording carries the
++ *                               {@code virtual} flag (false for recordings from JDKs
++ *                               without virtual threads; presence cannot be determined)
++ * @param distinctVirtualThreads number of distinct virtual threads observed (events
++ *                               attributed to a virtual thread, or explicit
++ *                               {@code javaThreadId} fields on jdk.VirtualThreadStart /
++ *                               jdk.VirtualThreadSubmitFailed)
++ * @param distinctCapped         true when distinct-thread tracking hit
++ *                               {@link VirtualThreadsService#MAX_TRACKED_THREADS} and the
++ *                               count is a lower bound
++ * @param virtualThreadEventCounts events attributed to virtual threads, by event type
++ * @param pinnedCount            number of jdk.VirtualThreadPinned events
++ * @param pinnedTotalNanos       sum of pinning durations
++ * @param pinningSites           top pinning sites (top stack frames)
++ * @param pinnedReasons          pinning events grouped by the {@code pinnedReason} field
++ *                               (JDK 24+ recordings only; empty otherwise)
++ * @param pinnedCarriers         pinning events grouped by carrier thread
++ *                               ({@code carrierThread} field, JDK 24+ recordings only)
++ * @param submitFailedCount      number of jdk.VirtualThreadSubmitFailed events
++ * @param submitFailures         submission failures grouped by exception message
++ * @param sleepFailedCount       number of jdk.VirtualThreadSleepFailed events
++ * @param sleepFailures          sleep failures grouped by exception message
++ * @param hasData                whether any virtual thread evidence was found at all
+  */
+ public record VirtualThreadsResult(
++        boolean virtualFieldPresent,
++        long distinctVirtualThreads,
++        boolean distinctCapped,
++        List<VirtualThreadEventCount> virtualThreadEventCounts,
+         long pinnedCount,
+-        long submitFailedCount,
+-        long sleepFailedCount,
++        long pinnedTotalNanos,
+         List<VirtualThreadPinningSite> pinningSites,
++        List<VirtualThreadTally> pinnedReasons,
++        List<VirtualThreadTally> pinnedCarriers,
++        long submitFailedCount,
+         List<VirtualThreadFailure> submitFailures,
++        long sleepFailedCount,
+         List<VirtualThreadFailure> sleepFailures,
+         boolean hasData
+ ) {
+diff --git a/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/service/VirtualThreadsService.java b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/service/VirtualThreadsService.java
+index 8e63297..47f3512 100644
+--- a/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/service/VirtualThreadsService.java
++++ b/01-domain/src/main/java/io/github/deplague/jmcmcp/domain/service/VirtualThreadsService.java
+@@ -1,106 +1,321 @@
+ package io.github.deplague.jmcmcp.domain.service;
+ 
++import io.github.deplague.jmcmcp.domain.model.VirtualThreadEventCount;
+ import io.github.deplague.jmcmcp.domain.model.VirtualThreadFailure;
+ import io.github.deplague.jmcmcp.domain.model.VirtualThreadPinningSite;
+ import io.github.deplague.jmcmcp.domain.model.VirtualThreadsResult;
+-import io.github.deplague.jmcmcp.domain.port.JfrAccessorRepository;
+-import io.github.deplague.jmcmcp.domain.port.JfrQuantityAggregator;
++import io.github.deplague.jmcmcp.domain.model.VirtualThreadTally;
+ import jakarta.enterprise.context.ApplicationScoped;
+-import jakarta.inject.Inject;
+-import lombok.RequiredArgsConstructor;
+-import lombok.extern.slf4j.Slf4j;
+-import org.openjdk.jmc.common.item.*;
++import jdk.jfr.consumer.RecordedEvent;
++import jdk.jfr.consumer.RecordedFrame;
++import jdk.jfr.consumer.RecordedStackTrace;
++import jdk.jfr.consumer.RecordedThread;
++import jdk.jfr.consumer.RecordingFile;
+ 
+-import java.util.ArrayList;
++import java.io.IOException;
++import java.nio.file.Path;
++import java.time.Instant;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+-
+-import static io.github.deplague.jmcmcp.domain.service.JfrStackTraceService.formatStackTrace;
+-import static java.util.List.of;
+-import static java.util.Map.Entry;
+-import static org.openjdk.jmc.common.item.ItemFilters.type;
++import java.util.Set;
+ 
+ /**
+  * Pure domain service for virtual thread analysis.
++ *
++ * <p>Friday patch (issue #11): rewritten on top of {@code jdk.jfr.consumer}
++ * instead of the JMC {@code IItemCollection} pipeline. JMC's parser maps the
++ * JFR "thread" type onto a fixed internal class
++ * ({@code StructTypes.JfrThread}) that has no "virtual" member, so the
++ * {@code Thread.virtual} boolean carried by every JDK 21+ recording is dropped
++ * with the warning "Could not find field with name 'virtual' in reader for
++ * 'thread'" (true for every JMC release to date). The previous implementation
++ * could therefore only see the dedicated jdk.VirtualThread* events and could
++ * not tell whether virtual threads were in use at all, which made the tool
++ * report "no data" for active-but-healthy virtual thread workloads.</p>
++ *
++ * <p>{@code jdk.jfr.consumer} is the JDK's own parser: {@code getValue}
++ * resolves fields from the recording metadata, so {@code getValue("virtual")}
++ * on a {@code RecordedThread} works for any JDK 21+ recording, including when
++ * the worker JVM is older than the JVM that produced the recording.</p>
+  */
+-@Slf4j
+ @ApplicationScoped
+-@RequiredArgsConstructor(onConstructor_ = @Inject)
+-public final class VirtualThreadsService {
+-    private final JfrAccessorRepository jfrAccessorRepository;
+-    private final JfrQuantityAggregator jfrQuantityAggregator;
+-
+-    public VirtualThreadsResult analyze(IItemCollection events, int topN) {
+-        IItemCollection pinned = events.apply(type("jdk.VirtualThreadPinned"));
+-        IItemCollection submitFailed = events.apply(type("jdk.VirtualThreadSubmitFailed"));
+-        IItemCollection sleepFailed = events.apply(type("jdk.VirtualThreadSleepFailed"));
+-
+-        long pinnedCount = jfrQuantityAggregator.count(pinned);
+-        long submitFailedCount = jfrQuantityAggregator.count(submitFailed);
+-        long sleepFailedCount = jfrQuantityAggregator.count(sleepFailed);
+-
+-        if (pinnedCount == 0 && submitFailedCount == 0 && sleepFailedCount == 0) {
+-            return new VirtualThreadsResult(0, 0, 0, of(), of(), of(), false);
+-        }
++public class VirtualThreadsService {
++
++    /** Upper bound for distinct-thread bookkeeping so pathological recordings cannot exhaust memory. */
++    public static final int MAX_TRACKED_THREADS = 10_000;
++
++    private static final String PINNED = "jdk.VirtualThreadPinned";
++    private static final String SUBMIT_FAILED = "jdk.VirtualThreadSubmitFailed";
++    private static final String SLEEP_FAILED = "jdk.VirtualThreadSleepFailed";
++    private static final String VT_START = "jdk.VirtualThreadStart";
++
++    /** Epoch-second threshold below which numeric time filters are relative-second mistakes (mirrors JfrProviderImpl). */
++    private static final long MIN_VALID_EPOCH_SECONDS = 946_684_800L; // 2000-01-01T00:00:00Z
++    private static final long EPOCH_MS_THRESHOLD = MIN_VALID_EPOCH_SECONDS * 1_000L;
++
++    public VirtualThreadsResult analyzeFile(String filePath, String startTime, String endTime, int topN)
++            throws IOException {
++        Instant start = parseInstant(startTime);
++        Instant end = parseInstant(endTime);
++
++        boolean virtualFieldPresent = false;
++        Set<Long> seenVirtualThreadIds = new HashSet<>();
++        boolean distinctCapped = false;
++        Map<String, Long> virtualThreadEvents = new HashMap<>();
++
++        long pinnedCount = 0;
++        long pinnedTotalNanos = 0;
++        Map<String, Long> pinningByStack = new HashMap<>();
++        Map<String, Long> pinningByReason = new HashMap<>();
++        Map<String, Long> pinningByCarrier = new HashMap<>();
++
++        long submitFailedCount = 0;
++        Map<String, Long> submitFailures = new HashMap<>();
++        long sleepFailedCount = 0;
++        Map<String, Long> sleepFailures = new HashMap<>();
+ 
+-        List<VirtualThreadPinningSite> pinningSites = new ArrayList<>();
+-        if (pinnedCount > 0) {
+-            Map<String, Long> pinningMap = new HashMap<>();
+-            for (IItemIterable iterable : pinned) {
+-                IType<?> type = iterable.getType();
+-                IMemberAccessor<Object, IItem> stackAccessor = jfrAccessorRepository.getAccessor(type, "stackTrace");
+-                if (stackAccessor != null) {
+-                    for (IItem item : iterable) {
+-                        Object stack = stackAccessor.getMember(item);
+-                        if (stack != null) {
+-                            String trace = formatStackTrace(stack, 5);
+-                            pinningMap.merge(trace, 1L, Long::sum);
++        try (RecordingFile recording = new RecordingFile(Path.of(filePath))) {
++            while (recording.hasMoreEvents()) {
++                RecordedEvent event = recording.readEvent();
++                if (!inRange(event, start, end)) {
++                    continue;
++                }
++                String name = event.getEventType().getName();
++
++                switch (name) {
++                    case PINNED -> {
++                        pinnedCount++;
++                        pinnedTotalNanos += event.getDuration().toNanos();
++                        pinningByStack.merge(topFrames(event.getStackTrace()), 1L, Long::sum);
++                        // pinnedReason / carrierThread are JDK 24+ fields; picked up when present.
++                        mergeIfPresent(pinningByReason, readStringField(event, "pinnedReason"));
++                        RecordedThread carrier = readThreadField(event, "carrierThread");
++                        if (carrier != null) {
++                            pinningByCarrier.merge(threadLabel(carrier), 1L, Long::sum);
+                         }
+                     }
++                    case SUBMIT_FAILED -> {
++                        submitFailedCount++;
++                        submitFailures.merge(orUnknown(readStringField(event, "exceptionMessage")), 1L, Long::sum);
++                    }
++                    case SLEEP_FAILED -> {
++                        sleepFailedCount++;
++                        sleepFailures.merge(orUnknown(readStringField(event, "exceptionMessage")), 1L, Long::sum);
++                    }
++                    default -> {
++                        // not a dedicated virtual thread event
++                    }
+                 }
+-            }
+ 
+-            pinningSites = pinningMap.entrySet().stream()
+-                    .sorted(Entry.<String, Long>comparingByValue().reversed())
+-                    .limit(topN)
+-                    .map(e -> new VirtualThreadPinningSite(
+-                            e.getKey(),
+-                            e.getValue(),
+-                            (e.getValue() * 100.0) / pinnedCount
+-                    ))
+-                    .toList();
++                // Presence and activity: any event attributed to a thread marked virtual.
++                RecordedThread eventThread = event.getThread();
++                if (eventThread != null) {
++                    Boolean virtual = readVirtualFlag(eventThread);
++                    if (virtual != null) {
++                        virtualFieldPresent = true;
++                        if (virtual) {
++                            if (seenVirtualThreadIds.size() < MAX_TRACKED_THREADS) {
++                                seenVirtualThreadIds.add(threadIdentity(eventThread));
++                            } else {
++                                distinctCapped = true;
++                            }
++                            virtualThreadEvents.merge(name, 1L, Long::sum);
++                        }
++                    }
++                }
++
++                // jdk.VirtualThreadStart / jdk.VirtualThreadSubmitFailed name the virtual
++                // thread explicitly (javaThreadId field) even when their event thread is
++                // another thread; count those identities as well.
++                if (VT_START.equals(name) || SUBMIT_FAILED.equals(name)) {
++                    Long virtualThreadId = readLongField(event, "javaThreadId");
++                    if (virtualThreadId != null && virtualThreadId != 0) {
++                        virtualFieldPresent = true;
++                        if (seenVirtualThreadIds.size() < MAX_TRACKED_THREADS) {
++                            seenVirtualThreadIds.add(virtualThreadId);
++                        } else {
++                            distinctCapped = true;
++                        }
++                    }
++                }
++            }
+         }
+ 
+-        List<VirtualThreadFailure> submitFailures = extractFailures(submitFailed);
+-        List<VirtualThreadFailure> sleepFailures = extractFailures(sleepFailed);
++        boolean hasData = !seenVirtualThreadIds.isEmpty() || pinnedCount > 0 || submitFailedCount > 0
++                || sleepFailedCount > 0;
++
++        final long totalPinned = pinnedCount;
++        List<VirtualThreadPinningSite> pinningSites = topEntries(pinningByStack, topN).stream()
++                .map(e -> new VirtualThreadPinningSite(e.getKey(), e.getValue(),
++                        totalPinned == 0 ? 0 : (e.getValue() * 100.0) / totalPinned))
++                .toList();
+ 
+         return new VirtualThreadsResult(
++                virtualFieldPresent,
++                seenVirtualThreadIds.size(),
++                distinctCapped,
++                topEntries(virtualThreadEvents, topN).stream()
++                        .map(e -> new VirtualThreadEventCount(e.getKey(), e.getValue()))
++                        .toList(),
+                 pinnedCount,
++                pinnedTotalNanos,
++                pinningSites,
++                topEntries(pinningByReason, topN).stream()
++                        .map(e -> new VirtualThreadTally(e.getKey(), e.getValue()))
++                        .toList(),
++                topEntries(pinningByCarrier, topN).stream()
++                        .map(e -> new VirtualThreadTally(e.getKey(), e.getValue()))
++                        .toList(),
+                 submitFailedCount,
++                topEntries(submitFailures, topN).stream()
++                        .map(e -> new VirtualThreadFailure(e.getKey(), e.getValue()))
++                        .toList(),
+                 sleepFailedCount,
+-                pinningSites,
+-                submitFailures,
+-                sleepFailures,
+-                true
++                topEntries(sleepFailures, topN).stream()
++                        .map(e -> new VirtualThreadFailure(e.getKey(), e.getValue()))
++                        .toList(),
++                hasData
+         );
+     }
+ 
+-    private List<VirtualThreadFailure> extractFailures(IItemCollection events) {
+-        Map<String, Long> exceptions = new HashMap<>();
+-        for (IItemIterable iterable : events) {
+-            IType<?> type = iterable.getType();
+-            IMemberAccessor<String, IItem> msgAccessor = jfrAccessorRepository.getAccessor(type, "exception");
+-            if (msgAccessor != null) {
+-                for (IItem item : iterable) {
+-                    String msg = msgAccessor.getMember(item);
+-                    exceptions.merge(msg != null ? msg : "Unknown", 1L, Long::sum);
+-                }
++    private static boolean inRange(RecordedEvent event, Instant start, Instant end) {
++        if (start != null && event.getStartTime().isBefore(start)) {
++            return false;
++        }
++        return end == null || !event.getEndTime().isAfter(end);
++    }
++
++    /**
++     * Mirrors {@code JfrProviderImpl.parseTimeQuantity}: ISO-8601, then epoch
++     * milliseconds, then epoch seconds; small numeric values are relative-second
++     * mistakes and are ignored. Filtering happens in {@link Instant} space here
++     * because the analysis reads the recording with {@code jdk.jfr.consumer}.
++     */
++    private static Instant parseInstant(String raw) {
++        if (raw == null || raw.isBlank()) {
++            return null;
++        }
++        try {
++            return Instant.parse(raw);
++        } catch (Exception ignored) {
++            // fall through to numeric interpretation
++        }
++        try {
++            long numeric = Long.parseLong(raw.strip());
++            if (numeric >= EPOCH_MS_THRESHOLD) {
++                return Instant.ofEpochMilli(numeric);
+             }
++            if (numeric >= MIN_VALID_EPOCH_SECONDS) {
++                return Instant.ofEpochSecond(numeric);
++            }
++            return null;
++        } catch (NumberFormatException ignored) {
++            return null;
++        }
++    }
++
++    /**
++     * Field access helpers that tolerate recordings from JDKs that do not
++     * define the field ({@code RecordedObject.getValue} throws
++     * {@code IllegalArgumentException} for unknown field names).
++     */
++    private static String readStringField(RecordedEvent event, String field) {
++        try {
++            Object value = event.getValue(field);
++            return value == null ? null : String.valueOf(value);
++        } catch (IllegalArgumentException notPresent) {
++            return null;
++        }
++    }
++
++    private static Long readLongField(RecordedEvent event, String field) {
++        try {
++            Object value = event.getValue(field);
++            return value instanceof Number number ? number.longValue() : null;
++        } catch (IllegalArgumentException notPresent) {
++            return null;
++        }
++    }
++
++    private static RecordedThread readThreadField(RecordedEvent event, String field) {
++        try {
++            Object value = event.getValue(field);
++            return value instanceof RecordedThread thread ? thread : null;
++        } catch (IllegalArgumentException notPresent) {
++            return null;
++        }
++    }
++
++    /** Returns null when the recording carries no {@code Thread.virtual} flag (JDK without virtual threads). */
++    private static Boolean readVirtualFlag(RecordedThread thread) {
++        try {
++            return thread.getValue("virtual") instanceof Boolean flag ? flag : null;
++        } catch (IllegalArgumentException notPresent) {
++            return null;
++        }
++    }
++
++    private static long threadIdentity(RecordedThread thread) {
++        long javaThreadId = thread.getJavaThreadId();
++        if (javaThreadId != 0) {
++            return javaThreadId;
++        }
++        long osThreadId = thread.getOSThreadId();
++        if (osThreadId != 0) {
++            return osThreadId;
+         }
+-        return exceptions.entrySet().stream()
+-                .sorted(Entry.<String, Long>comparingByValue().reversed())
+-                .map(e -> new VirtualThreadFailure(e.getKey(), e.getValue()))
++        // Thread constants without ids are rare; identity hash may overcount across
++        // chunks, but bookkeeping is capped by MAX_TRACKED_THREADS anyway.
++        return System.identityHashCode(thread);
++    }
++
++    private static String threadLabel(RecordedThread thread) {
++        String name = thread.getJavaName() != null ? thread.getJavaName() : thread.getOSName();
++        return name != null ? name : "thread#" + threadIdentity(thread);
++    }
++
++    private static void mergeIfPresent(Map<String, Long> target, String key) {
++        if (key != null) {
++            target.merge(key, 1L, Long::sum);
++        }
++    }
++
++    private static String orUnknown(String value) {
++        return value == null ? "Unknown" : value;
++    }
++
++    private static String topFrames(RecordedStackTrace stackTrace) {
++        if (stackTrace == null || stackTrace.getFrames() == null || stackTrace.getFrames().isEmpty()) {
++            return "<no stack trace>";
++        }
++        List<RecordedFrame> frames = stackTrace.getFrames();
++        StringBuilder sb = new StringBuilder();
++        int limit = Math.min(5, frames.size());
++        for (int i = 0; i < limit; i++) {
++            if (i > 0) {
++                sb.append(" <- ");
++            }
++            RecordedFrame frame = frames.get(i);
++            if (frame.getMethod() == null) {
++                sb.append('?');
++            } else {
++                sb.append(frame.getMethod().getType() != null ? frame.getMethod().getType().getName() : "?")
++                        .append('.')
++                        .append(frame.getMethod().getName());
++            }
++            if (frame.getLineNumber() >= 0) {
++                sb.append(':').append(frame.getLineNumber());
++            }
++        }
++        return sb.toString();
++    }
++
++    private static List<Map.Entry<String, Long>> topEntries(Map<String, Long> counts, int limit) {
++        return counts.entrySet().stream()
++                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
++                .limit(Math.max(1, limit))
+                 .toList();
+     }
+ }
+diff --git a/02-application/src/main/java/io/github/deplague/jmcmcp/application/service/VirtualThreadsApplicationService.java b/02-application/src/main/java/io/github/deplague/jmcmcp/application/service/VirtualThreadsApplicationService.java
+index 6cccaf3..fcd609b 100644
+--- a/02-application/src/main/java/io/github/deplague/jmcmcp/application/service/VirtualThreadsApplicationService.java
++++ b/02-application/src/main/java/io/github/deplague/jmcmcp/application/service/VirtualThreadsApplicationService.java
+@@ -6,7 +6,6 @@ import io.github.deplague.jmcmcp.domain.service.VirtualThreadsService;
+ import jakarta.enterprise.context.ApplicationScoped;
+ import jakarta.inject.Inject;
+ import lombok.RequiredArgsConstructor;
+-import org.openjdk.jmc.common.item.IItemCollection;
+ 
+ import java.io.IOException;
+ 
+@@ -20,9 +19,17 @@ public class VirtualThreadsApplicationService {
+     private final JfrProvider jfrProvider;
+     private final VirtualThreadsService virtualThreadsService;
+ 
+-    public VirtualThreadsResult analyze(String filePath, String startTime, String endTime, int topN) throws IOException {
+-        IItemCollection allEvents = jfrProvider.loadRecording(filePath);
+-        IItemCollection events = jfrProvider.filterByTimeRange(allEvents, startTime, endTime);
+-        return virtualThreadsService.analyze(events, topN);
++    /**
++     * Friday patch (issue #11): the domain service now reads the recording with
++     * jdk.jfr.consumer (see {@link VirtualThreadsService}) instead of the JMC
++     * IItemCollection, so this orchestration passes the file path through.
++     * jfrProvider.loadRecording is still called first: it enforces
++     * RecordingAccessController policy and warms the JMC recording cache that
++     * every other tool relies on.
++     */
++    public VirtualThreadsResult analyzeFile(String filePath, String startTime, String endTime, int topN)
++            throws IOException {
++        jfrProvider.loadRecording(filePath);
++        return virtualThreadsService.analyzeFile(filePath, startTime, endTime, topN);
+     }
+ }
+diff --git a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/api/AnalysisDispatcher.java b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/api/AnalysisDispatcher.java
+index 7f1ff40..fe2ed30 100644
+--- a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/api/AnalysisDispatcher.java
++++ b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/api/AnalysisDispatcher.java
+@@ -138,7 +138,7 @@ public class AnalysisDispatcher {
+             case "system-health" -> systemHealthService.analyze(filePath, startTime, endTime);
+             case "container-metrics" -> containerService.analyze(filePath, startTime, endTime);
+             case "virtual-threads" ->
+-                    virtualThreadsService.analyze(filePath, startTime, endTime, intParam(p, "topN", 20));
++                    virtualThreadsService.analyzeFile(filePath, startTime, endTime, intParam(p, "topN", 20));
+             case "quick-analysis" -> quickService.analyze(filePath, startTime, endTime, strParam(p, "focus", null));
+             case "high-cpu-diagnostic" ->
+                     highCpuService.analyze(filePath, startTime, endTime, strParam(p, "packagePrefix", null));
+diff --git a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsTool.java b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsTool.java
+index 2b8366c..d92f2ca 100644
+--- a/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsTool.java
++++ b/03-infrastructure/src/main/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsTool.java
+@@ -2,6 +2,7 @@ package io.github.deplague.jmcmcp.infrastructure.mcp;
+ 
+ import io.github.deplague.jmcmcp.application.service.VirtualThreadsApplicationService;
+ import io.github.deplague.jmcmcp.domain.model.VirtualThreadsResult;
++import io.github.deplague.jmcmcp.domain.service.VirtualThreadsService;
+ import io.quarkiverse.mcp.server.Tool;
+ import io.quarkiverse.mcp.server.ToolArg;
+ import io.quarkiverse.mcp.server.ToolResponse;
+@@ -20,21 +21,19 @@ import lombok.extern.slf4j.Slf4j;
+ @ApplicationScoped
+ public final class VirtualThreadsTool {
+ 
+-    private static final String NAME = "virtual_threads";
+-
+     private final VirtualThreadsApplicationService appService;
+ 
+     @RunOnVirtualThread
+-    @Tool(description = "Analyze virtual thread pinning sites and execution failures (Java 21+).")
++    @Tool(description = "Analyze virtual thread activity, pinning sites and execution failures (Java 21+).")
+     public ToolResponse virtualThreadTool(
+             @ToolArg(name = "jfr_file_path", description = "Absolute or relative path to the .jfr recording file") String jfrFilePath,
+             @ToolArg(name = "start_time", required = false, description = "Optional start time in ISO-8601 format (e.g., 2023-10-27T10:00:00Z)") String startTime,
+             @ToolArg(name = "end_time", required = false, description = "Optional end time in ISO-8601 format (e.g., 2023-10-27T10:05:00Z)") String endTime,
+-            @ToolArg(name = "top_n", required = false, description = "Number of top VM operations to return (default 10)") int topN
++            @ToolArg(name = "top_n", required = false, description = "Number of top entries to return (default 10)") Integer topN
+     ) {
+         try {
+-            VirtualThreadsResult result = appService.analyze(
+-                    jfrFilePath, startTime, endTime, topN
++            VirtualThreadsResult result = appService.analyzeFile(
++                    jfrFilePath, startTime, endTime, topN != null ? topN : 10
+             );
+             String markdown = formatMarkdown(result);
+             return ToolResponse.success(markdown);
+@@ -45,22 +44,51 @@ public final class VirtualThreadsTool {
+ 
+     private String formatMarkdown(VirtualThreadsResult result) {
+         if (!result.hasData()) {
+-            return "# Virtual Thread Analysis\n\nNo virtual thread pinning or failure events found in the recording. Virtual threads may not be in use, or JFR events are not enabled.";
++            if (!result.virtualFieldPresent()) {
++                return "# Virtual Thread Analysis\n\n"
++                        + "No virtual thread events found, and this recording carries no `Thread.virtual` flag "
++                        + "(produced by a JDK without virtual threads). Virtual thread presence cannot be "
++                        + "determined from this recording.\n";
++            }
++            return "# Virtual Thread Analysis\n\n"
++                    + "No virtual thread activity detected: no pinning events, no submission failures, and no "
++                    + "thread marked `virtual` appeared in any recorded event. If the application uses virtual "
++                    + "threads they were idle or too short-lived to be sampled during this recording window "
++                    + "(execution sampling may miss them; consider a longer recording).\n";
+         }
+ 
+         StringBuilder sb = new StringBuilder();
+         sb.append("# Virtual Thread Analysis\n\n");
+ 
++        if (result.distinctVirtualThreads() > 0) {
++            sb.append("Virtual threads detected: **").append(result.distinctVirtualThreads()).append(" distinct**");
++            if (result.distinctCapped()) {
++                sb.append(" (").append(VirtualThreadsService.MAX_TRACKED_THREADS).append("+, tracking capped)");
++            }
++            sb.append("\n\n");
++            if (!result.virtualThreadEventCounts().isEmpty()) {
++                sb.append("## Virtual Thread Activity\n\n");
++                sb.append("| Event Type | Count |\n");
++                sb.append("|---|---|\n");
++                for (var entry : result.virtualThreadEventCounts()) {
++                    sb.append("| `").append(escapeCell(entry.eventType())).append("` | ")
++                            .append(entry.count()).append(" |\n");
++                }
++                sb.append("\n");
++            }
++        }
++
+         if (result.pinnedCount() > 0) {
+             sb.append("## Pinning Summary\n\n");
+-            sb.append("- **Total Pinned Events:** ").append(result.pinnedCount()).append("\n\n");
++            sb.append("- **Total Pinned Events:** ").append(result.pinnedCount()).append("\n");
++            sb.append("- **Total Pinned Time:** ").append(formatNanos(result.pinnedTotalNanos())).append("\n\n");
+ 
+             sb.append("### Top Pinning Sites\n\n");
+             sb.append("| Stack Trace (top 5 frames) | Count | Percentage |\n");
+             sb.append("|----------------------------|-------|------------|\n");
+             for (var site : result.pinningSites()) {
+                 sb.append("| `")
+-                        .append(site.stackTrace().replace("\n", "`<br>`"))
++                        .append(escapeCell(site.stackTrace()))
+                         .append("` | ")
+                         .append(site.count())
+                         .append(" | ")
+@@ -68,6 +96,26 @@ public final class VirtualThreadsTool {
+                         .append(" |\n");
+             }
+             sb.append("\n");
++
++            if (!result.pinnedReasons().isEmpty()) {
++                sb.append("### Pinning Reasons\n\n");
++                sb.append("| Reason | Count |\n");
++                sb.append("|---|---|\n");
++                for (var reason : result.pinnedReasons()) {
++                    sb.append("| `").append(escapeCell(reason.label())).append("` | ").append(reason.count()).append(" |\n");
++                }
++                sb.append("\n");
++            }
++
++            if (!result.pinnedCarriers().isEmpty()) {
++                sb.append("### Carrier Threads\n\n");
++                sb.append("| Carrier | Count |\n");
++                sb.append("|---|---|\n");
++                for (var carrier : result.pinnedCarriers()) {
++                    sb.append("| `").append(escapeCell(carrier.label())).append("` | ").append(carrier.count()).append(" |\n");
++                }
++                sb.append("\n");
++            }
+         }
+ 
+         if (result.submitFailedCount() > 0) {
+@@ -75,7 +123,7 @@ public final class VirtualThreadsTool {
+             sb.append("| Exception | Count |\n");
+             sb.append("|-----------|-------|\n");
+             for (var failure : result.submitFailures()) {
+-                sb.append("| ").append(failure.exception()).append(" | ").append(failure.count()).append(" |\n");
++                sb.append("| ").append(escapeCell(failure.exception())).append(" | ").append(failure.count()).append(" |\n");
+             }
+             sb.append("\n");
+         }
+@@ -85,11 +133,23 @@ public final class VirtualThreadsTool {
+             sb.append("| Exception | Count |\n");
+             sb.append("|-----------|-------|\n");
+             for (var failure : result.sleepFailures()) {
+-                sb.append("| ").append(failure.exception()).append(" | ").append(failure.count()).append(" |\n");
++                sb.append("| ").append(escapeCell(failure.exception())).append(" | ").append(failure.count()).append(" |\n");
+             }
+             sb.append("\n");
+         }
+ 
+         return sb.toString();
+     }
++
++    private static String escapeCell(String value) {
++        return value.replace("|", "\\|").replace("\n", " ").replace("\r", " ");
++    }
++
++    private static String formatNanos(long nanos) {
++        double millis = nanos / 1_000_000.0;
++        if (millis < 1_000.0) {
++            return String.format("%.1f ms", millis);
++        }
++        return String.format("%.1f s", millis / 1_000.0);
++    }
+ }
+diff --git a/03-infrastructure/src/test/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsToolTest.java b/03-infrastructure/src/test/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsToolTest.java
+index c7cb654..0e725c2 100644
+--- a/03-infrastructure/src/test/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsToolTest.java
++++ b/03-infrastructure/src/test/java/io/github/deplague/jmcmcp/infrastructure/mcp/VirtualThreadsToolTest.java
+@@ -1,8 +1,6 @@
+ package io.github.deplague.jmcmcp.infrastructure.mcp;
+ 
+-import io.github.deplague.jmcmcp.infrastructure.jfr.JfrAccessorRepositoryImpl;
+ import io.github.deplague.jmcmcp.infrastructure.jfr.JfrProviderImpl;
+-import io.github.deplague.jmcmcp.infrastructure.jfr.JfrQuantityAggregatorImpl;
+ import io.github.deplague.jmcmcp.application.port.JfrProvider;
+ import io.github.deplague.jmcmcp.application.service.VirtualThreadsApplicationService;
+ import io.github.deplague.jmcmcp.domain.service.VirtualThreadsService;
+@@ -47,9 +45,7 @@ class VirtualThreadsToolTest {
+         cache = new JfrRecordingCache();
+         RecordingAccessController accessController = new RecordingAccessController();
+         JfrProvider jfrProvider = new JfrProviderImpl(cache, accessController);
+-        JfrAccessorRepositoryImpl accessorRepo = new JfrAccessorRepositoryImpl();
+-        JfrQuantityAggregatorImpl quantityAgg = new JfrQuantityAggregatorImpl(accessorRepo);
+-        VirtualThreadsService domainService = new VirtualThreadsService(accessorRepo, quantityAgg);
++        VirtualThreadsService domainService = new VirtualThreadsService();
+         VirtualThreadsApplicationService appService = new VirtualThreadsApplicationService(jfrProvider, domainService);
+         tool = new VirtualThreadsTool(appService);
+     }
+@@ -77,8 +73,9 @@ class VirtualThreadsToolTest {
+         assertThat(result.isError()).isFalse();
+         String text = extractText(result);
+ 
+-        if (!text.contains("Pinning Summary") && !text.contains("Submission Failures") && !text.contains("Sleep Failures")) {
+-            assertThat(text).contains("No virtual thread pinning or failure events found");
++        if (!text.contains("Pinning Summary") && !text.contains("Submission Failures") && !text.contains("Sleep Failures")
++                && !text.contains("Virtual threads detected")) {
++            assertThat(text).contains("No virtual thread");
+         }
+     }
+ 
+@@ -218,8 +215,8 @@ class VirtualThreadsToolTest {
+         assertThat(result.isError()).isFalse();
+         String text = extractText(result);
+ 
+-        if (text.contains("No virtual thread pinning or failure events found")) {
+-            assertThat(text).contains("JFR events are not enabled");
++        if (text.contains("No virtual thread")) {
++            assertThat(text).contains("recording");
+         }
+     }
+ 

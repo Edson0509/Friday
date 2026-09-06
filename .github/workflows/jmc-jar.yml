@@ -9,8 +9,12 @@ on:
   push:
     branches: [main]
     # 本文件是 pinned SHA 的所在地：SHA 升级/工作流修改 → 自动重建发布（零人工）。
-    # 回填步骤只改 vendor-versions.json，不命中此 paths → 无自触发循环。
-    paths: [".github/workflows/jmc-jar.yml"]
+    # 补丁文件（scripts/jmc-*.patch）变更同样触发重建。回填步骤只改 vendor-versions.json，
+    # 不命中此 paths → 无自触发循环。
+    paths:
+      - ".github/workflows/jmc-jar.yml"
+      - "scripts/jmc-topn-int-fix.patch"
+      - "scripts/jmc-virtual-threads-fix.patch"
 
 permissions:
   contents: write
@@ -47,6 +51,21 @@ jobs:
           git clone https://github.com/scarletbean01/jmc-mcp-server.git jmc
           cd jmc
           git checkout "$JMC_SHA"
+
+      - name: Apply Friday patches
+        run: |
+          cd jmc
+          # issue #10：6 个工具 top_n 声明为原始 int + required=false，缺省/null 时
+          # Quarkus invoker 拆箱 NPE → -32603。5 个工具在此补丁（VirtualThreadsTool
+          # 由 issue #11 补丁随重写一并修复）。
+          git apply --check ../scripts/jmc-topn-int-fix.patch
+          git apply ../scripts/jmc-topn-int-fix.patch
+          # issue #11：JMC 解析器丢弃 Thread.virtual 字段（JfrThread 无该成员），
+          # 虚拟线程分析对 JMC 不可见且旧实现查了不存在的 jdk.VirtualThreadSleepFailed。
+          # 补丁用 jdk.jfr.consumer 重写分析（存在性/活动/pinning 原因/载体线程）。
+          git apply --check ../scripts/jmc-virtual-threads-fix.patch
+          git apply ../scripts/jmc-virtual-threads-fix.patch
+          echo "patches applied"
 
       - name: Downgrade to Java 21 bytecode + enable preview
         run: |
@@ -118,6 +137,122 @@ jobs:
           done
           echo "tool name check passed"
 
+      - name: Generate virtual thread JFR fixture
+        run: |
+          # issue #11 冒烟测试数据源：带虚拟线程活动的真实 JFR（Java 21 worker 上生成）。
+          # - jdk.VirtualThreadStart/End 显式开启（默认关闭）→ 存在性检测数据
+          # - synchronized + parkNanos：Java 21 虚拟线程持 monitor 阻塞 → pinning 事件
+          # - 忙循环虚拟线程 → ExecutionSample（threadCpu 数据）
+          # 自检（pinned ≥ 1 且 VT 可见）失败即 fail-fast：防止 JDK 行为漂移产出无效 fixture。
+          cat > GenFixture.java <<'EOF'
+          import jdk.jfr.Recording;
+          import jdk.jfr.consumer.RecordedEvent;
+          import jdk.jfr.consumer.RecordedThread;
+          import jdk.jfr.consumer.RecordingFile;
+
+          import java.nio.file.Path;
+
+          public class GenFixture {
+              public static void main(String[] args) throws Exception {
+                  Path out = Path.of(args.length > 0 ? args[0] : "fixture.jfr");
+                  Recording r = new Recording();
+                  // enable() replaces the whole settings map, so seed it with the profile
+                  // configuration first (ExecutionSample, VirtualThreadPinned@20ms, ...).
+                  r.setSettings(jdk.jfr.Configuration.getConfiguration("profile").getSettings());
+                  r.enable("jdk.VirtualThreadStart");
+                  r.enable("jdk.VirtualThreadEnd");
+                  r.setDestination(out);
+                  r.start();
+
+                  // Pinning: a virtual thread blocking while holding a monitor. On JDK 21-23
+                  // (the CI worker JVM) this pins the carrier and emits jdk.VirtualThreadPinned.
+                  Thread pinner = Thread.ofVirtual().name("fixture-pinner").start(() -> {
+                      synchronized (GenFixture.class) {
+                          java.util.concurrent.locks.LockSupport.parkNanos(200_000_000L);
+                      }
+                  });
+                  // CPU activity on a virtual thread (mounted while busy -> execution samples).
+                  Thread busy = Thread.ofVirtual().name("fixture-busy").start(() -> {
+                      long sum = 0;
+                      long deadline = System.nanoTime() + 1_500_000_000L;
+                      while (System.nanoTime() < deadline) {
+                          sum += System.nanoTime();
+                      }
+                      if (sum < 0) {
+                          System.out.println("impossible");
+                      }
+                  });
+                  pinner.join();
+                  busy.join();
+                  r.stop();
+                  r.close();
+
+                  long pinned = 0;
+                  long vtAttributed = 0;
+                  long vtStart = 0;
+                  try (RecordingFile rf = new RecordingFile(out)) {
+                      while (rf.hasMoreEvents()) {
+                          RecordedEvent e = rf.readEvent();
+                          String name = e.getEventType().getName();
+                          if (name.equals("jdk.VirtualThreadPinned")) {
+                              pinned++;
+                          }
+                          if (name.equals("jdk.VirtualThreadStart")) {
+                              vtStart++;
+                          }
+                          RecordedThread t = e.getThread();
+                          if (t != null) {
+                              try {
+                                  if (Boolean.TRUE.equals(t.getValue("virtual"))) {
+                                      vtAttributed++;
+                                  }
+                              } catch (IllegalArgumentException ignored) {
+                                  // recording without the virtual flag
+                              }
+                          }
+                      }
+                  }
+                  System.out.println("fixture: pinned=" + pinned + " vtAttributedEvents=" + vtAttributed + " vtStartEvents=" + vtStart);
+                  if (pinned == 0) {
+                      System.out.println("FIXTURE_INVALID: no jdk.VirtualThreadPinned event produced");
+                      System.exit(1);
+                  }
+                  if (vtAttributed == 0 && vtStart == 0) {
+                      System.out.println("FIXTURE_INVALID: no virtual thread visibility in events");
+                      System.exit(1);
+                  }
+              }
+          }
+          EOF
+          javac GenFixture.java
+          java GenFixture fixture.jfr
+
+      - name: Smoke test — patched tools on fixture (issues #10/#11)
+        run: |
+          # 回归闸门（单 session：握手 + 两个 tools/call）：
+          # - threadCpu / virtualThreadTool 不传 top_n：补丁前 Quarkus 对 null 拆箱 →
+          #   -32603（issue #10 崩溃点），必须不再出现
+          # - virtualThreadTool 必须报出虚拟线程存在性与 pinning 分析（issue #11：
+          #   JMC 管线丢弃 Thread.virtual 字段时旧实现只会回 "no data"）
+          resp=$(
+            (echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0"}}}'; \
+             echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'; \
+             echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"threadCpu","arguments":{"jfr_file_path":"fixture.jfr"}}}'; \
+             echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"virtualThreadTool","arguments":{"jfr_file_path":"fixture.jfr"}}}'; sleep 90) \
+              | timeout 150 java --enable-preview -jar jmc-mcp-1.0.0.jar 2>/dev/null
+          )
+          # || true：grep 无匹配时命令替换的退出码会让 bash -e 提前退出，
+          # 掩盖真实原因；交由下方的显式空值断言给出可读错误。
+          tcpu=$(echo "$resp" | grep '"id":2' || true)
+          vt=$(echo "$resp" | grep '"id":3' || true)
+          [ -n "$tcpu" ] || { echo "::error::no response for tools/call threadCpu"; exit 1; }
+          [ -n "$vt" ] || { echo "::error::no response for tools/call virtualThreadTool"; exit 1; }
+          echo "$tcpu" | grep -q -- '-32603' && { echo "::error::threadCpu without top_n returned -32603 (issue #10 regression)"; exit 1; }
+          echo "$vt" | grep -q -- '-32603' && { echo "::error::virtualThreadTool without top_n returned -32603 (issue #10 regression)"; exit 1; }
+          echo "$vt" | grep -q 'Virtual threads detected' || { echo "::error::virtual thread presence not reported (issue #11 regression)"; exit 1; }
+          echo "$vt" | grep -q 'Pinning Summary' || { echo "::error::pinning summary not reported (issue #11 regression)"; exit 1; }
+          echo "patched tools smoke test passed"
+
       - name: Compute SHA256
         id: hash
         run: echo "sha256=$(sha256sum jmc-mcp-1.0.0.jar | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -131,6 +266,7 @@ jobs:
             Built from scarletbean01/jmc-mcp-server @ ${{ env.JMC_SHA }}
 
             - Bytecode: Java 21 + `--enable-preview`（运行需 JVM 21+ 且启动参数带 `--enable-preview`）
+            - Friday patches: `jmc-topn-int-fix.patch`（issue #10：可选参数 top_n 原始 int 拆箱 NPE → -32603）、`jmc-virtual-threads-fix.patch`（issue #11：jdk.jfr.consumer 重写虚拟线程分析，JMC 管线丢弃 Thread.virtual 字段）
             - SHA256: `${{ steps.hash.outputs.sha256 }}`
 
       - name: Backfill sha256 into vendor-versions.json

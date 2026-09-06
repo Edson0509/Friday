@@ -1,8 +1,8 @@
 # JMC 分析错误分类修复与遗留事项（issue #10）
 
 - 日期：2026-09-04
-- 状态：已实施（方案 1+2）；**两个遗留项待办，见 §3**
-- 关联 issue：#10（jfr_thread_cpu 报 `-32603 Internal error` 并拖垮 JMC 工人进程）
+- 状态：**全部已实施**——方案 1+2（当日落地）+ 方案 3（构建期补丁，2026-09-06 落地，见 §3.1 更新）
+- 关联 issue：#10（jfr_thread_cpu 报 `-32603 Internal error` 并拖垮 JMC 工人进程）、#11（jfr 虚拟线程分析失效，同批补丁根治，见 §3.1.1）
 - 相关设计：[JFR 飞行记录分析设计](2026-09-03-jmc-jfr-analysis-design.md)（JMC 工人进程/vendoring 模式）
 
 ## 1. 根因回顾
@@ -29,27 +29,44 @@
 
 回归测试：`test_build_proxy_injects_top_n_default_for_affected_kinds`、`test_map_call_result_mcp_error_is_tool_level_error`、`test_map_call_result_transport_error_still_err`、`test_map_call_result_complete_and_non_complete`。
 
-## 3. 遗留事项（勿漏）
+## 3. 遗留事项
 
 > 方案 2 落地后，NPE 的爆炸半径已缩小：即使再踩中拆箱 bug 也只是**该工具本次调用失败**（业务错误透传），不再杀工人进程。剩余影响：绕过 `build_proxy` 直接调上游 JAR 的调用方仍必崩；Friday 未代理的 3 个上游工具（ObjectStatistics / ThreadPoolAnalysis / VMOperations）直接调用必崩。
 
-### 3.1 上游 `int topN` 根因仍在（方案 3 未做）
+### 3.1 上游 `int topN` 根因仍在（方案 3 未做）→ ✅ 已根治（2026-09-06）
 
-Friday 侧兜底（§2.1）只是止血，上游 6 处原始 `int topN`（§1 表格）未修。
+采用**构建期补丁**路径（照抄 issue #9 的 analyzer 模式）：
 
-**根治路径（二选一）**：
+- `scripts/jmc-topn-int-fix.patch`：5 个工具类（ThreadCpu / ThreadContention / ObjectStatistics / ThreadPoolAnalysis / VMOperations）`int topN` → `Integer topN` + 调用点判空默认 10（对齐 HotMethodsTool 既有写法）。
+- `scripts/jmc-virtual-threads-fix.patch`：VirtualThreadsTool 的 top_n 修复随 issue #11 重写一并落地（见 §3.1.1），故不重复出现在 topn 补丁中。
+- `jmc-jar.yml` 在 clone 后 `git apply --check` fail-fast 应用两补丁；`paths` 触发器加入补丁文件（补丁变更即自动重建发布）。
+- smoke test 增补：CI 现场生成虚拟线程 fixture（GenFixture：profile 设置 + VTStart/VTEnd 开启 + 持 monitor park + 忙循环），断言 ① `threadCpu`/`virtualThreadTool` 不传 top_n 不再返回 -32603（#10 回归）② `virtualThreadTool` 报出 `Virtual threads detected` + `Pinning Summary`（#11 回归）。
 
-- **上游 PR**：向上游提 PR，把 6 处 `int topN` 改为 `Integer topN` + 判空默认（对齐其余 30+ 工具的既有写法，如 `HotMethodsTool.java:37`）。被合并发版后升级 pinned SHA。
-- **构建期补丁（推荐，已有现成模板）**：issue #9 已为 analyzer 落地同款模式——`scripts/analyzer-retained-fix.patch` + `.github/workflows/analyzer-jar.yml`（clone 上游 pinned tag → `git apply --check` fail-fast → 构建 → smoke test → 发布 Releases → 回填 sha256）。JMC 照抄即可：
-  1. 新建 `scripts/jmc-topn-int-fix.patch`（上游 6 个 Tool 类 `int topN` → `Integer topN` + 调用点判空默认 10）。
-  2. `jmc-jar.yml` 在 "Clone upstream at pinned SHA" 之后追加 `git apply` 步骤，`paths` 触发器加入补丁文件路径。
-  3. smoke test 增补一条：无 `top_n` 参数调用 `threadCpu`，断言不返回 -32603。
+**收尾清单**（已全部执行）：
 
-**收尾清单**（任一路径落地后）：
+1. ~~推送补丁/workflow 变更即自动重建~~（`jmc.upstream_sha` 不变，无 SHA 同步事项）。
+2. ~~移除 `mapping.rs` 的 `needs_top_n_default()` 与 `build_proxy` 注入逻辑 + 对应回归测试~~——替换为反向回归测试 `test_build_proxy_no_top_n_injection_after_upstream_fix`（断言不再注入、显式 null 原样透传）。
+3. 未来升级上游 SHA 前先本地 `git apply --check` 验证两补丁仍命中（上游布局可能变化）。
 
-1. 上游 PR 路径：升级 `scripts/vendor-versions.json` 的 `jmc.upstream_sha` + `.github/workflows/jmc-jar.yml` 的 `JMC_SHA`（两处同步，一致性单测守卫）。补丁路径：推送补丁/workflow 变更即自动重建。
-2. 移除 `mapping.rs` 的 `needs_top_n_default()` 与 `build_proxy` 注入逻辑 + 对应回归测试（`test_build_proxy_injects_top_n_default_for_affected_kinds`）。
-3. 补丁路径下升级上游 SHA 前先本地 `git apply --check` 验证补丁仍命中（上游布局可能变化）。
+#### 3.1.1 issue #11：jfr 虚拟线程分析功能（同批根治）
+
+**根因**（两层）：
+
+1. **JMC 解析器丢弃 `Thread.virtual` 字段**：JFR 的 thread 类型元数据自 JDK 21 GA 起就带 `virtual` boolean（实测 jdk-21-ga `metadata.xml`），但 JMC 把 thread 类型映射到固定内部类 `StructTypes.JfrThread`（无 `virtual` 成员），解析时丢值并告警 `Could not find field with name 'virtual' in reader for 'thread'`（截至 JMC 9.1.2/master 仍未支持）。JMC 管线（IItemCollection）因此**完全无法识别虚拟线程**。
+2. **上游 VirtualThreadsService 查询幻觉事件**：`jdk.VirtualThreadSleepFailed` 在任何 JDK 中都不存在；`jdk.VirtualThreadSubmitFailed` 的 `exception` 字段也不存在（实际是 `exceptionMessage`）。结果工具只会报 pinning/失败事件，无 pinning 时输出 "No virtual thread pinning or failure events found"——活跃但健康的虚拟线程负载被误判为"无数据"。
+
+**修复**（`jmc-virtual-threads-fix.patch`，~730 行）：
+
+- `VirtualThreadsService` 重写为 **jdk.jfr.consumer**（JDK 自带解析器，按录制文件元数据动态解析字段，`RecordedThread.getValue("virtual")` 对任何 JDK 21+ 录制可用，包括 worker JVM 比目标 JVM 旧的场景）：
+  - 存在性与规模：distinct 虚拟线程计数（事件线程 virtual=true + VTStart/SubmitFailed 的 `javaThreadId` 字段，上限 10000 防炸内存）、按事件类型活动分布
+  - pinning：计数、总耗时、top 栈、`pinnedReason`/`carrierThread`（JDK 24+ 字段，存在即用）
+  - 失败：SubmitFailed（`exceptionMessage` 字段）、SleepFailed（保留查询，兼容自定义事件）
+  - 时间窗过滤语义对齐 `JfrProviderImpl.parseTimeQuantity`（ISO-8601 → epoch-ms → epoch-s，忽略小数值）
+- `VirtualThreadsApplicationService.analyzeFile`：保留 `loadRecording` 调用（路径校验 + JMC 缓存预热），再走 RecordingFile 二次解析
+- `VirtualThreadsTool`：`Integer topN`（#10 根治）+ 全新 markdown 渲染（空结果区分"录制无 virtual 字段（JDK<21）"与"有字段但无虚拟线程活动"两种语义）
+- 本地验证：上游 fixture 单测 18/18 通过；Java 21 端到端（补丁 → uber-jar → MCP stdio tools/call）报出 `Virtual threads detected: **2 distinct**` + Pinning Summary（192.4ms）
+
+**经验**：`new Recording()` 后调 `enable()` 会**替换**整个设置映射（默认 profile 事件全部失效）——fixture 生成需先 `setSettings(Configuration.getConfiguration("profile").getSettings())` 再叠加 enable。
 
 ### 3.2 MAT heap 分析器存在同款误分类（未动）
 
