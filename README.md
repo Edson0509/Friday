@@ -194,3 +194,56 @@ SSH 单通道直连目标环境（K8s 场景同样经 SSH 执行 kubectl，无�
 ### 更新与卸载
 
 新版本从 [Releases](https://github.com/Ewan-90n9/Friday/releases) 下载覆盖安装即可，会话与配置保留。卸载走系统"应用"设置。
+
+## 路线图
+
+### 已落地
+
+- SSH 连接与命令执行、环境多用户凭证管理
+- JVM 基础诊断（jstat / jcmd 系列）
+- 堆快照分析（MAT 引擎，自动拉回 + 自动预热）
+- JFR 飞行记录（JMC 引擎，远程录制 + 21 个分析工具）
+- Arthas 动态诊断（27 个工具，SSH 桥接）
+- 文件上传下载（断点续传 + 自动拉回）
+- opencode / codeagentcli 双 Agent 接入
+- 暗色 / 浅色 / 暖白多主题
+
+### 下一批
+
+- **Playbook 知识层**：结构化故障知识（症状 → 工具序列 → 判读要点），诊断时语义检索自动注入，首批覆盖 Java 高频故障（OOM / CPU 飙高 / GC 频繁 / 死锁）
+- **知识导入管线**：URL / 文档抓取 + LLM 提炼为 Playbook 草稿，人工审核后生效，团队知识可沉淀灌入
+- **脚本工具热插拔**：脚本 + 清单自服务注册诊断工具，Agent 无需重启即可调用
+- **读日志 / 读 dump 结构化工具**：补齐"看现场"的最后两块拼图
+
+### 远期
+
+- 更多 Agent CLI 接入（claude code / codex 等）
+- 自建 LLM client，绕过 Agent CLI 直连模型 API
+- 知识爬虫管线、K8s 诊断 Playbook、经验时间衰减
+
+> 细粒度进度以 [TODO.md](TODO.md) 为准。
+
+## 开发构建
+
+前置：Node.js、pnpm、Rust（MSVC 工具链）。
+
+```bash
+pnpm install
+pnpm tauri dev                                          # 开发运行
+pnpm tauri build                                        # 打包安装产物
+pnpm typecheck                                          # 前端类型检查
+cargo check --manifest-path src-tauri/Cargo.toml        # Rust 检查
+cargo test --manifest-path src-tauri/Cargo.toml         # Rust 测试
+```
+
+### 文档
+
+| 主题 | 文档 |
+|------|------|
+| 架构总览（决策表 + 分层图） | [docs/architecture/overview.md](docs/architecture/overview.md) |
+| 运行时模型（通信 / 并发 / 取消） | [docs/architecture/runtime.md](docs/architecture/runtime.md) |
+| 错误处理与安全边界 | [docs/architecture/error-handling.md](docs/architecture/error-handling.md) |
+| 基础设施（凭证 / 日志） | [docs/architecture/infrastructure.md](docs/architecture/infrastructure.md) |
+| 日志规范 | [docs/architecture/logging-standard.md](docs/architecture/logging-standard.md) |
+| 知识层（Playbook） | [docs/architecture/playbook.md](docs/architecture/playbook.md) |
+| 设计语言 | [docs/design/design-language.md](docs/design/design-language.md) |
