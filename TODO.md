@@ -48,7 +48,8 @@
 
 ## 后续批次（阶段 4 之后）
 
-- [ ] 结构化 JVM 工具：jvm_gc_stats（jstat）、jcmd、arthas、read_log、read_dump——逐步替换 playbook 中的 run_command 命令模板
+- [x] 结构化 JVM 工具：jvm_gc_stats（jstat）、jcmd 基础系列、arthas、heap_*（MAT）、jfr_*（JMC）已按批次落地
+- [ ] 读日志 / 读 dump 结构化工具——补齐"看现场"最后两块，逐步替换 playbook 中的 run_command 命令模板
 - [ ] jvm_* 工具接入用户对齐/多凭证能力（pre-flight 用户检查 + 按 jvm_user 查凭证的通用工具函数，arthas 批次已落地基础设施，见 [arthas 对接设计](docs/superpowers/specs/2026-08-31-arthas-mcp-integration-design.md)）
 - [ ] 爬虫管线（摄入管线抽象为 `KnowledgeIngest` trait，前两条管线先按 trait 落地）
 - [ ] K8s 诊断 playbook 内容（SSH 上跑 kubectl 的知识条目，无新机制）
@@ -59,3 +60,5 @@
 - [ ] 工具事件去重（MCP Server 与 opencode stdout 双发 ToolExecuting/ToolResult，v1 有意保留）
 - [ ] Agent 停止时 in-flight 工具调用的取消（长时间诊断命令需要 per-session cancel）
 - [ ] opencode 配置 JSONC 注释丢失（可换 `jsonc-parser` crate）
+- [ ] 工具卡片名流式/重载不一致：流式渲染显示 registry 名（`echo`，mcp/server.rs ToolExecuting 事件），重载后显示 opencode 流持久化名（`friday_echo`，stream.rs），两处来源未统一
+- [ ] 重载后工具卡片参数渲染为 `null`：opencode 流中无 running tool_use 时累加器存空参数，convertMessages 把空参数映射为 null（截图时发现，卡片显示 `friday_echo null 0.1s`）
