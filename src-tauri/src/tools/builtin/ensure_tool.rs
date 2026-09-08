@@ -28,6 +28,8 @@ impl ToolHandler for EnsureToolHandler {
             return error_output("invalid_params", "missing required parameter: tool");
         };
         let java_bin = args.get("java_bin").and_then(|v| v.as_str()).unwrap_or("java");
+        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
         if tool != "jdk" {
             return error_output(
@@ -53,7 +55,7 @@ impl ToolHandler for EnsureToolHandler {
         // 获取 channel
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, None, None, &self.db).await {
+            match pool.get_or_create(&env.id, pod, container, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "ensure_tool: failed to get exec channel");
@@ -78,13 +80,17 @@ impl ToolHandler for EnsureToolHandler {
             cache_dir: self.cache_dir.clone(),
             artifactory_base_url: base_url,
             arthas_zip: None,
-            remote_tools_dir: crate::provision::jdk::REMOTE_TOOLS_DIR.to_string(),
+            remote_tools_dir: if pod.is_some() {
+                crate::exec::k8s::POD_TOOLS_DIR.to_string()
+            } else {
+                crate::provision::jdk::REMOTE_TOOLS_DIR.to_string()
+            },
             timeouts: StageTimeouts::default(),
             bus: self.bus.clone(),
         };
 
-        // (env_id, package) 串行化：并发请求排队，后者进锁后 ensure 会重新查远端缓存
-        let lock_key = format!("{}/{}", env.id, tool);
+        // (env_id, pod, container) 串行化：并发请求排队，后者进锁后 ensure 会重新查远端缓存
+        let lock_key = format!("{}/{}/{}", env.id, pod.unwrap_or("-"), container.unwrap_or("-"));
         let per_key = {
             let mut inflight = self.inflight.lock().await;
             inflight
@@ -94,16 +100,23 @@ impl ToolHandler for EnsureToolHandler {
         };
         let _guard = per_key.lock().await;
 
-        let package = crate::provision::jdk::JdkPackage;
+        let package: Box<dyn ToolPackage> = if pod.is_some() {
+            Box::new(crate::provision::k8s::K8sJdkPackage)
+        } else {
+            Box::new(crate::provision::jdk::JdkPackage)
+        };
         match package.ensure(&pctx, java_bin).await {
             Ok(result) => {
                 tracing::info!(session_id = %ctx.session_id, env_id = %env.id, tool, cached = result.cached, elapsed_ms = result.elapsed_ms, "ensure_tool succeeded");
-                // 成功即写入 JdkCache：jvm_* 工具按 env_id 取路径
+                // 成功即写入 JdkCache：VM 目标裸 env_id 键；k8s 目标复合键（env|pod=..|ctr=..）
                 let layout = crate::tools::builtin::jvm::jdk_cache::JdkLayout {
                     tool_home: result.tool_home.clone(),
                     bins: result.bins.clone(),
                 };
-                self.jdk_cache.set(&env.id, layout).await;
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+                self.jdk_cache
+                    .set(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target), layout)
+                    .await;
                 ToolOutput {
                     success: true,
                     data: serde_json::to_value(&result).unwrap_or_default(),
@@ -135,11 +148,13 @@ pub fn ensure_tool_tool_def(
 ) -> ToolDef {
     ToolDef {
         name: "ensure_tool".to_string(),
-        description: "确保目标环境已装备指定诊断工具包（当前支持 jdk）。生产环境通常只有 JRE，缺少 jstat/jcmd 等诊断工具；本工具探测目标 JVM 版本并下载匹配的 JDK 到 /tmp/friday-tools（不影响系统 Java）。装备成功后即可直接调用 jvm_gc_stats / jvm_thread_dump / jvm_heap_info / jvm_vm_info / jvm_class_histogram / jvm_heap_dump 等结构化工具。重复调用安全：已装备时直接返回。JVM 诊断流程：list_environments → list_processes（keyword=服务名）找 pid → ensure_tool → jvm_* 工具。".to_string(),
+        description: "确保目标环境已装备指定诊断工具包（当前支持 jdk）。生产环境通常只有 JRE，缺少 jstat/jcmd 等诊断工具；本工具探测目标 JVM 版本并下载匹配的 JDK 到 /tmp/friday-tools（不影响系统 Java）。装备成功后即可直接调用 jvm_gc_stats / jvm_thread_dump / jvm_heap_info / jvm_vm_info / jvm_class_histogram / jvm_heap_dump 等结构化工具。重复调用安全：已装备时直接返回。JVM 诊断流程：list_environments → list_processes（keyword=服务名）找 pid → ensure_tool → jvm_* 工具。容器内服务：先 k8s_find_pods 定位 Pod，再传 pod 参数调用本工具。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（装备到容器内时必传）" },
+                "container": { "type": "string", "description": "容器名（多容器 Pod 时指定）" },
                 "tool": { "type": "string", "enum": ["jdk"], "description": "要装备的工具包名" },
                 "java_bin": { "type": "string", "description": "目标服务使用的 java 可执行文件路径，默认 java（多版本共存时从服务进程命令行确认后传入）" }
             },
@@ -301,6 +316,70 @@ mod tests {
         assert_eq!(def.risk_level, RiskLevel::Low);
         assert_eq!(def.category, ToolCategory::Environment);
         assert!(!def.needs_channel);
+    }
+
+    /// k8s 目标：pod 参数 → K8sJdkPackage + 容器自带 jcmd 短路 + 复合缓存键
+    #[tokio::test]
+    async fn test_ensure_with_pod_uses_k8s_package_and_composite_cache() {
+        let (tmp, db, exec_pool, cache, bus) = setup().await;
+        let env_id = crate::app::environments::find_by_name(&db, "prod").await.unwrap().unwrap().id;
+        // 注入 k8s 目标通道（probe ok / musl 无 / native 命中）
+        exec_pool.lock().await.insert_channel(
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            Arc::new(K8sNativeChannel) as Arc<dyn ExecChannel>,
+        ).await;
+        let jdk_cache = Arc::new(crate::tools::builtin::jvm::jdk_cache::JdkCache::new());
+        let handler = EnsureToolHandler {
+            db: db.clone(),
+            exec_pool,
+            cache_dir: cache,
+            bus,
+            jdk_cache: jdk_cache.clone(),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let ctx = ToolContext { session_id: "s1".into(), channel: None };
+        let out = handler
+            .execute(
+                serde_json::json!({"environment": "prod", "tool": "jdk", "pod": "pod-1"}),
+                &ctx,
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        assert_eq!(out.data["bins"]["jcmd"], "/usr/bin/jcmd");
+        // 复合键写入（env|pod=..）
+        let layout = jdk_cache
+            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None)))
+            .await
+            .expect("composite cache key must be populated");
+        assert_eq!(layout.bins["jcmd"], "/usr/bin/jcmd");
+        drop(tmp);
+    }
+
+    /// K8sNativeChannel：probe 输出 / musl exit 1 / native 命中
+    struct K8sNativeChannel;
+
+    #[async_trait]
+    impl ExecChannel for K8sNativeChannel {
+        async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+            if cmd.contains("ld-musl") {
+                return Ok(ExecOutput { stdout: String::new(), stderr: String::new(), exit_code: 1 });
+            }
+            if cmd.contains("command -v jcmd") {
+                return Ok(ExecOutput {
+                    stdout: "/usr/bin/jcmd\n/usr/bin/jstat\n".into(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                });
+            }
+            Ok(ExecOutput {
+                stdout: "BiSheng_JDK_Enterprise_205.2.0.110.B001\nopenjdk version \"21.0.11\" 2025-04-15\n---\nx86_64\n".into(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+        async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn disconnect(&self) {}
+        async fn is_alive(&self) -> bool { true }
     }
 
     #[tokio::test]
