@@ -36,12 +36,15 @@ impl TargetKey {
         }
     }
 
-    /// 工具参数 → key：空串视为未传
+    /// 工具参数 → key：空串视为未传；pod 缺失时 container 无意义，一并丢弃（归一到 base key）
     pub fn from_parts(env_id: &str, pod: Option<&str>, container: Option<&str>) -> Self {
-        Self {
-            env_id: env_id.to_string(),
-            pod: pod.filter(|p| !p.is_empty()).map(|s| s.to_string()),
-            container: container.filter(|c| !c.is_empty()).map(|s| s.to_string()),
+        match pod.filter(|p| !p.is_empty()) {
+            None => Self { env_id: env_id.to_string(), pod: None, container: None },
+            Some(pod) => Self {
+                env_id: env_id.to_string(),
+                pod: Some(pod.to_string()),
+                container: container.filter(|c| !c.is_empty()).map(|s| s.to_string()),
+            },
         }
     }
 }
@@ -537,5 +540,11 @@ mod tests {
     fn test_from_parts_normalizes_empty_strings() {
         let k = TargetKey::from_parts("e", Some(""), Some(""));
         assert_eq!(k, TargetKey::base("e"));
+    }
+
+    #[test]
+    fn test_from_parts_drops_container_without_pod() {
+        let k = TargetKey::from_parts("e", None, Some("c1"));
+        assert_eq!(k, TargetKey::base("e"), "container without pod is meaningless, must normalize to base key");
     }
 }

@@ -125,11 +125,7 @@ impl JvmExecCore {
                 // 缓存失效：清缓存并引导重新装备
                 if is_jdk_missing(output.exit_code, &output.stderr) {
                     tracing::warn!(session_id, env_id = %target.env_id, bin_path, "jdk missing on remote, clearing cache");
-                    self.jdk_cache.clear(&super::jdk_cache::cache_key(
-                        &target.env_id,
-                        target.pod.as_deref(),
-                        target.container.as_deref(),
-                    )).await;
+                    self.jdk_cache.clear(&super::jdk_cache::cache_key(target)).await;
                     return error_output(
                         "jdk_missing_on_remote",
                         "远端 JDK 已不存在（可能 /tmp 被清理）。请重新调用 ensure_tool 装备后重试。",
