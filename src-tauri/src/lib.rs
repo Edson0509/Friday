@@ -219,6 +219,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 EventBus::new(handle.clone()),
                 transfer_manager.clone(),
             );
+            tool_registry.register(crate::tools::builtin::k8s::k8s_find_pods_tool_def(jvm_core.clone()));
             crate::tools::builtin::heap::register_all(
                 &mut tool_registry,
                 analyzer_manager.clone(),

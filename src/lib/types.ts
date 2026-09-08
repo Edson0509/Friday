@@ -112,6 +112,7 @@ export interface MessageRow {
 
 export type ToolCategory =
   | "environment"
+  | "k8s"
   | "jvm"
   | "heap"
   | "jfr"
