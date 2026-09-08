@@ -25,7 +25,10 @@ pub struct PodInfo {
     pub node: String,
 }
 
-/// 解析 custom-columns 输出：跳过表头；5 列空白切分；异常行（列数≠5）跳过，宁缺勿错
+/// 解析 custom-columns 输出：跳过表头；5 列空白切分；异常行（列数≠5）跳过，宁缺勿错。
+/// 安全前提：pod 名/命名空间是 DNS-1123 子域名、容器名是 DNS-1123 label、
+/// STATUS 是单词枚举、NODE 是主机名——均不含空格，空白切分安全。
+/// 列数≠5 的行（输出格式变化）被静默跳过（宁缺勿错），避免半解析数据误导 Agent。
 pub fn parse_pods_output(stdout: &str) -> Vec<PodInfo> {
     let mut pods = Vec::new();
     for line in stdout.lines() {
@@ -103,10 +106,16 @@ impl ToolHandler for FindPodsHandler {
         match result {
             Err(_) => {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "k8s_find_pods timed out, dropping connection");
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, None, None);
                 {
                     let mut pool = self.core.exec_pool.lock().await;
-                    pool.disconnect(&env.id).await;
+                    pool.disconnect_target(&target).await;
                 }
+                crate::exec::pool::spawn_timeout_kill(
+                    self.core.db.clone(),
+                    target,
+                    KUBECTL_GET_PODS.to_string(),
+                );
                 error_output("timeout_error", &format!("command timed out after {timeout_secs}s"))
             }
             Ok(Err(e)) => {
@@ -207,8 +216,6 @@ mod tests {
         use crate::tools::registry::{ToolContext, ToolHandler};
         use async_trait::async_trait;
 
-        const SAMPLE_OUTPUT: &str = SAMPLE;
-
         struct KubectlChannel {
             exit_code: i32,
             stderr: &'static str,
@@ -218,7 +225,7 @@ mod tests {
         impl ExecChannel for KubectlChannel {
             async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
                 assert!(cmd.starts_with("kubectl get pods"), "must run kubectl on host: {cmd}");
-                Ok(ExecOutput { stdout: SAMPLE_OUTPUT.to_string(), stderr: self.stderr.to_string(), exit_code: self.exit_code })
+                Ok(ExecOutput { stdout: SAMPLE.to_string(), stderr: self.stderr.to_string(), exit_code: self.exit_code })
             }
             async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
             async fn disconnect(&self) {}
@@ -297,6 +304,62 @@ mod tests {
             assert!(!out.success);
             assert_eq!(out.data["error"], "kubectl_error");
             assert!(out.data["message"].as_str().unwrap().contains("unauthorized"));
+            drop(tmp);
+        }
+
+        #[tokio::test]
+        async fn test_no_kubectl_executable_not_found_variant() {
+            // exit 0 但 stderr 含 "executable file not found"（非 bash shell 场景）
+            // → 同样映射 not_k8s_environment
+            let ch = Arc::new(KubectlChannel { exit_code: 0, stderr: "sh: kubectl: executable file not found" });
+            let (tmp, core) = setup(ch).await;
+            let handler = FindPodsHandler { core };
+            let ctx = ToolContext { session_id: "s1".into(), channel: None };
+            let out = handler.execute(serde_json::json!({"environment": "prod"}), &ctx).await;
+            assert!(!out.success);
+            assert_eq!(out.data["error"], "not_k8s_environment");
+            drop(tmp);
+        }
+
+        struct HangingChannel;
+
+        #[async_trait]
+        impl ExecChannel for HangingChannel {
+            async fn run(&self, _cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+                std::future::pending::<()>().await;
+                unreachable!("hanging channel run must never complete")
+            }
+            async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+            async fn disconnect(&self) {}
+            async fn is_alive(&self) -> bool { true }
+        }
+
+        #[tokio::test]
+        async fn test_timeout_disconnects_only_base_target() {
+            // base 通道挂起（kubectl get pods 无响应）+ k8s 目标通道正常（并发容器诊断）
+            let (tmp, core) = setup(Arc::new(HangingChannel)).await;
+            let env = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap();
+            let k8s_key = crate::exec::pool::TargetKey::k8s(&env.id, "pod-a", None);
+            core.exec_pool
+                .lock()
+                .await
+                .insert_channel(k8s_key.clone(), Arc::new(KubectlChannel { exit_code: 0, stderr: "" }))
+                .await;
+            assert_eq!(core.exec_pool.lock().await.connection_count(), 2);
+
+            let handler = FindPodsHandler { core: core.clone() };
+            let ctx = ToolContext { session_id: "s1".into(), channel: None };
+            let out = handler
+                .execute(serde_json::json!({"environment": "prod", "timeout_secs": 1}), &ctx)
+                .await;
+            assert!(!out.success);
+            assert_eq!(out.data["error"], "timeout_error");
+
+            // 超时只断 base 通道：k8s 目标通道必须存活（并发容器诊断不受波及）
+            let mut pool = core.exec_pool.lock().await;
+            assert_eq!(pool.connection_count(), 1, "k8s target channel must survive base-target timeout");
+            let ch = pool.get_or_create_unchecked_for_test(&k8s_key).await;
+            assert!(ch.is_alive().await, "k8s target channel must be retrievable and alive");
             drop(tmp);
         }
 
