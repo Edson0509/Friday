@@ -21,6 +21,7 @@ pub struct EnvironmentRow {
     pub user: String,
     pub auth_type: String,
     pub private_key_path: Option<String>,
+    pub transport_type: String,
     pub created_at: String,
 }
 
@@ -33,11 +34,12 @@ fn row_to_env(r: &sqlx::sqlite::SqliteRow) -> EnvironmentRow {
         user: r.get("user"),
         auth_type: r.get("auth_type"),
         private_key_path: r.get("private_key_path"),
+        transport_type: r.get("transport_type"),
         created_at: r.get("created_at"),
     }
 }
 
-const ENV_COLUMNS: &str = "id, name, host, port, user, auth_type, private_key_path, created_at";
+const ENV_COLUMNS: &str = "id, name, host, port, user, auth_type, private_key_path, transport_type, created_at";
 
 pub async fn get_environment(pool: &SqlitePool, id: &str) -> Result<Option<EnvironmentRow>, EnvironmentError> {
     let row = sqlx::query(&format!("SELECT {ENV_COLUMNS} FROM environments WHERE id = ?"))
