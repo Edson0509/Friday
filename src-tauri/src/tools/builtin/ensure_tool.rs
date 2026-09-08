@@ -14,7 +14,8 @@ pub struct EnsureToolHandler {
     pub bus: crate::app::events::EventBus,
     /// jvm_* 工具共享的 JDK 布局缓存：成功后写入
     pub jdk_cache: Arc<crate::tools::builtin::jvm::jdk_cache::JdkCache>,
-    /// (env_id, package) → 串行化锁
+    /// 目标键（env/pod/container，与池、缓存键同源——见 jdk_cache::cache_key）→ 串行化锁。
+    /// 注：当前仅 jdk 一种包，包名不入键；未来多包时需加回。
     pub inflight: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -89,8 +90,11 @@ impl ToolHandler for EnsureToolHandler {
             bus: self.bus.clone(),
         };
 
-        // (env_id, pod, container) 串行化：并发请求排队，后者进锁后 ensure 会重新查远端缓存
-        let lock_key = format!("{}/{}/{}", env.id, pod.unwrap_or("-"), container.unwrap_or("-"));
+        // (env_id, pod, container) 串行化：并发请求排队，后者进锁后 ensure 会重新查远端缓存。
+        // lock_key 与池键、JdkCache 键同源（TargetKey::from_parts 归一化 + cache_key），
+        // 避免手写第三套键格式导致键空间错位（如 container-without-pod 与裸调用撞池键却各持不同锁）。
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+        let lock_key = crate::tools::builtin::jvm::jdk_cache::cache_key(&target);
         let per_key = {
             let mut inflight = self.inflight.lock().await;
             inflight
@@ -113,7 +117,6 @@ impl ToolHandler for EnsureToolHandler {
                     tool_home: result.tool_home.clone(),
                     bins: result.bins.clone(),
                 };
-                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
                 self.jdk_cache
                     .set(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target), layout)
                     .await;
@@ -186,6 +189,7 @@ fn error_output(error: &str, message: &str) -> ToolOutput {
 mod tests {
     use super::*;
     use crate::exec::channel::{ExecChannel, ExecOutput};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 对所有命令返回探测输出且 exit 0：probe 成功 + 缓存检查命中 → cached:true
     struct ProbeOkChannel;
@@ -346,6 +350,9 @@ mod tests {
             .await;
         assert!(out.success, "out: {}", out.data);
         assert_eq!(out.data["bins"]["jcmd"], "/usr/bin/jcmd");
+        // pod 分支的 native 路径 tool_home 必须 = POD_TOOLS_DIR（防回归到 REMOTE_TOOLS_DIR，
+        // 后者位于 /tmp，容器内 JDK 有节点驱逐丢失风险）
+        assert_eq!(out.data["tool_home"], crate::exec::k8s::POD_TOOLS_DIR);
         // 复合键写入（env|pod=..）
         let layout = jdk_cache
             .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None)))
@@ -402,6 +409,61 @@ mod tests {
         let layout = jdk_cache.get(&env_id).await.expect("cache must be populated");
         assert_eq!(layout.tool_home, "/tmp/friday-tools/jdk-21.0.11");
         assert!(layout.bins.contains_key("jcmd"));
+        drop(tmp);
+    }
+
+    /// run 时短暂挂起并记录最大并发数，用于检测串行锁是否生效
+    #[derive(Default)]
+    struct ConcurrencyTrackingChannel {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ExecChannel for ConcurrencyTrackingChannel {
+        async fn run(&self, _cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(ExecOutput {
+                stdout: "openjdk version \"21.0.11\" 2025-04-15\nBiSheng_JDK_Enterprise_205.2.0.110.B001\n---\nx86_64\n".into(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+        async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn disconnect(&self) {}
+        async fn is_alive(&self) -> bool { true }
+        async fn upload(&self, _local: &std::path::Path, _remote: &str)
+            -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+    }
+
+    /// VM 场景：container-without-pod 与裸调用必须共享同一串行锁。
+    /// 两者经 TargetKey::from_parts 归一化后撞同一池键/缓存键（base env），
+    /// 若 lock_key 是独立的手写三元组，两者会各持不同锁并发进入 ensure，在远端缓存检查上竞态。
+    #[tokio::test]
+    async fn test_container_without_pod_shares_serialization_lock_with_bare_call() {
+        let (tmp, db, exec_pool, cache, bus) = setup().await;
+        let env_id = crate::app::environments::find_by_name(&db, "prod").await.unwrap().unwrap().id;
+        let channel = Arc::new(ConcurrencyTrackingChannel::default());
+        exec_pool.lock().await.insert_channel(env_id, channel.clone() as Arc<dyn ExecChannel>).await;
+        let handler = make_handler(db, exec_pool, cache, bus);
+        let ctx = ToolContext { session_id: "s1".into(), channel: None };
+        let (a, b) = tokio::join!(
+            handler.execute(serde_json::json!({"environment": "prod", "tool": "jdk"}), &ctx),
+            handler.execute(
+                serde_json::json!({"environment": "prod", "tool": "jdk", "container": "c1"}),
+                &ctx,
+            ),
+        );
+        assert!(a.success, "bare call: {}", a.data);
+        assert!(b.success, "container-without-pod call: {}", b.data);
+        assert_eq!(
+            channel.max_in_flight.load(Ordering::SeqCst),
+            1,
+            "container-without-pod 与裸调用必须串行（lock_key 需与池/缓存键同源）"
+        );
         drop(tmp);
     }
 }
