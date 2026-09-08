@@ -3,7 +3,7 @@
 日期：2026-09-08
 状态：已评审通过
 关联决策：连接模型 = SSH 宿主机 + kubectl exec；工具包固定落 `/opt/log/dump/heapdump/friday-tools/`；属组要求 ossadm:ossgroup（实现为 chgrp，exec 用户即 ossadm 非 root）
-grilling 修订（2026-09-08）：exec 用户=ossadm（chgrp 方案、删除 --user）、超时显式补刀、探活改宿主机探 podIP、kubectl 环境已就绪、musl 保险丝、不做自动残留清理、SSH 独立连接、多容器默认第一个不对求助用户
+grilling 修订（2026-09-08）：exec 用户=ossadm（chgrp 方案、删除 --user）、超时显式补刀、探活改宿主机探 podIP、kubectl 环境已就绪、musl 保险丝、不做自动残留清理、SSH 独立连接、多容器默认第一个不对求助用户、**按 pod 参数分发而非 transport_type 硬分发（服务定位判定流程）**
 
 ## 背景
 
@@ -32,10 +32,12 @@ grilling 修订（2026-09-08）：exec 用户=ossadm（chgrp 方案、删除 --u
 ### 通道组合
 
 ```
-build_transport（exec/pool.rs 唯一分发点）
-  ├─ transport_type = "ssh" → SshTransport                     （现状不变）
-  └─ transport_type = "k8s" → SshTransport(宿主机) 外包 K8sChannel(pod, container)
+build_transport(env, pod, container) —— 按 pod 参数分发，不按 transport_type 硬分发：
+  pod 参数缺省            → SshTransport（VM 模式，现状不变）
+  pod 参数存在            → SshTransport(宿主机) 外包 K8sChannel(pod, container)
 ```
+
+`transport_type` 降级为**提示性元数据**（UI 展示、Agent 发现顺序建议），不再是硬分发依据——用户未指明虚机/容器时，"服务在哪"由发现结果决定（见"服务定位判定流程"）。副作用是免费获得混合部署支持：K8s 宿主机上直接跑在 VM 里的服务（不传 pod）照常可查。
 
 `K8sChannel implements ExecChannel`（新文件 `src-tauri/src/exec/k8s.rs`）：
 
@@ -44,19 +46,35 @@ build_transport（exec/pool.rs 唯一分发点）
 | `run(cmd)` | `base.run("kubectl exec <pod> [-c <ctr>] -- sh -c '<cmd>'")`。`container` 缺省时省略 `-c`（使用 Pod 默认容器）。容器内用 `sh -c`（busybox 无 bash），宿主机侧仍走现有 `bash -lc` 包装 |
 | `upload(local, remote)` | 两跳：SFTP → 宿主机 staging（`/tmp/friday-tools/staging/`）→ `kubectl exec -i <pod> -c <ctr> -- sh -c 'cat > <remote>' < staging文件` → `chgrp ossgroup <remote>`（exec 用户即 ossadm 非 root，改自己文件的组是允许的，前提 ossadm ∈ ossgroup）。chgrp 失败视为上传失败并清理目标文件（与"失败不留半截"一致） |
 | `download(remote, local, offset, progress)` | 两跳（见"文件拷出"节）：`kubectl exec <pod> -c <ctr> -- cat <remote> > 宿主机staging文件` → 现有 SFTP 下载（offset/progress 原样透传） |
-| `connect/disconnect/is_alive` | 委托 base SSH 通道；超时杀进程沿用"断 SSH 连接"机制（kubectl exec 子进程随之死亡，语义不变） |
+| `connect/disconnect/is_alive` | 委托 base SSH 通道。超时杀进程不能只靠断 SSH（kubectl 死亡但容器内进程可能存活）→ 显式补刀，见"逐命令兼容性清单" |
 
 - **池 key** 从 `(env_id)` 扩为 `(env_id, pod: Option<String>, container: Option<String>)`；空闲回收、测试注入逻辑不变。每个 `(env, pod, container)` 一条**独立 SSH 连接**（不按宿主机共享：诊断通常一次盯一个 Pod，独立连接让空闲回收/超时杀进程语义与现状完全一致；共享优化 YAGNI）
 - `EnvironmentInfo` 增加 `transport_type` 透传（行内已有该列，只是没带到结构体）
 
 ### 工具参数管道
 
-- 所有远端工具（jvm_* / file_* / heap_dump / jfr_record / arthas_*）schema 增加**可选** `pod`、`container` 参数。VM 模式忽略；k8s 模式必填——缺失时报错并提示 Agent 先调 `k8s_find_pods`
+- 所有远端工具（jvm_* / file_* / heap_dump / jfr_record / arthas_*）schema 增加**可选** `pod`、`container` 参数，**所有环境通用**：不传 = VM 模式（K8s 宿主机上即查宿主机本身），传了 = 容器模式。不区分环境硬性必填
 - `resolve_environment` 一处统一解析 pod/container → 池取通道，工具内部零改动
-- **新增工具 `k8s_find_pods(pattern)`**：`kubectl get pods -A -o custom-columns=NAME:.metadata.name,NS:.metadata.namespace,STATUS:.status.phase,CONTAINERS:.spec.containers[*].name,NODE:.spec.nodeName`，pattern 过滤在 Friday 侧 Rust 完成（不用 shell grep，列格式稳定可解析），结构化输出（pod / namespace / container 列表 / status / node）。pattern 仅做包含匹配（大小写不敏感）。多实例由 Agent 询问用户
+- **新增工具 `k8s_find_pods(pattern)`**：`kubectl get pods -A -o custom-columns=NAME:.metadata.name,NS:.metadata.namespace,STATUS:.status.phase,CONTAINERS:.spec.containers[*].name,NODE:.spec.nodeName`，pattern 过滤在 Friday 侧 Rust 完成（不用 shell grep，列格式稳定可解析），结构化输出（pod / namespace / container 列表 / status / node）。pattern 仅做包含匹配（大小写不敏感）。多实例由 Agent 询问用户。**不挑环境**：任何环境可调用，kubectl 不存在时返回明确报错（"非 K8s 宿主机"），Agent 自然学会跳过
 - `list_processes` 经装饰器自动变为"容器内 ps"，无需改造
 - **多容器 Pod**：默认省略 `-c`（kubectl 默认容器 = spec 第一个容器）；运行结果不对时**求助用户**选择容器，不做自动 JVM 容器探测
 - 新工具归入 `ToolCategory` 新分组（如 `K8s`），注册时声明 category（既有约定）
+
+### 服务定位判定流程（用户未指明虚机/容器时）
+
+判定不靠猜，靠**发现结果**——服务实际在哪，通道就是哪套：
+
+```
+k8s_find_pods(服务名) 与 list_processes(服务名) 双路发现
+  ├─ Pod 命中、宿主机无 → 容器模式（后续工具带 pod 参数）
+  ├─ 宿主机命中、无 Pod → VM 模式
+  ├─ 两边都命中        → 询问用户诊断哪一个
+  └─ 都没有            → 报告未找到，建议检查环境/服务名
+```
+
+- 环境类型标注只决定**发现顺序**：`k8s` 标注的环境优先 Pod 发现，`ssh` 标注的优先宿主机进程；顺序只是省一次廉价探测，不影响正确性
+- 误标无害：ssh 标注环境上 `k8s_find_pods` 照常执行（kubectl 存在就能用），不存在则明确报错
+- VM 环境零影响：不传 pod 参数时行为与今天完全一致
 
 ### 环境配置
 
@@ -159,14 +177,14 @@ Friday 本地端口 ──SSH direct-tcpip──▶ 宿主机 127.0.0.1:P ──
 ## 错误处理
 
 - **两跳错误必须透传是哪一跳失败**（"kubectl exec cat 失败：容器内无 cat" vs "SFTP 下载失败"），不合并笼统报错
-- `resolve` 时 pod 缺失 → 错误信息指导 Agent："该环境是 Kubernetes 宿主机，请先用 k8s_find_pods 定位 Pod"
+- `k8s_find_pods` 在无 kubectl 的环境调用 → 明确报错"非 K8s 宿主机"（Agent 据此切换到 VM 模式发现路径）
 - 容器内依赖缺失（无 sh/tar/cat）→ 明确报"镜像 distroless 不支持，需要 xx 依赖"
 - **kubectl 环境已就绪**（PATH/kubeconfig/RBAC 均确认可用），不加配置字段；kubectl 报错（command not found / Unauthorized 等）原样透传给 Agent，本身就是最准的诊断信息
 - 超时补刀（pkill 签名）、musl 探测、chgrp 失败等新增错误路径全部遵循日志规范：入口 `#[instrument]`、stderr 全量记录、不脱敏不截断
 
 ## 测试策略
 
-- **单元**（mock ExecChannel，沿用 pool 测试的 insert_channel 模式）：K8sChannel 命令包装（kubectl exec 拼装、sh -c 转义、container 省略时省略 `-c`）；两跳 upload/download 的编排逻辑；池 key 扩展后的命中/回收；k8s_find_pods 输出解析（含多实例、异常行）
+- **单元**（mock ExecChannel，沿用 pool 测试的 insert_channel 模式）：K8sChannel 命令包装（kubectl exec 拼装、sh -c 转义、container 省略时省略 `-c`）；两跳 upload/download 的编排逻辑；池 key 扩展后的命中/回收；**build_transport 按 pod 参数分发**（pod 存在/缺省两分支、transport_type 不参与硬分发）；k8s_find_pods 输出解析（含多实例、异常行）
 - **单元**（纯字符串）：port-forward log 解析、超时补刀 pkill 命令构造、musl 探测命令、podIP 探活命令构造、staging 路径构造、chgrp/chmod 命令构造
 - **集成（手动，测试集群）**：发现→选定 Pod→jvm_gc_stats→heap_dump 拉回→MAT 预热→arthas attach→隧道 MCP 调用→会话关闭清理（pf 进程消失、Pod 内文件清理）
 - 回归：VM 模式全部现有测试必须零改动通过（transport_type 分发隔离）
