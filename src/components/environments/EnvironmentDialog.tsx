@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { X, CircleNotch } from "@phosphor-icons/react";
-import type { EnvironmentRow, TestConnectionResult } from "@/lib/types";
+import type { EnvironmentRow, EnvironmentTransport, TestConnectionResult } from "@/lib/types";
 import { listEnvCredentials } from "@/lib/ipc";
 import { useEnvStore } from "@/store/envStore";
 import { CredentialList } from "./CredentialList";
@@ -13,7 +13,7 @@ interface EnvironmentDialogProps {
   editing: EnvironmentRow | null;
 }
 
-const EMPTY_FORM = { name: "", host: "", port: "22", transportType: "ssh" as "ssh" | "k8s" };
+const EMPTY_FORM = { name: "", host: "", port: "22", transportType: "ssh" as EnvironmentTransport };
 
 export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogProps) {
   const save = useEnvStore((s) => s.save);
@@ -224,7 +224,7 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
               <select
                 id="env-transport"
                 value={form.transportType}
-                onChange={(e) => setForm({ ...form, transportType: e.target.value as "ssh" | "k8s" })}
+                onChange={(e) => setForm({ ...form, transportType: e.target.value as EnvironmentTransport })}
                 className={inputCls}
               >
                 <option value="ssh">宿主机 SSH</option>

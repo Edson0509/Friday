@@ -13,7 +13,8 @@ pub const STAGING_DIR: &str = "/tmp/friday-tools/staging";
 /// Pod 内 Friday 工具目录（用户指定：该目录不会触发 ephemeral-storage 驱逐）
 pub const POD_TOOLS_DIR: &str = "/opt/log/dump/heapdump/friday-tools";
 
-/// Pod 内 dump 产物目录（Phase 2 的 heap dump / JFR 落这里）
+/// Pod 内 dump 产物目录（Phase 2 的 heap dump / JFR 落这里；本期无生产消费方）
+#[allow(dead_code)]
 pub const POD_DUMP_DIR: &str = "/opt/log/dump/heapdump";
 
 /// 文件属组要求：非 ossgroup 无法被目标 JVM 用户使用（用户约束，exec 用户 = ossadm 非 root）
@@ -91,7 +92,7 @@ impl K8sChannel {
 impl ExecChannel for K8sChannel {
     async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
         let wrapped = wrap_exec_command(&self.pod, self.container.as_deref(), cmd);
-        tracing::debug!(pod = %self.pod, "k8s exec");
+        tracing::debug!(pod = %self.pod, container = self.container.as_deref().unwrap_or("-"), "k8s exec");
         self.base.run(&wrapped).await
     }
 

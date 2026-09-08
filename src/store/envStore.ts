@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { CredentialInput, EnvironmentRow, TestConnectionResult } from "@/lib/types";
+import type { CredentialInput, EnvironmentRow, EnvironmentTransport, TestConnectionResult } from "@/lib/types";
 import {
   listEnvironments as ipcList,
   saveEnvironment as ipcSave,
@@ -17,7 +17,7 @@ interface EnvStore {
     name: string;
     host: string;
     port?: number;
-    transportType: "ssh" | "k8s";
+    transportType: EnvironmentTransport;
     credentials: CredentialInput[];
   }) => Promise<boolean>;
   remove: (id: string) => Promise<boolean>;

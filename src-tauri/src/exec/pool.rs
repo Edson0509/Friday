@@ -95,7 +95,14 @@ impl ExecChannelPool {
         }
 
         let env = fetch_environment(pool, environment_id).await?;
-        let channel = build_transport(environment_id, &env, pod, container)?;
+        // 归一化在 from_parts 完成；构造通道必须用归一化后的 key 值，
+        // 避免调用方传 Some("") 时构造 pod="" 的坏 K8sChannel 却缓存在 base 键下。
+        let channel = build_transport(
+            environment_id,
+            &env,
+            key.pod.as_deref(),
+            key.container.as_deref(),
+        )?;
 
         channel
             .connect()

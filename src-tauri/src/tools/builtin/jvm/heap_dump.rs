@@ -68,7 +68,7 @@ impl ToolHandler for HeapDumpHandler {
             tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk not provisioned (cache miss)");
             return error_output(
                 "jdk_not_provisioned",
-                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\") 装备，然后重试本工具。",
+                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/container) 装备，然后重试本工具。",
             );
         };
         let bins = match require_bins(&layout, &["jcmd"]) {
