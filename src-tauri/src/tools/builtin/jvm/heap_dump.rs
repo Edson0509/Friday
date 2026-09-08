@@ -27,6 +27,8 @@ impl ToolHandler for HeapDumpHandler {
         let Some(pid) = args.get("pid").and_then(|v| parse_pid(v)) else {
             return error_output("invalid_params", "pid 必须是正整数字符串");
         };
+        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let dump_timeout = clamp_or(
             args.get("timeout_secs").and_then(|v| v.as_i64()),
             DUMP_DEFAULT_TIMEOUT_SECS,
@@ -37,8 +39,8 @@ impl ToolHandler for HeapDumpHandler {
             &self.core.db,
             &self.core.exec_pool,
             environment,
-            None,
-            None,
+            pod,
+            container,
         )
         .await
         {
@@ -54,8 +56,15 @@ impl ToolHandler for HeapDumpHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+
         // JDK 路径：查缓存，miss 引导 ensure_tool
-        let Some(layout) = self.core.jdk_cache.get(&env.id).await else {
+        let Some(layout) = self
+            .core
+            .jdk_cache
+            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target))
+            .await
+        else {
             tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk not provisioned (cache miss)");
             return error_output(
                 "jdk_not_provisioned",
@@ -91,8 +100,10 @@ impl ToolHandler for HeapDumpHandler {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs = dump_timeout, "heap dump generation timed out, dropping connection");
                 {
                     let mut pool = self.core.exec_pool.lock().await;
-                    pool.disconnect(&env.id).await;
+                    pool.disconnect_target(&target).await;
                 }
+                // k8s 目标：断 SSH 只杀 kubectl，容器内进程可能存活 → 独立连接补刀（VM no-op）
+                crate::exec::pool::spawn_timeout_kill(self.core.db.clone(), target, dump_cmd.clone());
                 return error_output(
                     "timeout_error",
                     &format!("heap dump generation timed out after {dump_timeout}s; ssh connection closed"),
@@ -105,7 +116,10 @@ impl ToolHandler for HeapDumpHandler {
             Ok(Ok(output)) => {
                 if is_jdk_missing(output.exit_code, &output.stderr) {
                     tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk missing on remote, clearing cache");
-                    self.core.jdk_cache.clear(&env.id).await;
+                    self.core
+                        .jdk_cache
+                        .clear(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target))
+                        .await;
                     return error_output(
                         "jdk_missing_on_remote",
                         "远端 JDK 已不存在（可能 /tmp 被清理）。请重新调用 ensure_tool 装备后重试。",
@@ -209,7 +223,9 @@ pub fn jvm_heap_dump_tool_def(
             "properties": {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
                 "pid": { "type": "string", "description": "目标 Java 进程 PID（list_processes 返回）" },
-                "timeout_secs": { "type": "number", "description": "dump 生成超时秒数，默认 300，上限 600" }
+                "timeout_secs": { "type": "number", "description": "dump 生成超时秒数，默认 300，上限 600" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）" },
+                "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment", "pid"]
         }),
