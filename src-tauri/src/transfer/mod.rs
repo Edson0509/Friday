@@ -66,10 +66,10 @@ impl TransferManager {
         let env = crate::exec::pool::fetch_environment(&self.db, env_id)
             .await
             .map_err(|e| e.to_string())?;
-        let transport = crate::exec::pool::build_transport(env_id, &env)
+        let channel = crate::exec::pool::build_transport(env_id, &env, None, None)
             .map_err(|e| e.to_string())?;
-        transport.connect().await.map_err(|e| e.to_string())?;
-        Ok(Arc::new(transport))
+        channel.connect().await.map_err(|e| e.to_string())?;
+        Ok(channel)
     }
 
     /// 是否已有同 session + direction + remote_path 的活跃传输

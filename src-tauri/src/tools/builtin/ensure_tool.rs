@@ -53,7 +53,7 @@ impl ToolHandler for EnsureToolHandler {
         // 获取 channel
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, &self.db).await {
+            match pool.get_or_create(&env.id, None, None, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "ensure_tool: failed to get exec channel");

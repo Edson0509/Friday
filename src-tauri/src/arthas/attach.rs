@@ -317,7 +317,7 @@ async fn get_default_channel_raw(
     env_id: &str,
 ) -> Result<Arc<dyn ExecChannel>, ManagerError> {
     let mut pool = exec_pool.lock().await;
-    pool.get_or_create(env_id, db)
+    pool.get_or_create(env_id, None, None, db)
         .await
         .map_err(|e| ManagerError::Attach(format!("SSH 连接失败: {e}")))
 }

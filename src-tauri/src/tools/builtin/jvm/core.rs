@@ -17,7 +17,7 @@ pub async fn resolve_environment(
     };
     let channel = {
         let mut pool = exec_pool.lock().await;
-        pool.get_or_create(&env.id, db).await.map_err(|e| e.to_string())?
+        pool.get_or_create(&env.id, None, None, db).await.map_err(|e| e.to_string())?
     };
     Ok(Some((env, channel)))
 }
@@ -294,7 +294,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (c, _db, pool, _cache) = core(tmp.path());
         pool.lock().await.insert_channel("env-1".to_string(), Arc::new(SlowChannel) as Arc<dyn ExecChannel>).await;
-        let ch = pool.lock().await.get_or_create_unchecked_for_test("env-1").await;
+        let ch = pool.lock().await.get_or_create_unchecked_for_test(&crate::exec::pool::TargetKey::base("env-1")).await;
         let out = c.exec_jdk_command("s1", "env-1", &ch, "/jdk/bin/jcmd", "/jdk/bin/jcmd 1 GC.heap_info", 1, "log").await;
         assert!(!out.success);
         assert_eq!(out.data["error"], "timeout_error");

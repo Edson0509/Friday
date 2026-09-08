@@ -73,7 +73,7 @@ impl ToolHandler for RunCommandHandler {
         // 获取或建连
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, &self.db).await {
+            match pool.get_or_create(&env.id, None, None, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "run_command: failed to get exec channel");
