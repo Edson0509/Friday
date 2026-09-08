@@ -199,6 +199,8 @@ fn url_encode_path_segment(s: &str) -> String {
 }
 
 pub const REMOTE_TOOLS_DIR: &str = "/tmp/friday-tools";
+/// JDK tarball 下载校验下限（过小 = 损坏/半截文件）。VM 与 k8s 装备共用（单一来源）。
+pub(crate) const JDK_TARBALL_MIN_BYTES: u64 = 50 * 1024 * 1024;
 pub const JDK_BINS: [&str; 4] = ["jcmd", "jstat", "jstack", "jmap"];
 
 /// 进度事件携带的工具名：必须与 MCP 工具名一致（前端按 tool.name 匹配工具卡片）
@@ -284,7 +286,7 @@ impl ToolPackage for JdkPackage {
                     url: Some(url.clone()),
                     ..ProvisionError::new("provision_failed", "download_local", e)
                 })?;
-            if let Err(e) = crate::provision::transfer::validate_download(&local, 50 * 1024 * 1024) {
+            if let Err(e) = crate::provision::transfer::validate_download(&local, JDK_TARBALL_MIN_BYTES) {
                 // 缓存的 tarball 损坏（如过小/被污染）：删除以便重试时重新下载
                 tracing::warn!(session_id = %ctx.session_id, env_id = %ctx.env_id, path = %local.display(), error = %e, "local cached tarball failed validation, removing");
                 let _ = std::fs::remove_file(&local);

@@ -5,7 +5,7 @@
 use crate::exec::k8s::OSS_GROUP;
 use crate::provision::jdk::{
     bins_for, build_download_url, jdk_home_for, run_remote, try_remote_download, JdkPackage,
-    JDK_TOOL_NAME, JvmProbe,
+    JDK_TARBALL_MIN_BYTES, JDK_TOOL_NAME, JvmProbe,
 };
 use crate::provision::package::{
     emit_progress, ProvisionContext, ProvisionError, ProvisionResult, ToolPackage,
@@ -13,14 +13,8 @@ use crate::provision::package::{
 use async_trait::async_trait;
 use std::time::Duration;
 
-// Task 8 接线（ensure_tool 按 pod 分发）前无生产调用点
-#[allow(dead_code)]
 const MUSL_PROBE_PATH: &str = "/lib/ld-musl-x86_64.so.1";
-#[allow(dead_code)]
-const JDK_TARBALL_MIN_BYTES: u64 = 50 * 1024 * 1024;
 
-// Task 8 接线（ensure_tool 按 pod 分发）前无生产调用点
-#[allow(dead_code)]
 pub struct K8sJdkPackage;
 
 #[async_trait]
@@ -167,11 +161,14 @@ impl ToolPackage for K8sJdkPackage {
             } else {
                 "extract"
             };
-            return Err(ProvisionError::new(
-                "provision_failed",
-                stage,
-                format!("tar/chgrp failed (exit {}): {}", extract.exit_code, extract.stderr),
-            ));
+            return Err(ProvisionError {
+                url: Some(url.clone()),
+                ..ProvisionError::new(
+                    "provision_failed",
+                    stage,
+                    format!("tar/chgrp failed (exit {}): {}", extract.exit_code, extract.stderr),
+                )
+            });
         }
 
         // ⑦ 验证
@@ -184,11 +181,14 @@ impl ToolPackage for K8sJdkPackage {
         )
         .await?;
         if verify.exit_code != 0 {
-            return Err(ProvisionError::new(
-                "provision_failed",
-                "verify",
-                format!("jdk binaries missing after extract; check artifactory base url setting ({})", ctx.artifactory_base_url),
-            ));
+            return Err(ProvisionError {
+                url: Some(url.clone()),
+                ..ProvisionError::new(
+                    "provision_failed",
+                    "verify",
+                    format!("jdk binaries missing after extract; check artifactory base url setting ({})", ctx.artifactory_base_url),
+                )
+            });
         }
 
         Ok(ProvisionResult {
@@ -221,12 +221,17 @@ mod tests {
     }
 
     impl ScriptedChannel {
-        fn new(script: Vec<(&str, i32)>) -> Self {
+        /// 每条响应 = (stdout, stderr, exit_code)
+        fn new(script: Vec<(&str, &str, i32)>) -> Self {
             Self {
                 script: std::sync::Mutex::new(
                     script
                         .into_iter()
-                        .map(|(out, code)| ExecOutput { stdout: out.to_string(), stderr: String::new(), exit_code: code })
+                        .map(|(out, err, code)| ExecOutput {
+                            stdout: out.to_string(),
+                            stderr: err.to_string(),
+                            exit_code: code,
+                        })
                         .collect(),
                 ),
                 runs: tokio::sync::Mutex::new(Vec::new()),
@@ -274,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn test_musl_container_rejected_upfront() {
         // ①probe ok ②musl 探测命中（exit 0）
-        let ch = Arc::new(ScriptedChannel::new(vec![(PROBE_OUT, 0), ("", 0)]));
+        let ch = Arc::new(ScriptedChannel::new(vec![(PROBE_OUT, "", 0), ("", "", 0)]));
         let err = K8sJdkPackage.ensure(&ctx(ch), "java").await.unwrap_err();
         assert_eq!(err.code, "unsupported_libc");
         assert_eq!(err.stage, "musl_check");
@@ -284,9 +289,9 @@ mod tests {
     async fn test_container_native_jcmd_short_circuits() {
         // ①probe ②musl 无（exit 1） ③自带 jcmd/jstat 命中
         let ch = Arc::new(ScriptedChannel::new(vec![
-            (PROBE_OUT, 0),
-            ("", 1),
-            ("/usr/bin/jcmd\n/usr/bin/jstat\n", 0),
+            (PROBE_OUT, "", 0),
+            ("", "", 1),
+            ("/usr/bin/jcmd\n/usr/bin/jstat\n", "", 0),
         ]));
         let result = K8sJdkPackage.ensure(&ctx(ch.clone()), "java").await.unwrap();
         assert!(result.cached);
@@ -302,13 +307,13 @@ mod tests {
         // ①probe ②musl ③native miss ④缓存 miss ⑤无 curl/wget（通道 A 失败）
         // ⑥extract（含 chgrp） ⑦verify
         let ch = Arc::new(ScriptedChannel::new(vec![
-            (PROBE_OUT, 0),
-            ("", 1),
-            ("", 1),
-            ("", 1),
-            ("", 1),
-            ("", 0),
-            ("", 0),
+            (PROBE_OUT, "", 0),
+            ("", "", 1),
+            ("", "", 1),
+            ("", "", 1),
+            ("", "", 1),
+            ("", "", 0),
+            ("", "", 0),
         ]));
         // 预置本地缓存 tarball（>50MB）让通道 B 的 download_to_cache 直接命中
         let tmp = tempfile::tempdir().unwrap();
@@ -337,14 +342,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_failure_cleans_home() {
-        // ①probe ②musl ③native ④cache ⑤无下载器 ⑥extract exit 1
+        // ①probe ②musl ③native ④cache ⑤无下载器 ⑥extract exit 1（chgrp 权限错误走 stderr）
         let ch = Arc::new(ScriptedChannel::new(vec![
-            (PROBE_OUT, 0),
-            ("", 1),
-            ("", 1),
-            ("", 1),
-            ("", 1),
-            ("chgrp: Operation not permitted", 1),
+            (PROBE_OUT, "", 0),
+            ("", "", 1),
+            ("", "", 1),
+            ("", "", 1),
+            ("", "", 1),
+            ("", "chgrp: Operation not permitted", 1),
         ]));
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("cache");
@@ -358,6 +363,7 @@ mod tests {
 
         let err = K8sJdkPackage.ensure(&pctx, "java").await.unwrap_err();
         assert_eq!(err.code, "provision_failed");
+        assert_eq!(err.stage, "ownership", "stderr contains chgrp error must map to ownership stage");
         // 失败不留半截：清理命令在编排里（异步 spawn，稍等验证）
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let runs = ch.runs.lock().await;
