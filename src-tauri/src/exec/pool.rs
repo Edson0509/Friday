@@ -295,8 +295,6 @@ pub async fn fetch_environment(
 /// k8s 目标超时补刀（best-effort）：断开 SSH 只能杀死宿主机上的 kubectl，
 /// 容器内进程可能存活（CRI exec 服务端语义）。独立建连（不走池、不持池锁）
 /// 在容器内 `pkill -f <命令签名>`；VM 目标（pod=None）no-op。失败仅告警。
-/// 调用方接线在后续任务（工具超时路径）；此前无生产调用点。
-#[allow(dead_code)]
 pub fn spawn_timeout_kill(db: sqlx::SqlitePool, target: TargetKey, command: String) {
     let Some(pod) = target.pod.clone() else { return };
     tokio::spawn(async move {

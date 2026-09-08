@@ -16,6 +16,15 @@ pub struct JdkCache {
     layouts: Mutex<HashMap<String, JdkLayout>>,
 }
 
+/// 复合缓存键：VM 目标 = env_id；k8s 目标 = env|pod=..|ctr=..
+/// （JdkCache 的 HashMap<String, JdkLayout> 不变，只换 key 构造）
+pub fn cache_key(env_id: &str, pod: Option<&str>, container: Option<&str>) -> String {
+    match pod.filter(|p| !p.is_empty()) {
+        None => env_id.to_string(),
+        Some(p) => format!("{env_id}|pod={p}|ctr={}", container.filter(|c| !c.is_empty()).unwrap_or("-")),
+    }
+}
+
 impl JdkCache {
     pub fn new() -> Self {
         Self::default()
@@ -75,6 +84,15 @@ mod tests {
     async fn test_clear_missing_is_noop() {
         let cache = JdkCache::new();
         cache.clear("nope").await; // must not panic
+    }
+
+    #[test]
+    fn test_cache_key_composite_for_k8s() {
+        assert_eq!(cache_key("e1", None, None), "e1");
+        assert_eq!(cache_key("e1", Some("p1"), None), "e1|pod=p1|ctr=-");
+        assert_eq!(cache_key("e1", Some("p1"), Some("c1")), "e1|pod=p1|ctr=c1");
+        // 空串视为未传
+        assert_eq!(cache_key("e1", Some(""), None), "e1");
     }
 
     #[tokio::test]

@@ -37,6 +37,8 @@ impl ToolHandler for JvmSimpleHandler {
         let Some(pid) = args.get("pid").and_then(|v| parse_pid(v)) else {
             return error_output("invalid_params", "pid 必须是正整数字符串");
         };
+        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let timeout_secs = clamp_or(
             args.get("timeout_secs").and_then(|v| v.as_i64()),
             self.timeouts.default_secs,
@@ -47,6 +49,8 @@ impl ToolHandler for JvmSimpleHandler {
             &self.core.db,
             &self.core.exec_pool,
             environment,
+            pod,
+            container,
         )
         .await
         {
@@ -63,11 +67,14 @@ impl ToolHandler for JvmSimpleHandler {
         };
 
         // JDK 路径：查缓存，miss 引导 ensure_tool
-        let Some(layout) = self.core.jdk_cache.get(&env.id).await else {
+        let Some(layout) = self.core.jdk_cache
+            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&env.id, pod, container))
+            .await
+        else {
             tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk not provisioned (cache miss)");
             return error_output(
                 "jdk_not_provisioned",
-                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\") 装备，然后重试本工具。",
+                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/container) 装备，然后重试本工具。",
             );
         };
         let bins = match require_bins(&layout, &[self.bin_key]) {
@@ -81,17 +88,10 @@ impl ToolHandler for JvmSimpleHandler {
             Err(e) => return error_output("invalid_params", &e),
         };
 
-        tracing::info!(session_id = %ctx.session_id, env_id = %env.id, pid, command, "jvm tool executing");
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+        tracing::info!(session_id = %ctx.session_id, env_id = %env.id, pod = pod.unwrap_or("-"), pid, command, "jvm tool executing");
         self.core
-            .exec_jdk_command(
-                &ctx.session_id,
-                &env.id,
-                &channel,
-                &bin_path,
-                &command,
-                timeout_secs,
-                "log",
-            )
+            .exec_jdk_command(&ctx.session_id, &target, &channel, &bin_path, &command, timeout_secs, "log")
             .await
     }
 }
@@ -172,6 +172,14 @@ fn simple_schema(
             "type": "number",
             "description": format!("超时秒数，默认 {}，上限 {}", timeouts.default_secs, timeouts.max_secs)
         }),
+    );
+    props.insert(
+        "pod".into(),
+        serde_json::json!({ "type": "string", "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）" }),
+    );
+    props.insert(
+        "container".into(),
+        serde_json::json!({ "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }),
     );
     for (k, v) in extra_props {
         props.insert((*k).into(), v);

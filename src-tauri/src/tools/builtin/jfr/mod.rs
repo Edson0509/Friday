@@ -78,7 +78,7 @@ impl JfrRecordHandler {
             duration_secs,
         );
 
-        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment).await {
+        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment, None, None).await {
             Ok(Some(pair)) => pair,
             Ok(None) => {
                 return error_output(

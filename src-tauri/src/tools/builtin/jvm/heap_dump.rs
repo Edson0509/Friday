@@ -37,6 +37,8 @@ impl ToolHandler for HeapDumpHandler {
             &self.core.db,
             &self.core.exec_pool,
             environment,
+            None,
+            None,
         )
         .await
         {
