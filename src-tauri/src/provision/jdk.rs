@@ -412,7 +412,7 @@ pub(crate) async fn run_remote(
     }
 }
 
-fn bins_for(home: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn bins_for(home: &str) -> std::collections::HashMap<String, String> {
     JDK_BINS
         .iter()
         .map(|b| (b.to_string(), format!("{home}/bin/{b}")))
