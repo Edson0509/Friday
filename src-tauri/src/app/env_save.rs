@@ -324,7 +324,9 @@ pub async fn save_environment_with_transport(
     })
 }
 
-/// 兼容入口：transport_type 默认 ssh（既有调用方与测试不变）
+/// 兼容入口：transport_type 默认 ssh（既有调用方与测试不变）。
+/// 调用方全在 #[cfg(test)]，非测试构建下显式豁免 dead_code 警告。
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn save_environment(
     pool: &SqlitePool,
     environment_id: Option<&str>,
