@@ -32,7 +32,7 @@ impl TargetKey {
         Self {
             env_id: env_id.to_string(),
             pod: Some(pod.to_string()),
-            container: container.map(|s| s.to_string()),
+            container: container.filter(|c| !c.is_empty()).map(|s| s.to_string()),
         }
     }
 
@@ -295,6 +295,14 @@ pub async fn fetch_environment(
     })
 }
 
+/// 超时补刀命令（纯函数，可单测）：容器内 pkill -f <ERE 转义 + 自排除 pattern>
+fn timeout_kill_command(command: &str) -> String {
+    format!(
+        "pkill -f {}",
+        super::ssh::shell_quote_single(&super::k8s::pkill_pattern(command))
+    )
+}
+
 /// k8s 目标超时补刀（best-effort）：断开 SSH 只能杀死宿主机上的 kubectl，
 /// 容器内进程可能存活（CRI exec 服务端语义）。独立建连（不走池、不持池锁）
 /// 在容器内 `pkill -f <命令签名>`；VM 目标（pod=None）no-op。失败仅告警。
@@ -319,13 +327,17 @@ pub fn spawn_timeout_kill(db: sqlx::SqlitePool, target: TargetKey, command: Stri
             tracing::warn!(env_id = %target.env_id, error = %e, "timeout kill: reconnect failed");
             return;
         }
-        let kill_cmd = format!(
-            "pkill -f {}",
-            super::ssh::shell_quote_single(&super::k8s::pkill_pattern(&command))
-        );
+        let kill_cmd = timeout_kill_command(&command);
         match channel.run(&kill_cmd).await {
-            Ok(out) => tracing::info!(env_id = %target.env_id, pod = %pod, exit_code = out.exit_code, "timeout kill executed"),
-            Err(e) => tracing::warn!(env_id = %target.env_id, error = %e, "timeout kill: pkill failed (best-effort)"),
+            Ok(out) if out.exit_code == 0 => {
+                tracing::info!(env_id = %target.env_id, pod = %pod, "timeout kill executed");
+            }
+            Ok(out) => {
+                tracing::warn!(env_id = %target.env_id, pod = %pod, exit_code = out.exit_code, stderr = %out.stderr, "timeout kill pkill exited non-zero (1 = no matching process; wrapper self-kill 也可能产生非零)");
+            }
+            Err(e) => {
+                tracing::warn!(env_id = %target.env_id, error = %e, "timeout kill: pkill failed (best-effort)");
+            }
         }
         channel.disconnect().await;
     });
@@ -546,5 +558,17 @@ mod tests {
     fn test_from_parts_drops_container_without_pod() {
         let k = TargetKey::from_parts("e", None, Some("c1"));
         assert_eq!(k, TargetKey::base("e"), "container without pod is meaningless, must normalize to base key");
+    }
+
+    #[test]
+    fn test_k8s_constructor_normalizes_empty_container() {
+        let k = TargetKey::k8s("e", "p", Some(""));
+        assert_eq!(k.container, None);
+    }
+
+    #[test]
+    fn test_timeout_kill_command_bracketed_and_quoted() {
+        let cmd = timeout_kill_command("jstat -gcutil 1");
+        assert!(cmd.starts_with("pkill -f '[j]stat -gcutil 1'"), "cmd: {cmd}");
     }
 }

@@ -35,11 +35,19 @@ pub fn wrap_exec_command(pod: &str, container: Option<&str>, cmd: &str) -> Strin
     )
 }
 
-/// pkill -f 的 pattern：转义 ERE 元字符（pkill -f 按扩展正则匹配整条命令行，
-/// 命令串里的 `. + ( )` 等字面量必须转义，防止误杀无关进程）
+/// pkill -f 的 pattern：ERE 元字符转义 + 首字符 bracket 化。
+/// bracket 化是 pkill 自排除惯用法：wrapper `sh -c 'pkill -f [j]stat ...'`
+/// 的 cmdline 含 `[j]stat` 字面量，pattern `[j]stat` 匹配 `jstat` 但不匹配
+/// 自身 cmdline，避免 wrapper 被 SIGTERM 导致 exit 143 误导日志。
 pub fn pkill_pattern(command: &str) -> String {
     let mut out = String::with_capacity(command.len() + 8);
-    for c in command.chars() {
+    for (i, c) in command.char_indices() {
+        if i == 0 {
+            out.push('[');
+            out.push(c);
+            out.push(']');
+            continue;
+        }
         if matches!(
             c,
             '\\' | '.' | '^' | '$' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}'
@@ -197,7 +205,15 @@ mod tests {
 
     #[test]
     fn test_pkill_pattern_escapes_regex_metachars() {
-        assert_eq!(pkill_pattern("/jdk-21.0.11+9/bin/jcmd 1 GC.heap_dump"), "/jdk-21\\.0\\.11\\+9/bin/jcmd 1 GC\\.heap_dump");
+        assert_eq!(pkill_pattern("/jdk-21.0.11+9/bin/jcmd 1 GC.heap_dump"), "[/]jdk-21\\.0\\.11\\+9/bin/jcmd 1 GC\\.heap_dump");
+    }
+
+    #[test]
+    fn test_pkill_pattern_brackets_first_char_for_self_exclusion() {
+        let p = pkill_pattern("jstat -gcutil 1");
+        assert!(p.starts_with("[j]"), "first char must be bracketed for self-exclusion: {p}");
+        // wrapper cmdline 含 [j]stat 字面量，pattern [j]stat 不匹配它
+        assert!(!p.contains("[j][j]"), "no double bracketing: {p}");
     }
 
     #[test]
