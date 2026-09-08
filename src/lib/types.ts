@@ -129,12 +129,15 @@ export interface ToolInfo {
 
 export type EnvironmentAuthType = "private_key" | "password";
 
+export type EnvironmentTransport = "ssh" | "k8s";
+
 export interface EnvironmentRow {
   id: string;
   name: string;
   host: string;
   port: number;
   user: string;
+  transport_type: EnvironmentTransport;
   auth_type: EnvironmentAuthType;
   private_key_path: string | null;
   created_at: string;

@@ -128,6 +128,7 @@ export async function saveEnvironment(params: {
   name: string;
   host: string;
   port?: number;
+  transportType: "ssh" | "k8s";
   credentials: CredentialInput[];
 }): Promise<SaveEnvironmentResult> {
   return invoke<SaveEnvironmentResult>("save_environment_cmd", {
@@ -136,6 +137,7 @@ export async function saveEnvironment(params: {
       name: params.name,
       host: params.host,
       port: params.port ?? null,
+      transportType: params.transportType,
       credentials: params.credentials,
     },
   });

@@ -17,6 +17,7 @@ interface EnvStore {
     name: string;
     host: string;
     port?: number;
+    transportType: "ssh" | "k8s";
     credentials: CredentialInput[];
   }) => Promise<boolean>;
   remove: (id: string) => Promise<boolean>;
