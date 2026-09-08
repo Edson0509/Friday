@@ -87,6 +87,75 @@ impl ExecChannel for K8sChannel {
         self.base.run(&wrapped).await
     }
 
+    async fn upload(
+        &self,
+        local: &std::path::Path,
+        remote_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        validate_pod_path(remote_path)?;
+        let basename = remote_path.rsplit('/').next().unwrap_or("file");
+        let staging = format!("{}/{}-{}", STAGING_DIR, uuid::Uuid::new_v4(), basename);
+
+        // ① 宿主机 staging 目录
+        self.base.run(&format!("mkdir -p {}", shell_quote_single(STAGING_DIR))).await?;
+
+        // ② leg A：SFTP → 宿主机 staging
+        self.base.upload(local, &staging).await?;
+
+        // ③ leg B：kubectl exec -i 注入容器。stdin 重定向发生在宿主机 bash 上，
+        //    数据不流经 Friday 内存（dump 级大文件安全）；容器内依赖仅 sh + cat。
+        let parent = match remote_path.rfind('/') {
+            Some(0) => "/".to_string(),
+            Some(i) => remote_path[..i].to_string(),
+            None => "/".to_string(),
+        };
+        let inner = format!(
+            "mkdir -p {} && cat > {}",
+            shell_quote_single(&parent),
+            shell_quote_single(remote_path)
+        );
+        let host_cmd = format!(
+            "kubectl exec -i {}{} -- sh -c {} < {}",
+            self.ctr_flag(),
+            shell_quote_single(&self.pod),
+            shell_quote_single(&inner),
+            shell_quote_single(&staging)
+        );
+        let out = self.base.run(&host_cmd).await?;
+
+        // staging 清理（成败都清）
+        let _ = self
+            .base
+            .run(&format!("rm -f {}", shell_quote_single(&staging)))
+            .await;
+
+        if out.exit_code != 0 {
+            tracing::warn!(pod = %self.pod, remote_path, exit_code = out.exit_code, stderr = %out.stderr, "k8s upload: kubectl exec -i failed");
+            // 半截文件兜底清理（经 kubectl exec，容器内）
+            let _ = self.run(&format!("rm -f {}", shell_quote_single(remote_path))).await;
+            return Err(format!(
+                "k8s upload: kubectl exec -i failed (exit {}): {}",
+                out.exit_code, out.stderr
+            )
+            .into());
+        }
+
+        // ④ 属组修正（spec：chgrp 失败 = 上传失败，清理目标文件）
+        let q = shell_quote_single(remote_path);
+        let fix = format!("chgrp {OSS_GROUP} {q} && chmod g+r {q}");
+        let gout = self.run(&fix).await?;
+        if gout.exit_code != 0 {
+            tracing::warn!(pod = %self.pod, remote_path, stderr = %gout.stderr, "k8s upload: chgrp failed");
+            let _ = self.run(&format!("rm -f {q}")).await;
+            return Err(format!(
+                "k8s upload: chgrp {OSS_GROUP} failed (exec 用户可能不在 {OSS_GROUP} 组): {}",
+                gout.stderr
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.base.connect().await
     }
@@ -175,6 +244,119 @@ mod tests {
             ch.run("ps -ef").await.unwrap();
             let runs = base.runs.lock().await;
             assert_eq!(runs[0], "kubectl exec -c 'main' 'svc-1' -- sh -c 'ps -ef'");
+        }
+    }
+
+    mod upload_tests {
+        use super::super::*;
+        use crate::exec::channel::ExecChannel;
+        use async_trait::async_trait;
+        use std::path::Path;
+
+        /// 可编排响应的 base：run 第 n 次返回脚本第 n 条 (stdout, exit_code)；
+        /// upload 记录 (local, remote)。默认 run 返回 exit 0。
+        struct ScriptedBase {
+            script: std::sync::Mutex<std::collections::VecDeque<(String, i32)>>,
+            runs: tokio::sync::Mutex<Vec<String>>,
+            uploads: tokio::sync::Mutex<Vec<(std::path::PathBuf, String)>>,
+        }
+
+        impl ScriptedBase {
+            fn new(script: Vec<(&str, i32)>) -> Self {
+                Self {
+                    script: std::sync::Mutex::new(
+                        script.into_iter().map(|(s, c)| (s.to_string(), c)).collect(),
+                    ),
+                    runs: tokio::sync::Mutex::new(Vec::new()),
+                    uploads: tokio::sync::Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl ExecChannel for ScriptedBase {
+            async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+                self.runs.lock().await.push(cmd.to_string());
+                let (stdout, exit_code) = self
+                    .script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or((String::new(), 0));
+                Ok(ExecOutput { stdout, stderr: String::new(), exit_code })
+            }
+            async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+            async fn disconnect(&self) {}
+            async fn is_alive(&self) -> bool { true }
+            async fn upload(&self, local: &Path, remote: &str)
+                -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.uploads.lock().await.push((local.to_path_buf(), remote.to_string()));
+                Ok(())
+            }
+        }
+
+        fn chan(script: Vec<(&str, i32)>) -> (Arc<ScriptedBase>, K8sChannel) {
+            let base = Arc::new(ScriptedBase::new(script));
+            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), container: None };
+            (base, ch)
+        }
+
+        #[tokio::test]
+        async fn test_upload_happy_path_two_legs_and_chgrp() {
+            let (base, ch) = chan(vec![]);
+            ch.upload(Path::new("/local/jdk.tar.gz"), "/opt/log/dump/heapdump/friday-tools/jdk.tar.gz")
+                .await
+                .unwrap();
+            // leg A：SFTP 到宿主机 staging（路径含随机前缀）
+            let uploads = base.uploads.lock().await;
+            assert_eq!(uploads.len(), 1);
+            assert!(uploads[0].1.starts_with("/tmp/friday-tools/staging/"), "staging: {}", uploads[0].1);
+            assert!(uploads[0].1.ends_with("-jdk.tar.gz"));
+            // leg B：kubectl exec -i + host 侧重定向 + 父目录创建
+            let runs = base.runs.lock().await;
+            let host_leg = runs.iter().find(|c| c.contains("kubectl exec -i")).expect("host leg");
+            assert!(host_leg.contains("< "), "host stdin redirect: {host_leg}");
+            assert!(host_leg.contains(r"cat > '\''/opt/log/dump/heapdump/friday-tools/jdk.tar.gz'\''"), "{host_leg}");
+            assert!(host_leg.contains(r"mkdir -p '\''/opt/log/dump/heapdump/friday-tools'\''"), "{host_leg}");
+            // 属组修正走 kubectl exec（容器内，不是宿主机）
+            let chgrp = runs.iter().find(|c| c.contains("chgrp ossgroup")).expect("chgrp leg");
+            assert!(chgrp.contains("kubectl exec"), "chgrp must run inside pod: {chgrp}");
+            assert!(chgrp.contains("chmod g+r"));
+            // staging 清理
+            assert!(runs.iter().any(|c| c.contains("rm -f '/tmp/friday-tools/staging/")));
+        }
+
+        #[tokio::test]
+        async fn test_upload_host_leg_failure_cleans_remote_and_errors() {
+            // 脚本顺序：①mkdir staging ②kubectl exec -i（exit 1）③rm staging ④rm remote（补刀清理）
+            let (base, ch) = chan(vec![("", 0), ("", 1), ("", 0), ("", 0)]);
+            let err = ch
+                .upload(Path::new("/local/x"), "/opt/log/dump/heapdump/friday-tools/x")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("kubectl exec -i failed"), "err: {err}");
+            let runs = base.runs.lock().await;
+            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/heapdump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
+        }
+
+        #[tokio::test]
+        async fn test_upload_chgrp_failure_cleans_remote_and_errors() {
+            // ①mkdir ②kubectl -i ok ③rm staging ④chgrp(exit 1) ⑤rm remote
+            let (base, ch) = chan(vec![("", 0), ("", 0), ("", 0), ("", 1), ("", 0)]);
+            let err = ch
+                .upload(Path::new("/local/x"), "/opt/log/dump/heapdump/friday-tools/x")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("chgrp ossgroup failed"), "err: {err}");
+            let runs = base.runs.lock().await;
+            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/heapdump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
+        }
+
+        #[tokio::test]
+        async fn test_upload_rejects_relative_path() {
+            let (_base, ch) = chan(vec![]);
+            let err = ch.upload(Path::new("/local/x"), "relative/x").await.unwrap_err();
+            assert!(err.to_string().contains("absolute"), "err: {err}");
         }
     }
 }
