@@ -78,6 +78,7 @@ impl ToolHandler for EnsureToolHandler {
             cache_dir: self.cache_dir.clone(),
             artifactory_base_url: base_url,
             arthas_zip: None,
+            remote_tools_dir: crate::provision::jdk::REMOTE_TOOLS_DIR.to_string(),
             timeouts: StageTimeouts::default(),
             bus: self.bus.clone(),
         };

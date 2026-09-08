@@ -221,8 +221,8 @@ pub fn validate_java_bin(java_bin: &str) -> Result<(), String> {
 }
 
 /// 按探测到的 OpenJDK 版本命名的安装目录
-pub fn jdk_home_for(openjdk_version: &str) -> String {
-    format!("{REMOTE_TOOLS_DIR}/jdk-{openjdk_version}")
+pub fn jdk_home_for(tools_dir: &str, openjdk_version: &str) -> String {
+    format!("{tools_dir}/jdk-{openjdk_version}")
 }
 
 pub struct JdkPackage;
@@ -248,12 +248,13 @@ impl ToolPackage for JdkPackage {
     async fn ensure(&self, ctx: &ProvisionContext, java_bin: &str) -> Result<ProvisionResult, ProvisionError> {
         let start = std::time::Instant::now();
         let probe = self.probe(ctx, java_bin).await?;
-        let home = jdk_home_for(&probe.openjdk_version);
-        let tarball = format!("{REMOTE_TOOLS_DIR}/jdk-{}.tar.gz", probe.openjdk_version);
+        let dir = &ctx.remote_tools_dir;
+        let home = jdk_home_for(dir, &probe.openjdk_version);
+        let tarball = format!("{dir}/jdk-{}.tar.gz", probe.openjdk_version);
 
         // 1. 远端缓存检查
         emit_progress(ctx, JDK_TOOL_NAME, "check_cache", &format!("checking {home}/bin/jcmd"));
-        let check = run_remote(ctx, &format!("mkdir -p {REMOTE_TOOLS_DIR} && test -x {home}/bin/jcmd"), Duration::from_secs(ctx.timeouts.probe), "check_cache").await?;
+        let check = run_remote(ctx, &format!("mkdir -p {dir} && test -x {home}/bin/jcmd"), Duration::from_secs(ctx.timeouts.probe), "check_cache").await?;
         if check.exit_code == 0 {
             return Ok(ProvisionResult {
                 cached: true,
@@ -309,7 +310,7 @@ impl ToolPackage for JdkPackage {
         emit_progress(ctx, JDK_TOOL_NAME, "extract", &format!("extracting {tarball}"));
         let v = probe.openjdk_version.as_str();
         let extract_cmd = format!(
-            "mkdir -p {REMOTE_TOOLS_DIR} && cd {REMOTE_TOOLS_DIR} && \
+            "mkdir -p {dir} && cd {dir} && \
              tar -xzf jdk-{v}.tar.gz && \
              topdir=$(tar -tzf jdk-{v}.tar.gz | head -1 | cut -f1 -d'/') && \
              if [ \"$topdir\" != \"jdk-{v}\" ] && [ -d \"$topdir\" ]; then rm -rf jdk-{v} && mv \"$topdir\" jdk-{v}; fi && \
@@ -667,6 +668,7 @@ mod tests {
             cache_dir: std::path::PathBuf::from("/tmp/unused-cache"),
             artifactory_base_url: "https://artifactory.example.com/artifactory/release".into(),
             arthas_zip: None,
+            remote_tools_dir: "/tmp/friday-tools".into(),
             timeouts: StageTimeouts::default(),
             bus: crate::app::events::EventBus::disabled(),
         }

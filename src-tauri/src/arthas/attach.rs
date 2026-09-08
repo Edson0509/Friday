@@ -342,6 +342,7 @@ async fn provision_context(
         cache_dir: deps.cache_dir.clone(),
         artifactory_base_url: base,
         arthas_zip: deps.arthas_zip.clone(),
+        remote_tools_dir: crate::provision::jdk::REMOTE_TOOLS_DIR.to_string(),
         timeouts: crate::provision::package::StageTimeouts::default(),
         bus: deps.bus.clone(),
     })
