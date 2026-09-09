@@ -40,6 +40,7 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
     let id = state.id.clone();
     let env_id = state.env_id.clone();
     let pod = state.pod.clone();
+    let namespace = state.namespace.clone();
     let container = state.container.clone();
     let remote_path = state.remote_path.clone();
     let local = state.local_path.clone();
@@ -50,7 +51,7 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
     let mut attempt: u32 = 0;
     let mut last_err: Option<String> = None;
 
-    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), remote_path = %remote_path, "transfer worker: download starting");
+    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), namespace = namespace.as_deref().unwrap_or("-"), remote_path = %remote_path, "transfer worker: download starting");
 
     loop {
         if cancel.is_cancelled() {
@@ -85,7 +86,7 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
         }
 
         let channel = match mgr
-            .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+            .dedicated_channel(&env_id, pod.as_deref(), namespace.as_deref(), container.as_deref())
             .await
         {
             Ok(c) => c,
@@ -201,6 +202,7 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
                         &mgr,
                         &env_id,
                         pod.as_deref(),
+                        namespace.as_deref(),
                         container.as_deref(),
                         &remote_path,
                     )
@@ -222,10 +224,11 @@ async fn channel_cmd_after_disconnect(
     mgr: &TransferManager,
     env_id: &str,
     pod: Option<&str>,
+    namespace: Option<&str>,
     container: Option<&str>,
     remote_path: &str,
 ) -> Result<(), String> {
-    let channel = mgr.dedicated_channel(env_id, pod, container).await?;
+    let channel = mgr.dedicated_channel(env_id, pod, namespace, container).await?;
     let cmd = format!("rm -f {}", crate::exec::ssh::shell_quote_single(remote_path));
     match channel.run(&cmd).await {
         Err(e) => {
@@ -248,6 +251,7 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
     let id = state.id.clone();
     let env_id = state.env_id.clone();
     let pod = state.pod.clone();
+    let namespace = state.namespace.clone();
     let container = state.container.clone();
     let remote_path = state.remote_path.clone();
     let local = state.local_path.clone();
@@ -262,7 +266,7 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
     };
     let total = meta.len();
 
-    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), remote_path = %remote_path, total, "transfer worker: upload starting");
+    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), namespace = namespace.as_deref().unwrap_or("-"), remote_path = %remote_path, total, "transfer worker: upload starting");
 
     loop {
         if cancel.is_cancelled() {
@@ -295,7 +299,7 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
         }
 
         let channel = match mgr
-            .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+            .dedicated_channel(&env_id, pod.as_deref(), namespace.as_deref(), container.as_deref())
             .await
         {
             Ok(c) => c,
@@ -341,7 +345,7 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
             Ok(()) => {
                 // 远端大小校验：再开短连接 stat（pod 目标下 stat 进容器）
                 let check = match mgr
-                    .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+                    .dedicated_channel(&env_id, pod.as_deref(), namespace.as_deref(), container.as_deref())
                     .await
                 {
                     Ok(c) => {
@@ -570,6 +574,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         let id = mgr.start(state).await;
 
@@ -600,6 +605,7 @@ mod tests {
             "/tmp/up.jar",
             local,
             false,
+            None,
             None,
             None,
         );

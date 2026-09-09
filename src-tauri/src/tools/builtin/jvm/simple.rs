@@ -39,6 +39,7 @@ impl ToolHandler for JvmSimpleHandler {
             return error_output("invalid_params", "pid 必须是正整数字符串");
         };
         let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let namespace = args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let timeout_secs = clamp_or(
             args.get("timeout_secs").and_then(|v| v.as_i64()),
@@ -51,6 +52,7 @@ impl ToolHandler for JvmSimpleHandler {
             &self.core.exec_pool,
             environment,
             pod,
+            namespace,
             container,
         )
         .await
@@ -67,12 +69,12 @@ impl ToolHandler for JvmSimpleHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod + k8s 名防呆
-        if let Err(msg) = validate_target(&env, pod, container) {
+        // 环境类型门禁：vm 拒 pod/ns / container 必填 pod+namespace + k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, namespace, container) {
             return error_output("environment_type_mismatch", &msg);
         }
 
-        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, namespace, container);
 
         // JDK 路径：查缓存，miss 引导 ensure_tool
         let Some(layout) = self.core.jdk_cache
@@ -82,7 +84,7 @@ impl ToolHandler for JvmSimpleHandler {
             tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk not provisioned (cache miss)");
             return error_output(
                 "jdk_not_provisioned",
-                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/container) 装备，然后重试本工具。",
+                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/namespace/container) 装备，然后重试本工具。",
             );
         };
         let bins = match require_bins(&layout, &[self.bin_key]) {
@@ -96,7 +98,7 @@ impl ToolHandler for JvmSimpleHandler {
             Err(e) => return error_output("invalid_params", &e),
         };
 
-        tracing::info!(session_id = %ctx.session_id, env_id = %env.id, pod = pod.unwrap_or("-"), container = container.unwrap_or("-"), pid, command, "jvm tool executing");
+        tracing::info!(session_id = %ctx.session_id, env_id = %env.id, pod = pod.unwrap_or("-"), namespace = namespace.unwrap_or("-"), container = container.unwrap_or("-"), pid, command, "jvm tool executing");
         self.core
             .exec_jdk_command(&ctx.session_id, &target, &channel, &bin_path, &command, timeout_secs, "log")
             .await
@@ -183,6 +185,10 @@ fn simple_schema(
     props.insert(
         "pod".into(),
         serde_json::json!({ "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" }),
+    );
+    props.insert(
+        "namespace".into(),
+        serde_json::json!({ "type": "string", "description": "Kubernetes namespace（容器环境必填；与 pod 一起来自 k8s_find_pods 返回；全小写）" }),
     );
     props.insert(
         "container".into(),
@@ -315,6 +321,7 @@ mod tests {
     use crate::tools::builtin::jvm::jdk_cache::JdkLayout;
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use tokio::sync::Mutex as TokioMutex;
 
     /// 不校验命令前缀的简单 channel（jstat/jcmd 通用）
     struct OkChannel;
@@ -325,6 +332,33 @@ mod tests {
             &self,
             _cmd: &str,
         ) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(ExecOutput {
+                stdout: "S0 S1 E O M YGC FGC".into(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+        async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+        async fn is_alive(&self) -> bool {
+            true
+        }
+    }
+
+    /// 记录型 channel：捕获收到的命令（K8sChannel 包一层断言 -n 透传用）
+    struct RecordingChannel {
+        calls: TokioMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ExecChannel for RecordingChannel {
+        async fn run(
+            &self,
+            cmd: &str,
+        ) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.lock().await.push(cmd.to_string());
             Ok(ExecOutput {
                 stdout: "S0 S1 E O M YGC FGC".into(),
                 stderr: String::new(),
@@ -402,13 +436,16 @@ mod tests {
         // Agent 把用户口中的服务名（含大写）直接当 pod 名 → 防呆拦截
         let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "SNMPAgentService", None, None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "SNMPAgentService", Some("ns1"), None),
             Arc::new(OkChannel),
         ).await;
         let handler =
             JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
         let out = handler
-            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "SNMPAgentService"}), &ctx())
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "SNMPAgentService", "namespace": "ns1"}),
+                &ctx(),
+            )
             .await;
         assert!(!out.success, "out: {}", out.data);
         assert_eq!(out.data["error"], "environment_type_mismatch");
@@ -421,25 +458,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pod_target_uses_composite_cache_and_k8s_channel() {
-        // k8s 目标：注入 TargetKey::k8s(env,"pod-1",ns=None) 通道 + 复合键 cache 条目
+    async fn test_container_env_pod_without_namespace_rejected() {
+        // 容器环境带 pod 缺 namespace → 门禁拦截（引导传 find_pods 返回的 ns）
         let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
             crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
             Arc::new(OkChannel),
         ).await;
+        let handler =
+            JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
+        let out = handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1"}), &ctx())
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        assert!(
+            out.data["message"].as_str().unwrap().contains("缺少 namespace"),
+            "message must demand namespace: {}",
+            out.data["message"]
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_pod_target_uses_composite_cache_and_k8s_channel() {
+        // k8s 目标：注入 TargetKey::k8s(env,"pod-1",ns) 通道 + 复合键 cache 条目
+        let (tmp, core, env_id) = setup_as("container").await;
+        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", Some("ns1"), None);
+        core.exec_pool.lock().await.insert_channel(target.clone(), Arc::new(OkChannel)).await;
         let mut bins = HashMap::new();
         bins.insert("jstat".to_string(), "/opt/friday-tools/jdk/bin/jstat".to_string());
         core.jdk_cache
             .set(
-                &crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None)),
+                &crate::tools::builtin::jvm::jdk_cache::cache_key(&target),
                 JdkLayout { tool_home: "/opt/friday-tools/jdk".into(), bins },
             )
             .await;
         let handler =
             JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
         let out = handler
-            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1"}), &ctx())
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1", "namespace": "ns1"}),
+                &ctx(),
+            )
             .await;
         assert!(out.success, "out: {}", out.data);
         assert!(
@@ -451,19 +512,64 @@ mod tests {
         drop(tmp);
     }
 
+    /// NS 贯通端到端：容器目标 pod+namespace → K8sChannel 包装命令必须带 -n 'ns1'
+    #[tokio::test]
+    async fn test_pod_target_with_namespace_passes_n_flag_to_kubectl() {
+        let base = Arc::new(RecordingChannel { calls: TokioMutex::new(Vec::new()) });
+        let (tmp, core, env_id) = setup_as("container").await;
+        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", Some("ns1"), None);
+        core.exec_pool.lock().await.insert_channel(
+            target.clone(),
+            Arc::new(crate::exec::k8s::K8sChannel {
+                base: base.clone(),
+                pod: "pod-1".to_string(),
+                namespace: Some("ns1".to_string()),
+                container: None,
+            }),
+        ).await;
+        let mut bins = HashMap::new();
+        bins.insert("jstat".to_string(), "/opt/friday-tools/jdk/bin/jstat".to_string());
+        core.jdk_cache
+            .set(
+                &crate::tools::builtin::jvm::jdk_cache::cache_key(&target),
+                JdkLayout { tool_home: "/opt/friday-tools/jdk".into(), bins },
+            )
+            .await;
+        let handler =
+            JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
+        let out = handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1", "namespace": "ns1"}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let calls = base.calls.lock().await;
+        assert!(
+            calls[0].starts_with("kubectl exec -n 'ns1' 'pod-1' --"),
+            "kubectl must carry -n 'ns1' before pod: {}",
+            calls[0]
+        );
+        assert!(calls[0].contains("jstat -gcutil 1234"), "cmd: {}", calls[0]);
+        drop(tmp);
+    }
+
     #[tokio::test]
     async fn test_pod_target_with_only_vm_cache_misses() {
         // 只有 VM cache 条目（env_id 裸键）时带 pod 调用 → jdk_not_provisioned（键隔离）
         let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", Some("ns1"), None),
             Arc::new(OkChannel),
         ).await;
         // setup() 已写入 VM 裸键条目；不再写复合键
         let handler =
             JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
         let out = handler
-            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1"}), &ctx())
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1", "namespace": "ns1"}),
+                &ctx(),
+            )
             .await;
         assert!(!out.success);
         assert_eq!(out.data["error"], "jdk_not_provisioned");

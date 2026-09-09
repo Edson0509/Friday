@@ -70,6 +70,7 @@ impl JfrRecordHandler {
             return error_output("invalid_args", "pid 必须是正整数字符串");
         };
         let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let namespace = args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let (duration_secs, settings) = match mapping::validate_record_params(args) {
             Ok(v) => v,
@@ -80,7 +81,7 @@ impl JfrRecordHandler {
             duration_secs,
         );
 
-        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment, pod, container).await {
+        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment, pod, namespace, container).await {
             Ok(Some(pair)) => pair,
             Ok(None) => {
                 return error_output(
@@ -93,12 +94,12 @@ impl JfrRecordHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
-        if let Err(msg) = validate_target(&env, pod, container) {
+        // 环境类型门禁：vm 拒 pod/ns / container 必填 pod+namespace（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, namespace, container) {
             return error_output("environment_type_mismatch", &msg);
         }
 
-        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, namespace, container);
 
         // JDK 路径：查缓存，miss 引导 ensure_tool
         let Some(layout) = self
@@ -110,7 +111,7 @@ impl JfrRecordHandler {
             tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk not provisioned (cache miss)");
             return error_output(
                 "jdk_not_provisioned",
-                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/container) 装备，然后重试本工具。",
+                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/namespace/container) 装备，然后重试本工具。",
             );
         };
         let bins = match require_bins(&layout, &["jcmd"]) {
@@ -201,7 +202,7 @@ impl JfrRecordHandler {
         };
 
         // ③ 后台拉回：TransferManager（MCP 同步调用返回，Agent 轮询 transfer_status）。
-        //    pod 目标 state 带 pod/container，worker 专用连接走 K8sChannel 两跳拉回
+        //    pod 目标 state 带 pod/namespace/container，worker 专用连接走 K8sChannel 两跳拉回
         let session_dir = artifact_dir_for(&self.core.artifacts_dir, &ctx.session_id);
         let local_path = session_dir.join(format!("recording-{pid}-{ts}.jfr"));
         let state = crate::transfer::state::TransferState::new(
@@ -212,6 +213,7 @@ impl JfrRecordHandler {
             local_path.clone(),
             true, // 下载成功后清理远端（Friday 自己生成的文件）
             pod,
+            namespace,
             container,
         );
         let transfer_id = self.transfer.start(state).await;
@@ -484,6 +486,7 @@ fn record_tool_def(
                 "settings": { "type": "string", "enum": ["profile", "default"], "description": "事件档位：profile 全维度（开销 1~3%），default 低开销（<1%），默认 profile" },
                 "timeout_secs": { "type": "number", "description": "总超时秒数（含录制等待与落盘轮询），默认 600，上限 1800；实际下限为 duration_secs+120" },
                 "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
+                "namespace": { "type": "string", "description": "Kubernetes namespace（容器环境必填；与 pod 一起来自 k8s_find_pods 返回；全小写）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment", "pid"]
@@ -728,7 +731,7 @@ mod tests {
     ) {
         let (tmp, core, transfer) = setup_as(channel.clone(), "container").await;
         let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
-        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None);
+        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", Some("ns1"), None);
         core.exec_pool.lock().await.insert_channel(target.clone(), channel).await;
         let mut bins = HashMap::new();
         bins.insert("jcmd".to_string(), "/opt/log/dump/coredump/friday-tools/jdk/bin/jcmd".to_string());
@@ -896,7 +899,7 @@ mod tests {
     }
 
     /// 容器目标：录制落 POD_DUMP_DIR（coredump 卷），文件名 friday- 前缀；
-    /// 拉回任务 state 带 pod（worker 专用连接走 K8sChannel 两跳）。
+    /// 拉回任务 state 带 pod/namespace（worker 专用连接走 K8sChannel 两跳）。
     /// 起搏器说明同 test_record_full_flow_starts_background_download。
     #[tokio::test]
     async fn test_record_pod_target_uses_pod_dump_dir() {
@@ -907,7 +910,7 @@ mod tests {
         let out = def(&reg, "jfr_record")
             .handler
             .execute(
-                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30, "pod": "pod-1"}),
+                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30, "pod": "pod-1", "namespace": "ns1"}),
                 &ctx(),
             )
             .await;
@@ -919,10 +922,11 @@ mod tests {
             "start cmd: {}", calls[0]
         );
         drop(calls);
-        // 拉回任务带 pod 定位
+        // 拉回任务带 pod/namespace 定位
         let tid = out.data["transfer_id"].as_str().unwrap();
         let st = mgr.get(tid).await.unwrap();
         assert_eq!(st.pod.as_deref(), Some("pod-1"));
+        assert_eq!(st.namespace.as_deref(), Some("ns1"));
         assert!(st.container.is_none());
         drop(tmp);
     }

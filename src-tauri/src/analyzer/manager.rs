@@ -1337,6 +1337,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         hook(&st);
         // 非 hprof 不触发

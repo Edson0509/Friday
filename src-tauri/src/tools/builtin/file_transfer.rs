@@ -67,6 +67,7 @@ impl FileTransferTools {
             return err_invalid("missing required parameter: remote_path");
         };
         let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let namespace = args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         if let Err(e) = validate_remote_path(remote_path) {
             return err_invalid(&e);
@@ -87,9 +88,9 @@ impl FileTransferTools {
             }
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆。
+        // 环境类型门禁：vm 拒 pod/ns / container 必填 pod+namespace（引导 k8s_find_pods）+ k8s 名防呆。
         // 容器环境 remote_path 是 Pod 内路径，传输走两跳（K8sChannel）。
-        if let Err(msg) = validate_target(&env, pod, container) {
+        if let Err(msg) = validate_target(&env, pod, namespace, container) {
             return ToolOutput {
                 success: false,
                 data: serde_json::json!({ "error": "environment_type_mismatch", "message": msg }),
@@ -126,11 +127,12 @@ impl FileTransferTools {
             local_path.clone(),
             false, // 独立下载不清理远端
             pod,
+            namespace,
             container,
         );
         let transfer_id = self.core.start(state).await;
 
-        tracing::info!(session_id = %ctx.session_id, transfer_id = %transfer_id, env_id = %env.id, pod = pod.unwrap_or("-"), remote_path, "file_download: background transfer started");
+        tracing::info!(session_id = %ctx.session_id, transfer_id = %transfer_id, env_id = %env.id, pod = pod.unwrap_or("-"), namespace = namespace.unwrap_or("-"), remote_path, "file_download: background transfer started");
 
         ToolOutput {
             success: true,
@@ -155,6 +157,7 @@ impl FileTransferTools {
             return err_invalid("missing required parameter: remote_path");
         };
         let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let namespace = args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let local = std::path::PathBuf::from(local_path);
         if !local.is_absolute() {
@@ -179,9 +182,9 @@ impl FileTransferTools {
             }
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆。
+        // 环境类型门禁：vm 拒 pod/ns / container 必填 pod+namespace（引导 k8s_find_pods）+ k8s 名防呆。
         // 容器环境 remote_path 是 Pod 内路径，上传走两跳（宿主机 staging 中转）。
-        if let Err(msg) = validate_target(&env, pod, container) {
+        if let Err(msg) = validate_target(&env, pod, namespace, container) {
             return ToolOutput {
                 success: false,
                 data: serde_json::json!({ "error": "environment_type_mismatch", "message": msg }),
@@ -200,7 +203,7 @@ impl FileTransferTools {
                     "error": "duplicate_transfer",
                     "message": "该文件已有进行中的上传任务。",
                     "transfer_id": existing.id,
-                    "note": "请轮询 transfer_status(transfer_id) 获取结果。",
+                    "note": "请轮询 transfer_status(transfer_id) 获取进度/结果。",
                 }),
                 raw_stdout: None,
             };
@@ -214,11 +217,12 @@ impl FileTransferTools {
             local.clone(),
             false,
             pod,
+            namespace,
             container,
         );
         let transfer_id = self.core.start(state).await;
 
-        tracing::info!(session_id = %ctx.session_id, transfer_id = %transfer_id, env_id = %env.id, pod = pod.unwrap_or("-"), local_path, remote_path, "file_upload: background transfer started");
+        tracing::info!(session_id = %ctx.session_id, transfer_id = %transfer_id, env_id = %env.id, pod = pod.unwrap_or("-"), namespace = namespace.unwrap_or("-"), local_path, remote_path, "file_upload: background transfer started");
 
         ToolOutput {
             success: true,
@@ -341,13 +345,14 @@ pub fn file_transfer_tool_defs(
     vec![
         ToolDef {
             name: "file_download".to_string(),
-            description: "从远端环境下载文件到本地（后台异步传输，支持断点续传）。启动后立即返回 transfer_id，必须轮询 transfer_status(transfer_id) 至终态。下载完成后文件在本机会话 artifacts 目录（返回 local_path），请把路径告知用户。远端文件不会被删除。容器环境 remote_path 是 Pod 内路径，需传 pod 参数，传输走两跳（kubectl exec 中转）。".to_string(),
+            description: "从远端环境下载文件到本地（后台异步传输，支持断点续传）。启动后立即返回 transfer_id，必须轮询 transfer_status(transfer_id) 至终态。下载完成后文件在本机会话 artifacts 目录（返回 local_path），请把路径告知用户。远端文件不会被删除。容器环境 remote_path 是 Pod 内路径，需传 pod + namespace 参数，传输走两跳（kubectl exec 中转）。".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
                     "remote_path": { "type": "string", "description": "远端文件绝对路径（容器环境为 Pod 内路径）" },
                     "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
+                    "namespace": { "type": "string", "description": "Kubernetes namespace（容器环境必填；与 pod 一起来自 k8s_find_pods 返回；全小写）" },
                     "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
                 },
                 "required": ["environment", "remote_path"]
@@ -359,7 +364,7 @@ pub fn file_transfer_tool_defs(
         },
         ToolDef {
             name: "file_upload".to_string(),
-            description: "上传本地文件到远端环境（后台异步传输）。⚠ 上传任意本地文件需用户确认。启动后立即返回 transfer_id，必须轮询 transfer_status(transfer_id) 至终态。上传失败重试会整体重传覆盖远端半成品。容器环境 remote_path 是 Pod 内路径，需传 pod 参数，上传走两跳（宿主机 staging 中转）。".to_string(),
+            description: "上传本地文件到远端环境（后台异步传输）。⚠ 上传任意本地文件需用户确认。启动后立即返回 transfer_id，必须轮询 transfer_status(transfer_id) 至终态。上传失败重试会整体重传覆盖远端半成品。容器环境 remote_path 是 Pod 内路径，需传 pod + namespace 参数，上传走两跳（宿主机 staging 中转）。".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -367,6 +372,7 @@ pub fn file_transfer_tool_defs(
                     "local_path": { "type": "string", "description": "本地文件绝对路径" },
                     "remote_path": { "type": "string", "description": "远端目标绝对路径（容器环境为 Pod 内路径）" },
                     "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
+                    "namespace": { "type": "string", "description": "Kubernetes namespace（容器环境必填；与 pod 一起来自 k8s_find_pods 返回；全小写）" },
                     "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
                 },
                 "required": ["environment", "local_path", "remote_path"]
@@ -548,12 +554,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_container_env_with_pod_starts_transfer() {
-        // 容器环境 + pod：门禁已撤，传输任务启动且 state 带 pod（worker 走 K8sChannel 两跳）
+        // 容器环境 + pod+ns：门禁已撤，传输任务启动且 state 带 pod/namespace（worker 走 K8sChannel 两跳）
         let (tmp, tools) = setup_as("container").await;
         let h = FileDownloadHandler(tools.clone());
         let out = h
             .execute(
-                serde_json::json!({"environment": "prod", "remote_path": "/opt/log/dump/coredump/friday-heapdump-1234-1.hprof", "pod": "pod-1"}),
+                serde_json::json!({"environment": "prod", "remote_path": "/opt/log/dump/coredump/friday-heapdump-1234-1.hprof", "pod": "pod-1", "namespace": "ns1"}),
                 &ctx(),
             )
             .await;
@@ -561,6 +567,7 @@ mod tests {
         let tid = out.data["transfer_id"].as_str().unwrap();
         let st = tools.core.get(tid).await.unwrap();
         assert_eq!(st.pod.as_deref(), Some("pod-1"));
+        assert_eq!(st.namespace.as_deref(), Some("ns1"));
         assert!(st.container.is_none());
         drop(tmp);
     }
@@ -605,7 +612,7 @@ mod tests {
         let h = FileDownloadHandler(tools);
         let out = h
             .execute(
-                serde_json::json!({"environment": "prod", "remote_path": "/tmp/a.hprof", "pod": "OOMService"}),
+                serde_json::json!({"environment": "prod", "remote_path": "/tmp/a.hprof", "pod": "OOMService", "namespace": "ns1"}),
                 &ctx(),
             )
             .await;
@@ -615,15 +622,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_container_env_pod_without_namespace_rejected() {
+        // 容器环境带 pod 缺 namespace → 门禁拦截（引导传 find_pods 返回的 ns）
+        let (tmp, tools) = setup_as("container").await;
+        let h = FileDownloadHandler(tools);
+        let out = h
+            .execute(
+                serde_json::json!({"environment": "prod", "remote_path": "/tmp/a.hprof", "pod": "pod-1"}),
+                &ctx(),
+            )
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        assert!(
+            out.data["message"].as_str().unwrap().contains("缺少 namespace"),
+            "message must demand namespace: {}",
+            out.data["message"]
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
     async fn test_upload_container_env_with_pod_starts_transfer() {
-        // 容器环境 + pod：上传任务启动且 state 带 pod/container（两跳上传）
+        // 容器环境 + pod+ns：上传任务启动且 state 带 pod/namespace/container（两跳上传）
         let (tmp, tools) = setup_as("container").await;
         let local = tmp.path().join("tool.jar");
         std::fs::write(&local, b"jar-bytes").unwrap();
         let h = FileUploadHandler(tools.clone());
         let out = h
             .execute(
-                serde_json::json!({"environment": "prod", "local_path": local.to_string_lossy(), "remote_path": "/tmp/tool.jar", "pod": "pod-1", "container": "main"}),
+                serde_json::json!({"environment": "prod", "local_path": local.to_string_lossy(), "remote_path": "/tmp/tool.jar", "pod": "pod-1", "namespace": "ns1", "container": "main"}),
                 &ctx(),
             )
             .await;
@@ -631,6 +659,7 @@ mod tests {
         let tid = out.data["transfer_id"].as_str().unwrap();
         let st = tools.core.get(tid).await.unwrap();
         assert_eq!(st.pod.as_deref(), Some("pod-1"));
+        assert_eq!(st.namespace.as_deref(), Some("ns1"));
         assert_eq!(st.container.as_deref(), Some("main"));
         drop(tmp);
     }

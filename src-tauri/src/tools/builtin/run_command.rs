@@ -55,6 +55,7 @@ impl ToolHandler for RunCommandHandler {
             return error_output("invalid_params", "missing required parameter: command");
         };
         let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let namespace = args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let timeout_secs = clamp_timeout(args.get("timeout_secs").and_then(|v| v.as_i64()));
 
@@ -72,10 +73,10 @@ impl ToolHandler for RunCommandHandler {
             Err(e) => return error_output("lookup_failed", &format!("查询环境失败: {e}")),
         };
 
-        // 获取或建连
+        // 获取或建连（namespace 语义同 pod：传了带 -n，不传宿主机执行；无门禁保持 escape hatch）
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, pod, None, container, &self.db).await {
+            match pool.get_or_create(&env.id, pod, namespace, container, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "run_command: failed to get exec channel");
@@ -98,7 +99,7 @@ impl ToolHandler for RunCommandHandler {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "run_command timed out, dropping connection to terminate remote process");
                 // 断开连接以终止远端进程（russh channel 无 Drop impl，仅取消 future 不会杀远端进程）
                 // + k8s 目标容器内补刀（VM no-op）
-                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, namespace, container);
                 crate::exec::pool::drop_target_and_kill(&self.exec_pool, &self.db, &target, command).await;
                 ToolOutput {
                     success: false,
@@ -198,7 +199,7 @@ pub fn run_command_tool_def(
 ) -> ToolDef {
     ToolDef {
         name: "run_command".to_string(),
-        description: "在目标远程环境上执行一条 shell 命令（登录 shell，PATH 完整）。这是兜底工具：优先使用结构化诊断工具，只有没有专用工具时才用本工具。每次执行都需要用户确认。传 pod 时命令在 Pod 容器内执行（sh -c）。容器环境不传 pod 时命令在宿主机执行（可用于 kubectl 排查）。".to_string(),
+        description: "在目标远程环境上执行一条 shell 命令（登录 shell，PATH 完整）。这是兜底工具：优先使用结构化诊断工具，只有没有专用工具时才用本工具。每次执行都需要用户确认。传 pod 时命令在 Pod 容器内执行（sh -c，需同时传 namespace）；不传 pod 时命令在宿主机执行（容器环境可用于 kubectl 排查）。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -217,6 +218,10 @@ pub fn run_command_tool_def(
                 "pod": {
                     "type": "string",
                     "description": "Kubernetes Pod 名（容器环境必填；虚机环境通常不传；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）"
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Kubernetes namespace（与 pod 一起来自 k8s_find_pods 返回；传了 pod 才生效；全小写）"
                 },
                 "container": {
                     "type": "string",
@@ -371,6 +376,56 @@ mod tests {
         assert!(out.success);
         assert_eq!(out.data["stdout"], "friday-ok");
         assert_eq!(out.data["exit_code"], 0);
+        drop(tmp);
+    }
+
+    /// 记录型 channel：捕获收到的命令（K8sChannel -n 透传断言用）
+    struct RecordingChannel {
+        calls: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ExecChannel for RecordingChannel {
+        async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.lock().await.push(cmd.to_string());
+            Ok(ExecOutput { stdout: "ok".into(), stderr: String::new(), exit_code: 0 })
+        }
+        async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn disconnect(&self) {}
+        async fn is_alive(&self) -> bool { true }
+    }
+
+    /// pod+namespace 参数贯通：命令经 K8sChannel 包装，kubectl 必须带 -n 'ns1'
+    #[tokio::test]
+    async fn test_handler_pod_with_namespace_carries_n_flag() {
+        let (tmp, db, exec_pool, artifacts) = setup_with_env().await;
+        let env_id = crate::app::environments::find_by_name(&db, "prod").await.unwrap().unwrap().id;
+        let base = Arc::new(RecordingChannel { calls: tokio::sync::Mutex::new(Vec::new()) });
+        exec_pool.lock().await.insert_channel(
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", Some("ns1"), None),
+            Arc::new(crate::exec::k8s::K8sChannel {
+                base: base.clone(),
+                pod: "pod-1".to_string(),
+                namespace: Some("ns1".to_string()),
+                container: None,
+            }),
+        ).await;
+        let handler = RunCommandHandler { db, exec_pool, artifacts_dir: artifacts };
+        let ctx = ToolContext { session_id: "s1".into(), channel: None };
+        let out = handler
+            .execute(
+                serde_json::json!({"environment": "prod", "command": "jstat -gcutil 1", "pod": "pod-1", "namespace": "ns1"}),
+                &ctx,
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let calls = base.calls.lock().await;
+        assert!(
+            calls[0].starts_with("kubectl exec -n 'ns1' 'pod-1' --"),
+            "kubectl must carry -n 'ns1': {}",
+            calls[0]
+        );
+        assert!(calls[0].contains("jstat -gcutil 1"), "cmd: {}", calls[0]);
         drop(tmp);
     }
 

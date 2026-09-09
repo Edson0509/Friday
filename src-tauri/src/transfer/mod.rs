@@ -59,11 +59,13 @@ impl TransferManager {
     }
 
     /// 后台任务专用连接：优先测试注入工厂，否则真实 SSH 直连（不走 ExecChannelPool）。
-    /// pod=Some 时构造 K8sChannel（两跳：宿主机 staging 中转），stat/rm/download 均进容器。
+    /// pod=Some 时构造 K8sChannel（两跳：宿主机 staging 中转），stat/rm/download 均进容器
+    /// （-n 显式 namespace，来自 TransferState）。
     pub(crate) async fn dedicated_channel(
         &self,
         env_id: &str,
         pod: Option<&str>,
+        namespace: Option<&str>,
         container: Option<&str>,
     ) -> Result<Arc<dyn ExecChannel>, String> {
         if let Some(factory) = &self.channel_factory {
@@ -72,8 +74,7 @@ impl TransferManager {
         let env = crate::exec::pool::fetch_environment(&self.db, env_id)
             .await
             .map_err(|e| e.to_string())?;
-        // namespace 先传 None：TransferState 尚无 namespace 字段（NS-T2 工具层接入）
-        let channel = crate::exec::pool::build_transport(env_id, &env, pod, None, container)
+        let channel = crate::exec::pool::build_transport(env_id, &env, pod, namespace, container)
             .map_err(|e| e.to_string())?;
         channel.connect().await.map_err(|e| e.to_string())?;
         Ok(channel)
@@ -314,6 +315,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
     }
 
@@ -534,13 +536,13 @@ mod tests {
             let m = m.clone();
             Box::pin(async move { Ok(m.clone()) })
         }));
-        // pod/container 有无不影响 factory 分支返回
+        // pod/namespace/container 有无不影响 factory 分支返回
         let ch = mgr
-            .dedicated_channel("env-1", Some("pod-1"), Some("main"))
+            .dedicated_channel("env-1", Some("pod-1"), Some("ns1"), Some("main"))
             .await
             .unwrap();
         assert!(ch.is_alive().await);
-        let ch2 = mgr.dedicated_channel("env-1", None, None).await.unwrap();
+        let ch2 = mgr.dedicated_channel("env-1", None, None, None).await.unwrap();
         assert!(ch2.is_alive().await);
     }
 }

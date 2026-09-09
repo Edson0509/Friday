@@ -466,6 +466,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
         };
         hook(&mk("a.jfr"));
