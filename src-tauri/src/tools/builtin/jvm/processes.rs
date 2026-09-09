@@ -1,4 +1,6 @@
-use crate::tools::builtin::jvm::core::{clamp_or, error_output, resolve_environment, JvmExecCore};
+use crate::tools::builtin::jvm::core::{
+    clamp_or, error_output, resolve_environment, validate_target, JvmExecCore,
+};
 use crate::tools::category::ToolCategory;
 use crate::tools::registry::{ToolContext, ToolDef, ToolHandler, ToolOutput};
 use crate::tools::risk::RiskLevel;
@@ -42,6 +44,11 @@ impl ToolHandler for ListProcessesHandler {
             }
             Err(e) => return error_output("connection_error", &e),
         };
+
+        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, container) {
+            return error_output("environment_type_mismatch", &msg);
+        }
 
         // keyword 插值进远端 shell 命令（注入面），必须单引号转义；无 keyword 时纯 ps 返回全部进程
         let command = match keyword {
@@ -109,14 +116,14 @@ impl ToolHandler for ListProcessesHandler {
 pub fn list_processes_tool_def(core: Arc<JvmExecCore>) -> ToolDef {
     ToolDef {
         name: "list_processes".to_string(),
-        description: "列出目标环境上的进程（PID、用户、完整命令行），按 keyword（服务名/关键字，大小写不敏感）过滤；不传 keyword 返回全部进程。诊断第一步：用用户提到的服务名作 keyword 查 PID，再配合 jvm_* 等工具。不依赖 JDK 装备。传 pod 时列出的是容器内进程（PID 为容器内 PID，后续 jvm_* 工具需带相同 pod）。".to_string(),
+        description: "列出目标环境上的进程（PID、用户、完整命令行），按 keyword（服务名/关键字，大小写不敏感）过滤。虚机环境：诊断第一步，用服务名作 keyword 查 PID，再配合 jvm_* 等工具。容器环境：先用 k8s_find_pods 定位 Pod，再带 pod 列出容器内进程（PID 为容器内 PID，后续 jvm_* 工具需带相同 pod）。不依赖 JDK 装备。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
                 "keyword": { "type": "string", "description": "过滤关键字（服务名等，大小写不敏感；缺省返回全部进程）" },
                 "timeout_secs": { "type": "number", "description": "超时秒数，默认 30，上限 120" },
-                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment"]
@@ -150,11 +157,11 @@ mod tests {
         async fn is_alive(&self) -> bool { true }
     }
 
-    async fn setup(channel: Arc<dyn ExecChannel>) -> (tempfile::TempDir, Arc<JvmExecCore>) {
+    async fn setup_as(channel: Arc<dyn ExecChannel>, transport: &str) -> (tempfile::TempDir, Arc<JvmExecCore>) {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        let env_id = crate::app::env_save::save_environment(
-            &db, None, "prod", "10.0.0.1", 22,
+        let env_id = crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, transport,
             vec![crate::app::env_save::CredentialInput {
                 id: None,
                 username: "root".to_string(),
@@ -175,6 +182,10 @@ mod tests {
             artifacts_dir: artifacts,
         });
         (tmp, core)
+    }
+
+    async fn setup(channel: Arc<dyn ExecChannel>) -> (tempfile::TempDir, Arc<JvmExecCore>) {
+        setup_as(channel, "vm").await
     }
 
     const PS_OUTPUT: &str = "  1234 root /opt/jdk/bin/java -Xmx4g -jar oomservice.jar\n  5678 root /usr/bin/python3 script.py\n  9999 app nginx: worker process\n";
@@ -286,11 +297,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vm_env_rejects_pod_param() {
+        // 虚机环境 + pod 参数 → environment_type_mismatch（类型门禁）
+        let ch = Arc::new(PsChannel { stdout: PS_OUTPUT, calls: tokio::sync::Mutex::new(Vec::new()) });
+        let (tmp, core) = setup(ch.clone()).await;
+        let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
+        // 预注入 k8s 目标通道：让 resolve 成功，证明拦截来自门禁而非连接层
+        core.exec_pool.lock().await.insert_channel(
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            ch,
+        ).await;
+        let handler = ListProcessesHandler { core };
+        let ctx = ToolContext { session_id: "s1".into(), channel: None };
+        let out = handler
+            .execute(serde_json::json!({"environment": "prod", "pod": "pod-1"}), &ctx)
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        drop(tmp);
+    }
+
+    #[tokio::test]
     async fn test_pod_param_routes_through_k8s_channel() {
         // pod 参数贯通：注入 TargetKey::k8s 的 K8sChannel（包记录型 base），
         // ps 命令必须经 kubectl exec 包装进容器（而非走宿主机 base key）
         let ch = Arc::new(PsChannel { stdout: PS_OUTPUT, calls: tokio::sync::Mutex::new(Vec::new()) });
-        let (tmp, core) = setup(ch.clone()).await;
+        let (tmp, core) = setup_as(ch.clone(), "container").await;
         let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
         core.exec_pool.lock().await.insert_channel(
             crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),

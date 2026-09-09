@@ -1,5 +1,6 @@
 use crate::tools::builtin::jvm::core::{
-    clamp_or, error_output, parse_pid, require_bins, resolve_environment, JvmExecCore,
+    clamp_or, error_output, parse_pid, require_bins, resolve_environment, validate_target,
+    JvmExecCore,
 };
 use crate::tools::category::ToolCategory;
 use crate::tools::registry::{ToolContext, ToolDef, ToolHandler, ToolOutput};
@@ -65,6 +66,11 @@ impl ToolHandler for JvmSimpleHandler {
             }
             Err(e) => return error_output("connection_error", &e),
         };
+
+        // 环境类型门禁：vm 拒 pod / container 必填 pod + k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, container) {
+            return error_output("environment_type_mismatch", &msg);
+        }
 
         let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
 
@@ -176,7 +182,7 @@ fn simple_schema(
     );
     props.insert(
         "pod".into(),
-        serde_json::json!({ "type": "string", "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）" }),
+        serde_json::json!({ "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" }),
     );
     props.insert(
         "container".into(),
@@ -334,11 +340,11 @@ mod tests {
         }
     }
 
-    async fn setup() -> (tempfile::TempDir, Arc<JvmExecCore>, String) {
+    async fn setup_as(transport: &str) -> (tempfile::TempDir, Arc<JvmExecCore>, String) {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        let env_id = crate::app::env_save::save_environment(
-            &db, None, "prod", "10.0.0.1", 22,
+        let env_id = crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, transport,
             vec![crate::app::env_save::CredentialInput {
                 id: None,
                 username: "root".to_string(),
@@ -359,6 +365,10 @@ mod tests {
         std::fs::create_dir_all(&artifacts).unwrap();
         let core = Arc::new(JvmExecCore { db, exec_pool, jdk_cache, artifacts_dir: artifacts });
         (tmp, core, env_id)
+    }
+
+    async fn setup() -> (tempfile::TempDir, Arc<JvmExecCore>, String) {
+        setup_as("vm").await
     }
 
     fn ctx() -> ToolContext {
@@ -387,9 +397,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vm_env_rejects_pod_param() {
+        // 虚机环境 + pod 参数 → environment_type_mismatch（类型门禁）
+        let (tmp, core, env_id) = setup().await;
+        core.exec_pool.lock().await.insert_channel(
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            Arc::new(OkChannel),
+        ).await;
+        let handler =
+            JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
+        let out = handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1"}), &ctx())
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_container_env_rejects_service_name_as_pod() {
+        // Agent 把用户口中的服务名（含大写）直接当 pod 名 → 防呆拦截
+        let (tmp, core, env_id) = setup_as("container").await;
+        core.exec_pool.lock().await.insert_channel(
+            crate::exec::pool::TargetKey::k8s(&env_id, "SNMPAgentService", None),
+            Arc::new(OkChannel),
+        ).await;
+        let handler =
+            JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
+        let out = handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "SNMPAgentService"}), &ctx())
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        assert!(
+            out.data["message"].as_str().unwrap().contains("k8s_find_pods"),
+            "message must guide to k8s_find_pods: {}",
+            out.data["message"]
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
     async fn test_pod_target_uses_composite_cache_and_k8s_channel() {
         // k8s 目标：注入 TargetKey::k8s(env,"pod-1",None) 通道 + 复合键 cache 条目
-        let (tmp, core, env_id) = setup().await;
+        let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
             crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
             Arc::new(OkChannel),
@@ -420,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn test_pod_target_with_only_vm_cache_misses() {
         // 只有 VM cache 条目（env_id 裸键）时带 pod 调用 → jdk_not_provisioned（键隔离）
-        let (tmp, core, env_id) = setup().await;
+        let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
             crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
             Arc::new(OkChannel),

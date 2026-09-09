@@ -32,6 +32,14 @@ pub async fn init(db_path: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     // Migration (arthas)：环境多用户凭证表
     let schema9 = include_str!("../../migrations/0009_env_credentials.sql");
     sqlx::query(schema9).execute(&pool).await?;
+    // Migration (env type semantics)：transport_type 值域 ssh/k8s → vm/container
+    //（环境类型从"宿主机形态提示"升级为"服务运行位置"，驱动工具差异逻辑）
+    sqlx::query("UPDATE environments SET transport_type = 'vm' WHERE transport_type = 'ssh'")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE environments SET transport_type = 'container' WHERE transport_type = 'k8s'")
+        .execute(&pool)
+        .await?;
     tracing::info!(?db_path, "SQLite initialized");
     Ok(pool)
 }
@@ -321,6 +329,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auth_type, "private_key");
+    }
+
+    /// Migration (env type semantics)：transport_type 值域 ssh/k8s → vm/container。
+    /// 手工 INSERT 旧值 → 重新 init 同一路径 → 断言迁移；再 init 一次验证幂等。
+    #[tokio::test]
+    async fn test_db_init_migrates_env_type_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("friday.db");
+        let pool = init(db_path.clone()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO environments (id, name, transport_type, created_at) VALUES ('e1', 'vm-old', 'ssh', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO environments (id, name, transport_type, created_at) VALUES ('e2', 'k8s-old', 'k8s', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // 重新 init 同一路径：旧值迁移为 vm/container
+        let pool = init(db_path.clone()).await.unwrap();
+        let tt: String = sqlx::query_scalar("SELECT transport_type FROM environments WHERE id = 'e1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tt, "vm");
+        let tt: String = sqlx::query_scalar("SELECT transport_type FROM environments WHERE id = 'e2'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tt, "container");
+        pool.close().await;
+
+        // 幂等：再 init 一次值不变（无行满足旧值条件）
+        let pool = init(db_path).await.unwrap();
+        let stale: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM environments WHERE transport_type IN ('ssh', 'k8s')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale, 0);
+        let tt: String = sqlx::query_scalar("SELECT transport_type FROM environments WHERE id = 'e1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tt, "vm");
     }
 
     #[tokio::test]

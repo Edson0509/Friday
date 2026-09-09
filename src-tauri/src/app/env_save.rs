@@ -118,9 +118,9 @@ pub async fn save_environment_with_transport(
     transport_type: &str,
     credentials: Vec<CredentialInput>,
 ) -> Result<SaveOutcome, SaveError> {
-    if !matches!(transport_type, "ssh" | "k8s") {
+    if !matches!(transport_type, "vm" | "container") {
         return Err(SaveError::Validation(format!(
-            "transport_type 必须是 ssh 或 k8s：{transport_type:?}"
+            "transport_type 必须是 vm 或 container：{transport_type:?}"
         )));
     }
     // 环境级校验：名称/host 非空
@@ -324,7 +324,7 @@ pub async fn save_environment_with_transport(
     })
 }
 
-/// 兼容入口：transport_type 默认 ssh（既有调用方与测试不变）。
+/// 兼容入口：transport_type 默认 vm（虚机环境）。
 /// 调用方全在 #[cfg(test)]，非测试构建下显式豁免 dead_code 警告。
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn save_environment(
@@ -335,7 +335,7 @@ pub async fn save_environment(
     port: u16,
     credentials: Vec<CredentialInput>,
 ) -> Result<SaveOutcome, SaveError> {
-    save_environment_with_transport(pool, environment_id, name, host, port, "ssh", credentials).await
+    save_environment_with_transport(pool, environment_id, name, host, port, "vm", credentials).await
 }
 
 /// 事务提交后执行 keychain 操作；任一失败时补偿已写条目并回滚 DB。
@@ -466,7 +466,7 @@ pub async fn save_environment_cmd(
         params.name.trim(),
         params.host.trim(),
         params.port.unwrap_or(22),
-        params.transport_type.as_deref().unwrap_or("ssh"),
+        params.transport_type.as_deref().unwrap_or("vm"),
         params.credentials,
     )
     .await
@@ -753,29 +753,31 @@ mod tests {
         assert_eq!(row.private_key_path.as_deref(), Some("~/.ssh/new"));
     }
 
-    // ── transport_type 存取（ssh | k8s）──
+    // ── transport_type 存取（vm | container）──
 
     #[tokio::test]
-    async fn test_save_with_transport_type_k8s_roundtrip() {
+    async fn test_save_with_transport_type_container_roundtrip() {
         let (_tmp, pool) = setup().await;
         let outcome = save_environment_with_transport(
-            &pool, None, "prod-k8s", "10.0.0.2", 22, "k8s",
+            &pool, None, "prod-container", "10.0.0.2", 22, "container",
             vec![cred("opc", true)],
         ).await.unwrap();
-        assert_eq!(outcome.environment.transport_type, "k8s");
-        // 默认路径（旧 wrapper）仍是 ssh
+        assert_eq!(outcome.environment.transport_type, "container");
+        // 默认路径（wrapper）默认 vm
         let vm = save_environment(&pool, None, "prod-vm", "10.0.0.3", 22, vec![cred("opc", true)]).await.unwrap();
-        assert_eq!(vm.environment.transport_type, "ssh");
+        assert_eq!(vm.environment.transport_type, "vm");
     }
 
     #[tokio::test]
     async fn test_save_rejects_invalid_transport_type() {
         let (_tmp, pool) = setup().await;
-        let err = save_environment_with_transport(
-            &pool, None, "x", "10.0.0.1", 22, "docker",
-            vec![cred("opc", true)],
-        ).await.unwrap_err();
-        assert!(matches!(err, SaveError::Validation(_)));
+        for bad in ["docker", "ssh", "k8s"] {
+            let err = save_environment_with_transport(
+                &pool, None, "x", "10.0.0.1", 22, bad,
+                vec![cred("opc", true)],
+            ).await.unwrap_err();
+            assert!(matches!(err, SaveError::Validation(_)), "bad: {bad}");
+        }
     }
 
     #[tokio::test]
@@ -784,9 +786,9 @@ mod tests {
         let first = save_environment(&pool, None, "prod", "10.0.0.1", 22, vec![cred("opc", true)]).await.unwrap();
         let env_id = first.environment.id;
         let second = save_environment_with_transport(
-            &pool, Some(&env_id), "prod", "10.0.0.1", 22, "k8s",
+            &pool, Some(&env_id), "prod", "10.0.0.1", 22, "container",
             vec![cred("opc", true)],
         ).await.unwrap();
-        assert_eq!(second.environment.transport_type, "k8s");
+        assert_eq!(second.environment.transport_type, "container");
     }
 }

@@ -1,6 +1,6 @@
 use crate::tools::builtin::jvm::core::{
     clamp_or, error_output, is_jdk_missing, parse_pid, require_bins, resolve_environment,
-    JvmExecCore,
+    validate_target, JvmExecCore,
 };
 use crate::tools::builtin::run_command::artifact_dir_for;
 use crate::tools::category::ToolCategory;
@@ -55,6 +55,11 @@ impl ToolHandler for HeapDumpHandler {
             }
             Err(e) => return error_output("connection_error", &e),
         };
+
+        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, container) {
+            return error_output("environment_type_mismatch", &msg);
+        }
 
         let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
 
@@ -224,7 +229,7 @@ pub fn jvm_heap_dump_tool_def(
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
                 "pid": { "type": "string", "description": "目标 Java 进程 PID（list_processes 返回）" },
                 "timeout_secs": { "type": "number", "description": "dump 生成超时秒数，默认 300，上限 600" },
-                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment", "pid"]
@@ -270,11 +275,11 @@ mod tests {
         // upload/download 不再被 heap_dump 使用
     }
 
-    async fn setup(channel: Arc<dyn ExecChannel>) -> (tempfile::TempDir, Arc<JvmExecCore>, Arc<crate::transfer::TransferManager>) {
+    async fn setup_as(channel: Arc<dyn ExecChannel>, transport: &str) -> (tempfile::TempDir, Arc<JvmExecCore>, Arc<crate::transfer::TransferManager>) {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        let env_id = crate::app::env_save::save_environment(
-            &db, None, "prod", "10.0.0.1", 22,
+        let env_id = crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, transport,
             vec![crate::app::env_save::CredentialInput {
                 id: None,
                 username: "root".to_string(),
@@ -297,12 +302,30 @@ mod tests {
         (tmp, core, mgr)
     }
 
+    async fn setup(channel: Arc<dyn ExecChannel>) -> (tempfile::TempDir, Arc<JvmExecCore>, Arc<crate::transfer::TransferManager>) {
+        setup_as(channel, "vm").await
+    }
+
     fn ctx() -> ToolContext {
         ToolContext { session_id: "123e4567-e89b-12d3-a456-426614174000".into(), channel: None }
     }
 
     fn handler(core: Arc<JvmExecCore>, mgr: Arc<crate::transfer::TransferManager>) -> HeapDumpHandler {
         HeapDumpHandler { core, transfer: mgr, bus: crate::app::events::EventBus::disabled() }
+    }
+
+    #[tokio::test]
+    async fn test_container_env_requires_pod() {
+        // 容器环境 + 缺 pod → environment_type_mismatch（引导 k8s_find_pods）
+        let ch = Arc::new(DumpChannel { dump_exit: 0, stat_size: "12345", calls: TokioMutex::new(Vec::new()) });
+        let (tmp, core, mgr) = setup_as(ch, "container").await;
+        let out = handler(core, mgr)
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234"}), &ctx())
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        assert!(out.data["message"].as_str().unwrap().contains("k8s_find_pods"));
+        drop(tmp);
     }
 
     #[tokio::test]

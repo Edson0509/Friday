@@ -53,6 +53,11 @@ impl ToolHandler for EnsureToolHandler {
             Err(e) => return error_output("lookup_failed", &format!("查询环境失败: {e}")),
         };
 
+        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = crate::tools::builtin::jvm::core::validate_target(&env, pod, container) {
+            return error_output("environment_type_mismatch", &msg);
+        }
+
         // 获取 channel
         let channel = {
             let mut pool = self.exec_pool.lock().await;
@@ -151,12 +156,12 @@ pub fn ensure_tool_tool_def(
 ) -> ToolDef {
     ToolDef {
         name: "ensure_tool".to_string(),
-        description: "确保目标环境已装备指定诊断工具包（当前支持 jdk）。生产环境通常只有 JRE，缺少 jstat/jcmd 等诊断工具；本工具探测目标 JVM 版本并下载匹配的 JDK 到 /tmp/friday-tools（不影响系统 Java）。装备成功后即可直接调用 jvm_gc_stats / jvm_thread_dump / jvm_heap_info / jvm_vm_info / jvm_class_histogram / jvm_heap_dump 等结构化工具。重复调用安全：已装备时直接返回。JVM 诊断流程：list_environments → list_processes（keyword=服务名）找 pid → ensure_tool → jvm_* 工具。容器内服务：先 k8s_find_pods 定位 Pod，再传 pod 参数调用本工具。".to_string(),
+        description: "确保目标环境已装备指定诊断工具包（当前支持 jdk）。生产环境通常只有 JRE，缺少 jstat/jcmd 等诊断工具；本工具探测目标 JVM 版本并下载匹配的 JDK 到 /tmp/friday-tools（不影响系统 Java）。装备成功后即可直接调用 jvm_gc_stats / jvm_thread_dump / jvm_heap_info / jvm_vm_info / jvm_class_histogram / jvm_heap_dump 等结构化工具。重复调用安全：已装备时直接返回。JVM 诊断流程——虚机环境：list_processes 查 pid → ensure_tool → jvm_*；容器环境：k8s_find_pods 定位 Pod → ensure_tool(pod=...) → jvm_*(pod=...)。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
-                "pod": { "type": "string", "description": "Kubernetes Pod 名（装备到容器内时必传）" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定）" },
                 "tool": { "type": "string", "enum": ["jdk"], "description": "要装备的工具包名" },
                 "java_bin": { "type": "string", "description": "目标服务使用的 java 可执行文件路径，默认 java（多版本共存时从服务进程命令行确认后传入）" }
@@ -210,11 +215,11 @@ mod tests {
             -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
     }
 
-    async fn setup() -> (tempfile::TempDir, sqlx::SqlitePool, Arc<Mutex<crate::exec::pool::ExecChannelPool>>, std::path::PathBuf, crate::app::events::EventBus) {
+    async fn setup_as(transport: &str) -> (tempfile::TempDir, sqlx::SqlitePool, Arc<Mutex<crate::exec::pool::ExecChannelPool>>, std::path::PathBuf, crate::app::events::EventBus) {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        crate::app::env_save::save_environment(
-            &db, None, "prod", "10.0.0.1", 22,
+        crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, transport,
             vec![crate::app::env_save::CredentialInput {
                 id: None,
                 username: "root".to_string(),
@@ -228,6 +233,10 @@ mod tests {
         let cache = tmp.path().join("cache");
         std::fs::create_dir_all(&cache).unwrap();
         (tmp, db, exec_pool, cache, crate::app::events::EventBus::disabled())
+    }
+
+    async fn setup() -> (tempfile::TempDir, sqlx::SqlitePool, Arc<Mutex<crate::exec::pool::ExecChannelPool>>, std::path::PathBuf, crate::app::events::EventBus) {
+        setup_as("vm").await
     }
 
     fn make_handler(
@@ -322,10 +331,24 @@ mod tests {
         assert!(!def.needs_channel);
     }
 
+    #[tokio::test]
+    async fn test_vm_env_rejects_pod_param() {
+        // 虚机环境 + pod 参数 → environment_type_mismatch（类型门禁）
+        let (tmp, db, exec_pool, cache, bus) = setup().await;
+        let handler = make_handler(db, exec_pool, cache, bus);
+        let ctx = ToolContext { session_id: "s1".into(), channel: None };
+        let out = handler
+            .execute(serde_json::json!({"environment": "prod", "tool": "jdk", "pod": "pod-1"}), &ctx)
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        drop(tmp);
+    }
+
     /// k8s 目标：pod 参数 → K8sJdkPackage + 容器自带 jcmd 短路 + 复合缓存键
     #[tokio::test]
     async fn test_ensure_with_pod_uses_k8s_package_and_composite_cache() {
-        let (tmp, db, exec_pool, cache, bus) = setup().await;
+        let (tmp, db, exec_pool, cache, bus) = setup_as("container").await;
         let env_id = crate::app::environments::find_by_name(&db, "prod").await.unwrap().unwrap().id;
         // 注入 k8s 目标通道（probe ok / musl 无 / native 命中）
         exec_pool.lock().await.insert_channel(

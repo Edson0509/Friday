@@ -33,6 +33,56 @@ pub fn error_output(error: &str, message: &str) -> ToolOutput {
     }
 }
 
+/// 环境类型门禁 + k8s 名防呆（类型驱动差异逻辑）：
+/// - 容器环境：pod 必填（缺失引导先 k8s_find_pods）；pod/container 名做 DNS-1123 防呆校验
+/// - 虚机环境：拒绝 pod 参数
+/// 防呆背景：虚机服务名常含大写，k8s 命名全小写——Agent 误把服务名当 Pod 名时
+/// 尽早拦截，避免走到 kubectl 才报模糊的 "pod not found"。
+/// 门禁在 resolve_environment 之后执行（resolve 内部急切建连）：vm+pod 误路由且宿主机不可达时会先报 connection_error——可接受的权衡，避免 resolve 内嵌门禁需要的类型化错误改造。
+pub fn validate_target(
+    env: &crate::app::environments::EnvironmentRow,
+    pod: Option<&str>,
+    container: Option<&str>,
+) -> Result<(), String> {
+    match env.transport_type.as_str() {
+        "container" => match pod {
+            Some(p) => {
+                validate_k8s_name("Pod", p)?;
+                if let Some(c) = container.filter(|c| !c.is_empty()) {
+                    validate_k8s_name("容器", c)?;
+                }
+                Ok(())
+            }
+            None => Err(
+                "该环境是容器环境：请先用 k8s_find_pods 定位 Pod，再带 pod 参数调用本工具。"
+                    .to_string(),
+            ),
+        },
+        "vm" => match pod {
+            None => Ok(()),
+            Some(_) => Err(
+                "该环境是虚机环境：不支持 pod 参数（服务应直接跑在宿主机上）。".to_string(),
+            ),
+        },
+        other => Err(format!("未知环境类型 {other:?}（支持 vm / container）")),
+    }
+}
+
+/// k8s 名防呆校验：全小写 DNS-1123（小写字母/数字/连字符/点）。含大写或非法字符即拒。
+fn validate_k8s_name(kind: &str, name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.'));
+    if valid {
+        return Ok(());
+    }
+    Err(format!(
+        "{kind}名 {name:?} 非法：k8s 命名为全小写（DNS-1123：小写字母/数字/连字符）。\
+         请使用 k8s_find_pods 返回的准确 {kind}名，不要直接用服务名。"
+    ))
+}
+
 /// pid 参数校验：必须正整数字符串（拼 shell 的注入面）
 pub fn parse_pid(value: &serde_json::Value) -> Option<u32> {
     let s = value.as_str()?;
@@ -213,6 +263,60 @@ mod tests {
         let artifacts = tmp_dir.join("artifacts");
         std::fs::create_dir_all(&artifacts).unwrap();
         (JvmExecCore { db: db.clone(), exec_pool: exec_pool.clone(), jdk_cache: jdk_cache.clone(), artifacts_dir: artifacts }, db, exec_pool, jdk_cache)
+    }
+
+    fn env_row(transport_type: &str) -> crate::app::environments::EnvironmentRow {
+        crate::app::environments::EnvironmentRow {
+            id: "e1".into(),
+            name: "prod".into(),
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: "opc".into(),
+            auth_type: "password".into(),
+            private_key_path: None,
+            transport_type: transport_type.into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn test_validate_target_rules() {
+        // vm：无 pod OK，有 pod 拒绝
+        assert!(validate_target(&env_row("vm"), None, None).is_ok());
+        assert!(validate_target(&env_row("vm"), Some("p1"), None).is_err());
+        // container：有 pod OK，缺 pod 拒绝（引导 k8s_find_pods）
+        assert!(validate_target(&env_row("container"), Some("p1"), None).is_ok());
+        let err = validate_target(&env_row("container"), None, None).unwrap_err();
+        assert!(err.contains("k8s_find_pods"), "err: {err}");
+        // 未知类型拒绝
+        assert!(validate_target(&env_row("ssh"), None, None).is_err());
+    }
+
+    #[test]
+    fn test_validate_target_rejects_uppercase_pod_name() {
+        let env = env_row("container");
+        let err = validate_target(&env, Some("SNMPAgentService"), None).unwrap_err();
+        assert!(err.contains("全小写"), "err: {err}");
+        assert!(err.contains("k8s_find_pods"), "err: {err}");
+    }
+
+    #[test]
+    fn test_validate_target_rejects_uppercase_container_name() {
+        let env = env_row("container");
+        assert!(validate_target(&env, Some("pod-1"), Some("Main")).is_err());
+        // 合法小写容器名通过
+        assert!(validate_target(&env, Some("pod-1"), Some("main")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_target_accepts_valid_dns1123_names() {
+        let env = env_row("container");
+        assert!(validate_target(&env, Some("snmpagent-7d9b-x2vkl"), None).is_ok());
+        assert!(validate_target(&env, Some("pod.1"), None).is_ok()); // 点号（DNS subdomain）
+        // 边角：空串/首尾连字符拒绝
+        assert!(validate_target(&env, Some(""), None).is_err());
+        assert!(validate_target(&env, Some("-pod"), None).is_err());
+        assert!(validate_target(&env, Some("pod-"), None).is_err());
     }
 
     #[test]
