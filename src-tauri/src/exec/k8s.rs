@@ -11,11 +11,10 @@ use super::ssh::shell_quote_single;
 pub const STAGING_DIR: &str = "/tmp/friday-tools/staging";
 
 /// Pod 内 Friday 工具目录（用户指定：该目录不会触发 ephemeral-storage 驱逐）
-pub const POD_TOOLS_DIR: &str = "/opt/log/dump/heapdump/friday-tools";
+pub const POD_TOOLS_DIR: &str = "/opt/log/dump/coredump/friday-tools";
 
-/// Pod 内 dump 产物目录（Phase 2 的 heap dump / JFR 落这里；本期无生产消费方）
-#[allow(dead_code)]
-pub const POD_DUMP_DIR: &str = "/opt/log/dump/heapdump";
+/// Pod 内 dump 产物目录（heap dump / JFR 容器目标落这里；用户环境实际只有该目录）
+pub const POD_DUMP_DIR: &str = "/opt/log/dump/coredump";
 
 /// 文件属组要求：非 ossgroup 无法被目标 JVM 用户使用（用户约束，exec 用户 = ossadm 非 root）
 pub const OSS_GROUP: &str = "ossgroup";
@@ -105,11 +104,29 @@ impl ExecChannel for K8sChannel {
         let basename = remote_path.rsplit('/').next().unwrap_or("file");
         let staging = format!("{}/{}-{}", STAGING_DIR, uuid::Uuid::new_v4(), basename);
 
-        // ① 宿主机 staging 目录
-        self.base.run(&format!("mkdir -p {}", shell_quote_single(STAGING_DIR))).await?;
+        // ① 宿主机 staging 目录（显式检查退出码：mkdir 失败时后续两跳都会连环失败）
+        let mkdir_out = self.base.run(&format!("mkdir -p {}", shell_quote_single(STAGING_DIR))).await?;
+        if mkdir_out.exit_code != 0 {
+            tracing::warn!(pod = %self.pod, exit_code = mkdir_out.exit_code, stderr = %mkdir_out.stderr, "k8s upload: staging mkdir failed");
+            return Err(format!(
+                "k8s upload: staging mkdir {} failed (exit {}): {}",
+                STAGING_DIR, mkdir_out.exit_code, mkdir_out.stderr
+            )
+            .into());
+        }
 
         // ② leg A：SFTP → 宿主机 staging
-        self.base.upload(local, &staging).await?;
+        tracing::info!(
+            pod = %self.pod,
+            local = %local.display(),
+            staging = %staging,
+            bytes = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0),
+            "k8s upload: leg A sftp to host staging"
+        );
+        if let Err(e) = self.base.upload(local, &staging).await {
+            tracing::warn!(pod = %self.pod, staging = %staging, error = %e, "k8s upload: leg A sftp to staging failed");
+            return Err(format!("k8s upload: leg A sftp to staging {staging} failed: {e}").into());
+        }
 
         // ③ leg B：kubectl exec -i 注入容器。stdin 重定向发生在宿主机 bash 上，
         //    数据不流经 Friday 内存（dump 级大文件安全）；容器内依赖仅 sh + cat。
@@ -130,7 +147,9 @@ impl ExecChannel for K8sChannel {
             shell_quote_single(&inner),
             shell_quote_single(&staging)
         );
+        let leg_b_start = std::time::Instant::now();
         let out = self.base.run(&host_cmd).await?;
+        let leg_b_elapsed_ms = leg_b_start.elapsed().as_millis() as u64;
 
         // staging 清理（成败都清）
         let _ = self
@@ -139,15 +158,16 @@ impl ExecChannel for K8sChannel {
             .await;
 
         if out.exit_code != 0 {
-            tracing::warn!(pod = %self.pod, remote_path, exit_code = out.exit_code, stderr = %out.stderr, "k8s upload: kubectl exec -i failed");
+            tracing::warn!(pod = %self.pod, remote_path, staging = %staging, exit_code = out.exit_code, stderr = %out.stderr, elapsed_ms = leg_b_elapsed_ms, "k8s upload: leg B kubectl exec -i failed");
             // 半截文件兜底清理（经 kubectl exec，容器内）
             let _ = self.run(&format!("rm -f {}", shell_quote_single(remote_path))).await;
             return Err(format!(
-                "k8s upload: kubectl exec -i failed (exit {}): {}",
+                "k8s upload: leg B kubectl exec -i failed (exit {}): {}",
                 out.exit_code, out.stderr
             )
             .into());
         }
+        tracing::info!(pod = %self.pod, remote_path, elapsed_ms = leg_b_elapsed_ms, "k8s upload: leg B kubectl exec -i done, fixing group");
 
         // ④ 属组修正（spec：chgrp 失败 = 上传失败，清理目标文件）
         let q = shell_quote_single(remote_path);
@@ -219,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_validate_pod_path() {
-        assert!(validate_pod_path("/opt/log/dump/heapdump/x").is_ok());
+        assert!(validate_pod_path("/opt/log/dump/coredump/x").is_ok());
         assert!(validate_pod_path("relative/x").is_err());
         assert!(validate_pod_path("/a\0b").is_err());
     }
@@ -321,7 +341,7 @@ mod tests {
         #[tokio::test]
         async fn test_upload_happy_path_two_legs_and_chgrp() {
             let (base, ch) = chan(vec![]);
-            ch.upload(Path::new("/local/jdk.tar.gz"), "/opt/log/dump/heapdump/friday-tools/jdk.tar.gz")
+            ch.upload(Path::new("/local/jdk.tar.gz"), "/opt/log/dump/coredump/friday-tools/jdk.tar.gz")
                 .await
                 .unwrap();
             // leg A：SFTP 到宿主机 staging（路径含随机前缀）
@@ -333,8 +353,8 @@ mod tests {
             let runs = base.runs.lock().await;
             let host_leg = runs.iter().find(|c| c.contains("kubectl exec -i")).expect("host leg");
             assert!(host_leg.contains("< "), "host stdin redirect: {host_leg}");
-            assert!(host_leg.contains(r"cat > '\''/opt/log/dump/heapdump/friday-tools/jdk.tar.gz'\''"), "{host_leg}");
-            assert!(host_leg.contains(r"mkdir -p '\''/opt/log/dump/heapdump/friday-tools'\''"), "{host_leg}");
+            assert!(host_leg.contains(r"cat > '\''/opt/log/dump/coredump/friday-tools/jdk.tar.gz'\''"), "{host_leg}");
+            assert!(host_leg.contains(r"mkdir -p '\''/opt/log/dump/coredump/friday-tools'\''"), "{host_leg}");
             // 属组修正走 kubectl exec（容器内，不是宿主机）
             let chgrp = runs.iter().find(|c| c.contains("chgrp ossgroup")).expect("chgrp leg");
             assert!(chgrp.contains("kubectl exec"), "chgrp must run inside pod: {chgrp}");
@@ -348,12 +368,12 @@ mod tests {
             // 脚本顺序：①mkdir staging ②kubectl exec -i（exit 1）③rm staging ④rm remote（补刀清理）
             let (base, ch) = chan(vec![("", 0), ("", 1), ("", 0), ("", 0)]);
             let err = ch
-                .upload(Path::new("/local/x"), "/opt/log/dump/heapdump/friday-tools/x")
+                .upload(Path::new("/local/x"), "/opt/log/dump/coredump/friday-tools/x")
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("kubectl exec -i failed"), "err: {err}");
             let runs = base.runs.lock().await;
-            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/heapdump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
+            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/coredump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
         }
 
         #[tokio::test]
@@ -361,12 +381,12 @@ mod tests {
             // ①mkdir ②kubectl -i ok ③rm staging ④chgrp(exit 1) ⑤rm remote
             let (base, ch) = chan(vec![("", 0), ("", 0), ("", 0), ("", 1), ("", 0)]);
             let err = ch
-                .upload(Path::new("/local/x"), "/opt/log/dump/heapdump/friday-tools/x")
+                .upload(Path::new("/local/x"), "/opt/log/dump/coredump/friday-tools/x")
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("chgrp ossgroup failed"), "err: {err}");
             let runs = base.runs.lock().await;
-            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/heapdump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
+            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/coredump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
         }
 
         #[tokio::test]

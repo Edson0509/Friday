@@ -82,12 +82,17 @@ impl ToolHandler for HeapDumpHandler {
         };
         let jcmd = &bins[0];
 
-        // ① 生成（文件名 Friday 固定构造——不开放自定义，注入面）
+        // ① 生成（文件名 Friday 固定构造——不开放自定义，注入面）。
+        // 容器目标落 POD_DUMP_DIR（coredump 卷，用户环境实际存在）；VM 保持 /tmp/friday-tools
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let remote_path = format!("/tmp/friday-tools/heapdump-{pid}-{ts}.hprof");
+        let remote_path = if target.pod.is_some() {
+            format!("{}/friday-heapdump-{pid}-{ts}.hprof", crate::exec::k8s::POD_DUMP_DIR)
+        } else {
+            format!("/tmp/friday-tools/heapdump-{pid}-{ts}.hprof")
+        };
         let dump_cmd = format!("{jcmd} {pid} GC.heap_dump {remote_path}");
 
         tracing::info!(session_id = %ctx.session_id, env_id = %env.id, pid, command = %dump_cmd, "heap dump: generating");
@@ -329,6 +334,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pod_target_dump_uses_pod_dump_dir() {
+        // 容器目标：dump 落 POD_DUMP_DIR（coredump 卷），文件名 friday- 前缀
+        let ch = Arc::new(DumpChannel { dump_exit: 0, stat_size: "12345", calls: TokioMutex::new(Vec::new()) });
+        let (tmp, core, mgr) = setup_as(ch.clone(), "container").await;
+        let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
+        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None);
+        core.exec_pool.lock().await.insert_channel(target.clone(), ch.clone()).await;
+        let mut bins = HashMap::new();
+        bins.insert("jcmd".to_string(), "/opt/log/dump/coredump/friday-tools/jdk/bin/jcmd".to_string());
+        core.jdk_cache
+            .set(
+                &crate::tools::builtin::jvm::jdk_cache::cache_key(&target),
+                JdkLayout { tool_home: "/opt/log/dump/coredump/friday-tools/jdk".into(), bins },
+            )
+            .await;
+        let out = handler(core, mgr)
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-1"}), &ctx())
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let calls = ch.calls.lock().await;
+        assert!(
+            calls[0].contains("GC.heap_dump /opt/log/dump/coredump/friday-heapdump-1234-"),
+            "dump cmd: {}", calls[0]
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
     async fn test_full_flow_starts_background_download() {
         let ch = Arc::new(DumpChannel { dump_exit: 0, stat_size: "12345", calls: TokioMutex::new(Vec::new()) });
         let (tmp, core, mgr) = setup(ch.clone()).await;
@@ -345,7 +378,7 @@ mod tests {
         assert!(mgr.get(tid).await.is_some());
         // 调用序列：dump → stat（无 rm/download——rm 移到 worker 完成后）
         let calls = ch.calls.lock().await;
-        assert!(calls[0].contains("GC.heap_dump"));
+        assert!(calls[0].contains("GC.heap_dump /tmp/friday-tools/heapdump-1234-"), "dump cmd: {}", calls[0]);
         assert!(calls[1].starts_with("stat -c %s"));
         assert_eq!(calls.len(), 2);
         drop(tmp);

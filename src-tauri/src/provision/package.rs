@@ -28,7 +28,7 @@ pub struct ProvisionContext {
     pub artifactory_base_url: String,
     /// vendored arthas zip（随应用分发）；None = 未随包分发，arthas ensure 时报结构化错误
     pub arthas_zip: Option<std::path::PathBuf>,
-    /// 远端工具根目录：VM = /tmp/friday-tools；k8s = /opt/log/dump/heapdump/friday-tools
+    /// 远端工具根目录：VM = /tmp/friday-tools；k8s = /opt/log/dump/coredump/friday-tools
     pub remote_tools_dir: String,
     pub timeouts: StageTimeouts,
     pub bus: EventBus,
