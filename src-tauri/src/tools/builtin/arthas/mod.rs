@@ -55,6 +55,17 @@ impl ToolHandler for ArthasToolHandler {
             }
             Err(e) => return error_output("lookup_failed", &format!("查询环境失败: {e}")),
         };
+
+        // 容器门禁：arthas 容器内 attach 属 Phase 2（当前 attach 跑在宿主机，容器环境必然失败）
+        if env.transport_type == "container" {
+            tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, kind = ?self.kind, pid, "arthas rejected: container env not supported yet (phase 2)");
+            return error_output(
+                "arthas_container_not_supported",
+                "Arthas 容器内 attach 尚未支持（规划中）：当前 arthas 只能在虚机环境（服务直接跑在宿主机）使用。\
+                 容器环境诊断请用 jvm_* 工具（带 pod 参数）。",
+            );
+        }
+
         let timeout_secs = clamp_or(
             args.get("timeout_secs").and_then(|v| v.as_i64()),
             self.timeouts.0,
@@ -354,5 +365,47 @@ mod tests {
         assert_eq!(def.category, ToolCategory::Arthas);
         assert_eq!(def.risk_level, RiskLevel::Low);
         assert!(!def.needs_channel);
+    }
+
+    #[tokio::test]
+    async fn test_container_env_rejected_upfront() {
+        // 容器环境 + arthas_open → 门禁明确报错，不触发 attach（dummy factory 必败佐证：
+        // 若门禁缺失会走到 attach，得到 arthas_attach_failed 而非门禁错误码）
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
+        crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, "container",
+            vec![crate::app::env_save::CredentialInput {
+                id: None,
+                username: "root".to_string(),
+                auth_type: "password".to_string(),
+                private_key_path: None,
+                secret: None,
+                is_default: true,
+            }],
+        ).await.unwrap();
+        let factory: AttachFactory =
+            Arc::new(|_req| Box::pin(async { Err(ManagerError::Attach("must not reach attach".to_string())) }));
+        let manager = Arc::new(ArthasManager::new(factory, ArthasConfig::default()));
+        let handler = ArthasToolHandler {
+            manager,
+            db,
+            artifacts_dir: std::path::PathBuf::from("/tmp/x"),
+            kind: ArthasToolKind::Open,
+            timeouts: OPEN,
+        };
+        let out = handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234"}),
+                &ToolContext { session_id: "s1".into(), channel: None },
+            )
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "arthas_container_not_supported");
+        assert!(
+            out.data["message"].as_str().unwrap().contains("jvm_*"),
+            "message must guide to jvm_* tools: {}",
+            out.data["message"]
+        );
     }
 }

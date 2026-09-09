@@ -84,6 +84,22 @@ impl FileTransferTools {
             }
         };
 
+        // 容器门禁：文件在 Pod 内，宿主机 SFTP 无法访问（K8sChannel::download 属 Phase 2）
+        if env.transport_type == "container" {
+            tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, remote_path, "file transfer rejected: container env not supported yet (phase 2)");
+            return ToolOutput {
+                success: false,
+                data: serde_json::json!({
+                    "error": "container_transfer_not_supported",
+                    "message": "容器环境的文件在 Pod 内，宿主机 SFTP 无法访问，当前版本暂不支持容器文件传输（规划中）。\
+                               临时方案：用 run_command 在宿主机执行 kubectl cp <pod>:<容器内路径> /tmp/friday-tools/<文件名>，\
+                               再对宿主机路径调 file_download。",
+                    "remote_path": remote_path,
+                }),
+                raw_stdout: None,
+            };
+        }
+
         // 去重提示（start 内部原子去重，这里先查一次给 Agent 明确信号）
         if let Some(existing) = self
             .core
@@ -161,6 +177,23 @@ impl FileTransferTools {
                 };
             }
         };
+
+        // 容器门禁：上传经 SFTP 只能到宿主机，Pod 内目标不可达（K8sChannel 属 Phase 2）
+        if env.transport_type == "container" {
+            tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, remote_path, "file transfer rejected: container env not supported yet (phase 2)");
+            return ToolOutput {
+                success: false,
+                data: serde_json::json!({
+                    "error": "container_transfer_not_supported",
+                    "message": "容器环境的远端路径在 Pod 内，宿主机 SFTP 无法直达，当前版本暂不支持容器文件上传（规划中）。\
+                               临时方案：小文件先用 run_command 在宿主机落地（如 base64 -d 写入 /tmp/friday-tools/<文件名>），\
+                               再在宿主机执行 kubectl cp /tmp/friday-tools/<文件名> <pod>:<容器内路径> 送入 Pod。",
+                    "remote_path": remote_path,
+                }),
+                raw_stdout: None,
+            };
+        }
+
         if let Some(existing) = self
             .core
             .find_active(&ctx.session_id, Direction::Upload, remote_path)
@@ -378,11 +411,11 @@ pub fn file_transfer_tool_defs(
 mod tests {
     use super::*;
 
-    async fn setup() -> (tempfile::TempDir, Arc<FileTransferTools>) {
+    async fn setup_as(transport: &str) -> (tempfile::TempDir, Arc<FileTransferTools>) {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        crate::app::env_save::save_environment(
-            &db, None, "prod", "10.0.0.1", 22,
+        crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, transport,
             vec![crate::app::env_save::CredentialInput {
                 id: None,
                 username: "root".to_string(),
@@ -396,6 +429,10 @@ mod tests {
         let artifacts = tmp.path().join("artifacts");
         std::fs::create_dir_all(&artifacts).unwrap();
         (tmp, Arc::new(FileTransferTools { core: mgr, artifacts_dir: artifacts }))
+    }
+
+    async fn setup() -> (tempfile::TempDir, Arc<FileTransferTools>) {
+        setup_as("vm").await
     }
 
     fn ctx() -> ToolContext {
@@ -505,6 +542,41 @@ mod tests {
         ).await;
         assert!(!out.success);
         assert_eq!(out.data["error"], "environment_not_found");
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_download_container_env_gated() {
+        // 容器环境：文件在 Pod 内，宿主机 SFTP 够不到 → 门禁明确报错 + kubectl cp 兜底引导
+        let (tmp, tools) = setup_as("container").await;
+        let h = FileDownloadHandler(tools);
+        let out = h.execute(
+            serde_json::json!({"environment": "prod", "remote_path": "/opt/log/dump/coredump/friday-heapdump-1234-1.hprof"}),
+            &ctx(),
+        ).await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "container_transfer_not_supported");
+        let msg = out.data["message"].as_str().unwrap();
+        assert!(msg.contains("kubectl cp"), "message must guide kubectl cp: {msg}");
+        assert_eq!(out.data["remote_path"], "/opt/log/dump/coredump/friday-heapdump-1234-1.hprof");
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_upload_container_env_gated() {
+        // 容器环境：上传只能到宿主机，Pod 内目标不可达 → 门禁 + kubectl cp 兜底引导
+        let (tmp, tools) = setup_as("container").await;
+        let local = tmp.path().join("tool.jar");
+        std::fs::write(&local, b"jar-bytes").unwrap();
+        let h = FileUploadHandler(tools);
+        let out = h.execute(
+            serde_json::json!({"environment": "prod", "local_path": local.to_string_lossy(), "remote_path": "/opt/log/dump/coredump/tool.jar"}),
+            &ctx(),
+        ).await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "container_transfer_not_supported");
+        let msg = out.data["message"].as_str().unwrap();
+        assert!(msg.contains("kubectl cp"), "message must guide kubectl cp: {msg}");
         drop(tmp);
     }
 
