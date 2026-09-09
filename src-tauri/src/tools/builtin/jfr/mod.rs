@@ -5,7 +5,7 @@ use crate::exec::channel::ExecChannel;
 use crate::jfr::{JmcError, JmcManager};
 use crate::tools::builtin::jvm::core::{
     clamp_or, error_output, is_jdk_missing, parse_pid, require_bins, resolve_environment,
-    validate_target_type, JvmExecCore,
+    validate_target, JvmExecCore,
 };
 use crate::tools::builtin::run_command::{artifact_dir_for, truncate_output};
 use crate::tools::category::ToolCategory;
@@ -93,8 +93,8 @@ impl JfrRecordHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）
-        if let Err(msg) = validate_target_type(&env, pod) {
+        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, container) {
             return error_output("environment_type_mismatch", &msg);
         }
 
@@ -480,7 +480,7 @@ fn record_tool_def(
                 "duration_secs": { "type": "number", "description": "录制时长秒数，10~600，默认 60" },
                 "settings": { "type": "string", "enum": ["profile", "default"], "description": "事件档位：profile 全维度（开销 1~3%），default 低开销（<1%），默认 profile" },
                 "timeout_secs": { "type": "number", "description": "总超时秒数（含录制等待与落盘轮询），默认 600，上限 1800；实际下限为 duration_secs+120" },
-                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持）" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment", "pid"]

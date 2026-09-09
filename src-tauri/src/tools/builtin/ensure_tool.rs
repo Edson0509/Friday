@@ -53,8 +53,8 @@ impl ToolHandler for EnsureToolHandler {
             Err(e) => return error_output("lookup_failed", &format!("查询环境失败: {e}")),
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）
-        if let Err(msg) = crate::tools::builtin::jvm::core::validate_target_type(&env, pod) {
+        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = crate::tools::builtin::jvm::core::validate_target(&env, pod, container) {
             return error_output("environment_type_mismatch", &msg);
         }
 
@@ -161,7 +161,7 @@ pub fn ensure_tool_tool_def(
             "type": "object",
             "properties": {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
-                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持）" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定）" },
                 "tool": { "type": "string", "enum": ["jdk"], "description": "要装备的工具包名" },
                 "java_bin": { "type": "string", "description": "目标服务使用的 java 可执行文件路径，默认 java（多版本共存时从服务进程命令行确认后传入）" }

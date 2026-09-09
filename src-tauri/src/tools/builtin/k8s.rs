@@ -157,7 +157,7 @@ impl ToolHandler for FindPodsHandler {
                     data: serde_json::json!({
                         "pods": pods,
                         "count": pods.len(),
-                        "note": "多实例命中时请让用户选择目标 Pod；后续 jvm_* 工具传该 Pod 名作为 pod 参数（PID 为容器内 PID，用带 pod 的 list_processes 获取）。",
+                        "note": "多实例命中时请让用户选择目标 Pod；后续 jvm_* 工具传该 Pod 的 name 作为 pod 参数（PID 为容器内 PID，用带 pod 的 list_processes 获取）。注意：k8s 命名全小写——传 pod 参数时请使用下方返回的准确 name，勿直接用服务名。",
                         "elapsed_ms": elapsed_ms,
                     }),
                     raw_stdout: Some(output.stdout),

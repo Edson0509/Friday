@@ -1,5 +1,5 @@
 use crate::tools::builtin::jvm::core::{
-    clamp_or, error_output, resolve_environment, validate_target_type, JvmExecCore,
+    clamp_or, error_output, resolve_environment, validate_target, JvmExecCore,
 };
 use crate::tools::category::ToolCategory;
 use crate::tools::registry::{ToolContext, ToolDef, ToolHandler, ToolOutput};
@@ -45,8 +45,8 @@ impl ToolHandler for ListProcessesHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）
-        if let Err(msg) = validate_target_type(&env, pod) {
+        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, container) {
             return error_output("environment_type_mismatch", &msg);
         }
 
@@ -123,7 +123,7 @@ pub fn list_processes_tool_def(core: Arc<JvmExecCore>) -> ToolDef {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
                 "keyword": { "type": "string", "description": "过滤关键字（服务名等，大小写不敏感；缺省返回全部进程）" },
                 "timeout_secs": { "type": "number", "description": "超时秒数，默认 30，上限 120" },
-                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持）" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment"]

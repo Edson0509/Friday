@@ -1,5 +1,5 @@
 use crate::tools::builtin::jvm::core::{
-    clamp_or, error_output, parse_pid, require_bins, resolve_environment, validate_target_type,
+    clamp_or, error_output, parse_pid, require_bins, resolve_environment, validate_target,
     JvmExecCore,
 };
 use crate::tools::category::ToolCategory;
@@ -67,8 +67,8 @@ impl ToolHandler for JvmSimpleHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod
-        if let Err(msg) = validate_target_type(&env, pod) {
+        // 环境类型门禁：vm 拒 pod / container 必填 pod + k8s 名防呆
+        if let Err(msg) = validate_target(&env, pod, container) {
             return error_output("environment_type_mismatch", &msg);
         }
 
@@ -182,7 +182,7 @@ fn simple_schema(
     );
     props.insert(
         "pod".into(),
-        serde_json::json!({ "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持）" }),
+        serde_json::json!({ "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" }),
     );
     props.insert(
         "container".into(),
@@ -411,6 +411,29 @@ mod tests {
             .await;
         assert!(!out.success, "out: {}", out.data);
         assert_eq!(out.data["error"], "environment_type_mismatch");
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_container_env_rejects_service_name_as_pod() {
+        // Agent 把用户口中的服务名（含大写）直接当 pod 名 → 防呆拦截
+        let (tmp, core, env_id) = setup_as("container").await;
+        core.exec_pool.lock().await.insert_channel(
+            crate::exec::pool::TargetKey::k8s(&env_id, "SNMPAgentService", None),
+            Arc::new(OkChannel),
+        ).await;
+        let handler =
+            JvmSimpleHandler { core, bin_key: "jstat", timeouts: &GC_STATS, build_command: build_gc_stats };
+        let out = handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "pod": "SNMPAgentService"}), &ctx())
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+        assert!(
+            out.data["message"].as_str().unwrap().contains("k8s_find_pods"),
+            "message must guide to k8s_find_pods: {}",
+            out.data["message"]
+        );
         drop(tmp);
     }
 
