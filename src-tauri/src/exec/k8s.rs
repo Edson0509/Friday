@@ -11,11 +11,10 @@ use super::ssh::shell_quote_single;
 pub const STAGING_DIR: &str = "/tmp/friday-tools/staging";
 
 /// Pod 内 Friday 工具目录（用户指定：该目录不会触发 ephemeral-storage 驱逐）
-pub const POD_TOOLS_DIR: &str = "/opt/log/dump/heapdump/friday-tools";
+pub const POD_TOOLS_DIR: &str = "/opt/log/dump/coredump/friday-tools";
 
-/// Pod 内 dump 产物目录（Phase 2 的 heap dump / JFR 落这里；本期无生产消费方）
-#[allow(dead_code)]
-pub const POD_DUMP_DIR: &str = "/opt/log/dump/heapdump";
+/// Pod 内 dump 产物目录（heap dump / JFR 容器目标落这里；用户环境实际只有该目录）
+pub const POD_DUMP_DIR: &str = "/opt/log/dump/coredump";
 
 /// 文件属组要求：非 ossgroup 无法被目标 JVM 用户使用（用户约束，exec 用户 = ossadm 非 root）
 pub const OSS_GROUP: &str = "ossgroup";
@@ -219,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_validate_pod_path() {
-        assert!(validate_pod_path("/opt/log/dump/heapdump/x").is_ok());
+        assert!(validate_pod_path("/opt/log/dump/coredump/x").is_ok());
         assert!(validate_pod_path("relative/x").is_err());
         assert!(validate_pod_path("/a\0b").is_err());
     }
@@ -321,7 +320,7 @@ mod tests {
         #[tokio::test]
         async fn test_upload_happy_path_two_legs_and_chgrp() {
             let (base, ch) = chan(vec![]);
-            ch.upload(Path::new("/local/jdk.tar.gz"), "/opt/log/dump/heapdump/friday-tools/jdk.tar.gz")
+            ch.upload(Path::new("/local/jdk.tar.gz"), "/opt/log/dump/coredump/friday-tools/jdk.tar.gz")
                 .await
                 .unwrap();
             // leg A：SFTP 到宿主机 staging（路径含随机前缀）
@@ -333,8 +332,8 @@ mod tests {
             let runs = base.runs.lock().await;
             let host_leg = runs.iter().find(|c| c.contains("kubectl exec -i")).expect("host leg");
             assert!(host_leg.contains("< "), "host stdin redirect: {host_leg}");
-            assert!(host_leg.contains(r"cat > '\''/opt/log/dump/heapdump/friday-tools/jdk.tar.gz'\''"), "{host_leg}");
-            assert!(host_leg.contains(r"mkdir -p '\''/opt/log/dump/heapdump/friday-tools'\''"), "{host_leg}");
+            assert!(host_leg.contains(r"cat > '\''/opt/log/dump/coredump/friday-tools/jdk.tar.gz'\''"), "{host_leg}");
+            assert!(host_leg.contains(r"mkdir -p '\''/opt/log/dump/coredump/friday-tools'\''"), "{host_leg}");
             // 属组修正走 kubectl exec（容器内，不是宿主机）
             let chgrp = runs.iter().find(|c| c.contains("chgrp ossgroup")).expect("chgrp leg");
             assert!(chgrp.contains("kubectl exec"), "chgrp must run inside pod: {chgrp}");
@@ -348,12 +347,12 @@ mod tests {
             // 脚本顺序：①mkdir staging ②kubectl exec -i（exit 1）③rm staging ④rm remote（补刀清理）
             let (base, ch) = chan(vec![("", 0), ("", 1), ("", 0), ("", 0)]);
             let err = ch
-                .upload(Path::new("/local/x"), "/opt/log/dump/heapdump/friday-tools/x")
+                .upload(Path::new("/local/x"), "/opt/log/dump/coredump/friday-tools/x")
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("kubectl exec -i failed"), "err: {err}");
             let runs = base.runs.lock().await;
-            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/heapdump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
+            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/coredump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
         }
 
         #[tokio::test]
@@ -361,12 +360,12 @@ mod tests {
             // ①mkdir ②kubectl -i ok ③rm staging ④chgrp(exit 1) ⑤rm remote
             let (base, ch) = chan(vec![("", 0), ("", 0), ("", 0), ("", 1), ("", 0)]);
             let err = ch
-                .upload(Path::new("/local/x"), "/opt/log/dump/heapdump/friday-tools/x")
+                .upload(Path::new("/local/x"), "/opt/log/dump/coredump/friday-tools/x")
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("chgrp ossgroup failed"), "err: {err}");
             let runs = base.runs.lock().await;
-            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/heapdump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
+            assert!(runs.iter().any(|c| c.contains("kubectl exec") && c.contains(r"rm -f '\''/opt/log/dump/coredump/friday-tools/x'\''")), "remote cleanup: {runs:?}");
         }
 
         #[tokio::test]

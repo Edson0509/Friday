@@ -1,6 +1,6 @@
 //! K8s 容器内 JDK 装备：与 VM 模式（provision::jdk::JdkPackage）同构，
 //! 差异点：musl 保险丝、容器自带工具优先、--no-same-owner 解压、chgrp 属组修正。
-//! 固定目录 /opt/log/dump/heapdump/friday-tools（用户指定，不触发驱逐）。
+//! 固定目录 /opt/log/dump/coredump/friday-tools（用户指定，不触发驱逐）。
 
 use crate::exec::k8s::OSS_GROUP;
 use crate::provision::jdk::{
@@ -268,7 +268,7 @@ mod tests {
             cache_dir: std::path::PathBuf::from("/tmp/unused-cache"),
             artifactory_base_url: "https://artifactory.example.com/artifactory/release".into(),
             arthas_zip: None,
-            remote_tools_dir: "/opt/log/dump/heapdump/friday-tools".into(),
+            remote_tools_dir: "/opt/log/dump/coredump/friday-tools".into(),
             timeouts: StageTimeouts::default(),
             bus: crate::app::events::EventBus::disabled(),
         }
@@ -328,11 +328,11 @@ mod tests {
 
         let result = K8sJdkPackage.ensure(&pctx, "java").await.unwrap();
         assert!(!result.cached);
-        assert_eq!(result.tool_home, "/opt/log/dump/heapdump/friday-tools/jdk-21.0.11");
+        assert_eq!(result.tool_home, "/opt/log/dump/coredump/friday-tools/jdk-21.0.11");
         // 两跳上传发生（tarball 落 Pod 内工具目录）
         let uploads = ch.uploads.lock().await;
         assert_eq!(uploads.len(), 1);
-        assert_eq!(uploads[0].1, "/opt/log/dump/heapdump/friday-tools/jdk-21.0.11.tar.gz");
+        assert_eq!(uploads[0].1, "/opt/log/dump/coredump/friday-tools/jdk-21.0.11.tar.gz");
         // 解压命令含 --no-same-owner 与 chgrp
         let runs = ch.runs.lock().await;
         let extract = runs.iter().find(|c| c.contains("tar --no-same-owner")).expect("extract cmd");
@@ -368,7 +368,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let runs = ch.runs.lock().await;
         assert!(
-            runs.iter().any(|c| c.contains("rm -rf /opt/log/dump/heapdump/friday-tools/jdk-21.0.11")),
+            runs.iter().any(|c| c.contains("rm -rf /opt/log/dump/coredump/friday-tools/jdk-21.0.11")),
             "cleanup must fire: {runs:?}"
         );
     }

@@ -119,12 +119,17 @@ impl JfrRecordHandler {
         };
         let jcmd = &bins[0];
 
-        // ① 一次性定时录制（文件名 Friday 固定构造——不开放自定义，注入面）
+        // ① 一次性定时录制（文件名 Friday 固定构造——不开放自定义，注入面）。
+        // 容器目标落 POD_DUMP_DIR（coredump 卷，用户环境实际存在）；VM 保持 /tmp/friday-tools
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let remote_path = format!("/tmp/friday-tools/recording-{pid}-{ts}.jfr");
+        let remote_path = if target.pod.is_some() {
+            format!("{}/friday-recording-{pid}-{ts}.jfr", crate::exec::k8s::POD_DUMP_DIR)
+        } else {
+            format!("/tmp/friday-tools/recording-{pid}-{ts}.jfr")
+        };
         let name = format!("friday-{ts}");
         let start_cmd = mapping::jfr_start_command(jcmd, pid, &name, duration_secs, &settings, &remote_path);
 
@@ -746,6 +751,35 @@ mod tests {
         (tmp, reg)
     }
 
+    /// 容器环境 + pod 目标（k8s 复合键通道 + JDK 缓存条目）注册全量 jfr 工具
+    async fn registry_pod_target(
+        channel: Arc<dyn ExecChannel>,
+        mock: Arc<MockJmcClient>,
+    ) -> (tempfile::TempDir, ToolRegistry) {
+        let (tmp, core, transfer) = setup_as(channel.clone(), "container").await;
+        let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
+        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None);
+        core.exec_pool.lock().await.insert_channel(target.clone(), channel).await;
+        let mut bins = HashMap::new();
+        bins.insert("jcmd".to_string(), "/opt/log/dump/coredump/friday-tools/jdk/bin/jcmd".to_string());
+        core.jdk_cache
+            .set(
+                &crate::tools::builtin::jvm::jdk_cache::cache_key(&target),
+                JdkLayout { tool_home: "/opt/log/dump/coredump/friday-tools/jdk".into(), bins },
+            )
+            .await;
+        let mut reg = ToolRegistry::new();
+        register_all(
+            &mut reg,
+            jmc_manager(mock),
+            core,
+            EventBus::disabled(),
+            transfer,
+            tmp.path().join("artifacts"),
+        );
+        (tmp, reg)
+    }
+
     fn jfr_file(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("a.jfr");
         std::fs::write(&p, "fake jfr").unwrap();
@@ -888,6 +922,31 @@ mod tests {
         assert!(!out.success, "out: {}", out.data);
         assert_eq!(out.data["error"], "environment_type_mismatch");
         assert!(out.data["message"].as_str().unwrap().contains("k8s_find_pods"));
+        drop(tmp);
+    }
+
+    /// 容器目标：录制落 POD_DUMP_DIR（coredump 卷），文件名 friday- 前缀。
+    /// 起搏器说明同 test_record_full_flow_starts_background_download。
+    #[tokio::test]
+    async fn test_record_pod_target_uses_pod_dump_dir() {
+        let ch = std_channel("54321");
+        let (tmp, reg) = registry_pod_target(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        tokio::time::pause();
+        let pacer = spawn_auto_advance_pacer();
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30, "pod": "pod-1"}),
+                &ctx(),
+            )
+            .await;
+        pacer.abort();
+        assert!(out.success, "out: {}", out.data);
+        let calls = ch.calls.lock().await;
+        assert!(
+            calls[0].contains("filename=/opt/log/dump/coredump/friday-recording-1234-"),
+            "start cmd: {}", calls[0]
+        );
         drop(tmp);
     }
 

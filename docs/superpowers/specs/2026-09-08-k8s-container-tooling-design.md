@@ -2,7 +2,7 @@
 
 日期：2026-09-08
 状态：已评审通过
-关联决策：连接模型 = SSH 宿主机 + kubectl exec；工具包固定落 `/opt/log/dump/heapdump/friday-tools/`；属组要求 ossadm:ossgroup（实现为 chgrp，exec 用户即 ossadm 非 root）
+关联决策：连接模型 = SSH 宿主机 + kubectl exec；工具包固定落 `/opt/log/dump/coredump/friday-tools/`；属组要求 ossadm:ossgroup（实现为 chgrp，exec 用户即 ossadm 非 root）
 grilling 修订（2026-09-08）：exec 用户=ossadm（chgrp 方案、删除 --user）、超时显式补刀、探活改宿主机探 podIP、kubectl 环境已就绪、musl 保险丝、不做自动残留清理、SSH 独立连接、多容器默认第一个不对求助用户、**按 pod 参数分发而非 transport_type 硬分发（服务定位判定流程）**
 
 ## 背景
@@ -14,7 +14,7 @@ grilling 修订（2026-09-08）：exec 用户=ossadm（chgrp 方案、删除 --u
 ### 用户确认的关键约束
 
 1. **Pod 动态发现**：用户输入"检查 xxxservice 的内存"，Agent 先 `kubectl get pods -A -o wide | grep xxxservice` 发现 Pod；多实例时询问用户选哪一个
-2. **工具包进 Pod**：与 VM 场景一样上传 JDK/arthas；**固定目录** `/opt/log/dump/heapdump/friday-tools/`（该目录不会导致 Pod 被驱逐，不探测不决策）
+2. **工具包进 Pod**：与 VM 场景一样上传 JDK/arthas；**固定目录** `/opt/log/dump/coredump/friday-tools/`（该目录不会导致 Pod 被驱逐，不探测不决策）
 3. **文件属组**：Pod 内所有 Friday 写入的文件必须 `chown ossadm:ossgroup`，否则 JVM 用户（ossadm）无法使用
 4. **五类工具全做**：基础 JVM 工具、文件传输、heap dump、JFR、arthas
 5. **逐命令兼容性清单**是交付物之一（分析按工具家族逐命令做，实现统一走通道层）
@@ -84,7 +84,7 @@ k8s_find_pods(服务名) 与 list_processes(服务名) 双路发现
 
 ## 深入分析 ①：工具包进 Pod
 
-**固定路径**：`/opt/log/dump/heapdump/friday-tools/`（JDK、arthas、后续新工具统一于此；heap dump/JFR 产物直接落 `/opt/log/dump/heapdump/`）。该目录挂载于不会触发 ephemeral-storage 驱逐的卷，不探测、不决策链。
+**固定路径**：`/opt/log/dump/coredump/friday-tools/`（JDK、arthas、后续新工具统一于此；heap dump/JFR 产物直接落 `/opt/log/dump/coredump/`）。该目录挂载于不会触发 ephemeral-storage 驱逐的卷，不探测、不决策链。
 
 **上传管道**（容器内依赖仅 sh+tar）：
 
@@ -170,8 +170,8 @@ Friday 本地端口 ──SSH direct-tcpip──▶ 宿主机 127.0.0.1:P ──
 |---|---|
 | 基础 JVM 工具 | **零逻辑改动**。JDK 解析：容器内 `command -v jcmd` 优先 → 没有则 ensure_tool 走分析①上传链；JdkCache key 加 pod 维度 |
 | 文件传输 | TransferManager **一行不改**（只认 ExecChannel 的 upload/download，装饰器已实现两跳）；`validate_remote_path` 仍校验 Pod 内路径 |
-| heap dump | k8s 模式 `remote_path` 默认 `/opt/log/dump/heapdump/friday-heapdump-{pid}-{ts}.hprof`；生成前 `GC.heap_info` 估算 + 空间检查，不足报错不落盘；拉回成功后清 Pod 内源文件；MAT 本地分析不变 |
-| JFR | 同 heap dump 模式：录制落 `/opt/log/dump/heapdump/`，两跳拉回，JMC 本地分析不变 |
+| heap dump | k8s 模式 `remote_path` 默认 `/opt/log/dump/coredump/friday-heapdump-{pid}-{ts}.hprof`；生成前 `GC.heap_info` 估算 + 空间检查，不足报错不落盘；拉回成功后清 Pod 内源文件；MAT 本地分析不变 |
+| JFR | 同 heap dump 模式：录制落 `/opt/log/dump/coredump/`，两跳拉回，JMC 本地分析不变 |
 | arthas | attach 在 Pod 内执行（exec + nohup；arthas 包走分析①上传链）；k8s 模式 MCP 绑 0.0.0.0 + Bearer；通信走正向隧道（分析③），exec-curl 桥为降级路径；**用户对齐天然成立**——容器默认执行用户即 ossadm（非 root），与 JVM 用户一致，跳过 SSH 凭证对齐，无 `--user` 逻辑；**探活改宿主机侧**——容器 sh 无 `/dev/tcp`，改为宿主机 bash 探 `/dev/tcp/<podIP>/<port>`（podIP 经 `kubectl get pod -o jsonpath={.status.podIP}`，节点→Pod IP 集群内路由可达；探活失败兜底 MCP 握手重试）；会话 key 加 pod 维度：`(env_id, pod, container, pid)` |
 
 ## 错误处理
