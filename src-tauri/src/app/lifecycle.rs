@@ -421,6 +421,32 @@ pub async fn delete_session_cmd(
 
 #[tauri::command]
 #[tracing::instrument(skip(state))]
+pub async fn rename_session_cmd(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    tracing::info!(session_id = %session_id, "rename_session_cmd called");
+    let normalized = session::normalize_rename_title(&title).map_err(|e| {
+        tracing::warn!(session_id = %session_id, reason = %e, "rename title rejected");
+        e
+    })?;
+
+    let updated = session::rename_session(&state.db, &session_id, &normalized)
+        .await
+        .map_err(|e| {
+            tracing::error!(session_id = %session_id, error = %e, "rename session failed");
+            e.to_string()
+        })?;
+    if !updated {
+        tracing::warn!(session_id = %session_id, "rename target session not found");
+        return Err("会话不存在".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip(state))]
 pub async fn get_session_summary_cmd(
     state: State<'_, crate::AppState>,
     session_id: String,
