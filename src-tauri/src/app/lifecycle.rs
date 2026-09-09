@@ -431,6 +431,65 @@ pub async fn get_session_summary_cmd(
         .map_err(|e| e.to_string())
 }
 
+/// 按 session_id 过滤全部落盘日志，导出到该会话的 artifacts 目录。
+#[tauri::command]
+#[tracing::instrument(skip(state))]
+pub async fn export_session_logs_cmd(
+    state: State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<crate::infra::logging::SessionLogExport, String> {
+    if session_id.trim().is_empty() {
+        return Err("session_id 不能为空".to_string());
+    }
+    tracing::info!(session_id = %session_id, "export_session_logs_cmd called");
+
+    let artifacts_dir = state.paths.session_artifacts_dir(&session_id);
+    let out_path = artifacts_dir.join(format!(
+        "session-logs-{}.log",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    if let Err(e) = std::fs::create_dir_all(&artifacts_dir) {
+        tracing::error!(?e, path = %artifacts_dir.display(), "failed to create artifacts dir");
+        return Err(e.to_string());
+    }
+
+    let log_dir = state.paths.log_dir();
+    let result = crate::infra::logging::export_session_logs(&log_dir, &out_path, &session_id)
+        .map_err(|e| {
+            tracing::error!(?e, session_id = %session_id, "failed to export session logs");
+            e.to_string()
+        })?;
+    tracing::info!(
+        session_id = %session_id,
+        path = %result.path.display(),
+        line_count = result.line_count,
+        files_scanned = result.files_scanned,
+        "session logs exported"
+    );
+    Ok(result)
+}
+
+/// 在系统文件管理器中打开日志目录。
+#[tauri::command]
+#[tracing::instrument(skip(state, app))]
+pub async fn open_logs_dir_cmd(
+    app: tauri::AppHandle,
+    state: State<'_, crate::AppState>,
+) -> Result<(), String> {
+    let log_dir = state.paths.log_dir();
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        tracing::warn!(?e, path = %log_dir.display(), "failed to ensure log dir");
+    }
+    tracing::info!(path = %log_dir.display(), "opening logs dir in file manager");
+    use tauri_plugin_shell::ShellExt;
+    app.shell()
+        .open(log_dir.to_string_lossy().to_string(), None)
+        .map_err(|e| {
+            tracing::error!(?e, path = %log_dir.display(), "failed to open logs dir");
+            e.to_string()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
