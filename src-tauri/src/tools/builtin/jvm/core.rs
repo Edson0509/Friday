@@ -151,17 +151,8 @@ impl JvmExecCore {
         match result {
             Err(_) => {
                 tracing::warn!(session_id, env_id = %target.env_id, timeout_secs, "jvm tool timed out, dropping connection to terminate remote process");
-                {
-                    let mut pool = self.exec_pool.lock().await;
-                    pool.disconnect_target(target).await;
-                }
-                // k8s 目标：断 SSH 只杀 kubectl，容器内进程可能存活 → 独立连接补刀
-                // （VM 目标 no-op）
-                crate::exec::pool::spawn_timeout_kill(
-                    self.db.clone(),
-                    target.clone(),
-                    command.to_string(),
-                );
+                // 断连 + k8s 目标容器内补刀（VM 目标补刀 no-op）
+                crate::exec::pool::drop_target_and_kill(&self.exec_pool, &self.db, target, command).await;
                 error_output(
                     "timeout_error",
                     &format!("command timed out after {timeout_secs}s; connection closed, remote process kill is best-effort for containers"),
@@ -230,6 +221,64 @@ impl JvmExecCore {
                 }
             }
         }
+    }
+}
+
+/// jvm 工具族共享测试夹具（基础层）：临时目录 + SQLite + 建环境（指定 transport）+ 空连接池。
+/// ensure_tool 等不构造 JvmExecCore 的测试直接用这层。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::JvmExecCore;
+    use std::sync::Arc;
+
+    pub async fn setup_env(
+        transport: &str,
+    ) -> (
+        tempfile::TempDir,
+        sqlx::SqlitePool,
+        Arc<tokio::sync::Mutex<crate::exec::pool::ExecChannelPool>>,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
+        let env_id = crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, transport,
+            vec![crate::app::env_save::CredentialInput {
+                id: None,
+                username: "root".to_string(),
+                auth_type: "password".to_string(),
+                private_key_path: None,
+                secret: None,
+                is_default: true,
+            }],
+        )
+        .await
+        .unwrap()
+        .environment
+        .id;
+        let exec_pool = Arc::new(tokio::sync::Mutex::new(crate::exec::pool::ExecChannelPool::new()));
+        (tmp, db, exec_pool, env_id)
+    }
+
+    /// jvm 工具族共享测试夹具（完整层）：建环境（指定 transport）+ 注入 base 通道 + JvmExecCore。
+    /// 返回 (临时目录, core, env_id)；env_id 供测试补注 k8s 复合键通道 / JDK 缓存条目
+    /// （base 目标的 JDK 缓存键即 env_id）。需要预置 JDK 缓存或 TransferManager 的
+    /// 测试在返回的 core 上叠加（JvmExecCore 字段皆 pub）。
+    pub async fn setup_env_with_channel(
+        transport: &str,
+        channel: Arc<dyn crate::exec::channel::ExecChannel>,
+    ) -> (tempfile::TempDir, Arc<JvmExecCore>, String) {
+        let (tmp, db, exec_pool, env_id) = setup_env(transport).await;
+        exec_pool.lock().await.insert_channel(env_id.clone(), channel).await;
+        let artifacts = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let core = Arc::new(JvmExecCore {
+            db,
+            exec_pool,
+            jdk_cache: Arc::new(crate::tools::builtin::jvm::jdk_cache::JdkCache::new()),
+            artifacts_dir: artifacts,
+        });
+        (tmp, core, env_id)
     }
 }
 

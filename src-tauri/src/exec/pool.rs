@@ -350,6 +350,18 @@ pub fn spawn_timeout_kill(db: sqlx::SqlitePool, target: TargetKey, command: Stri
     });
 }
 
+/// 超时处置：精确断开目标连接 + k8s 目标容器内补刀（best-effort）。
+/// 六个远端工具超时分支的共享路径——断连持池锁，补刀独立建连不持锁。
+pub async fn drop_target_and_kill(
+    exec_pool: &Arc<tokio::sync::Mutex<ExecChannelPool>>,
+    db: &sqlx::SqlitePool,
+    target: &TargetKey,
+    command: &str,
+) {
+    exec_pool.lock().await.disconnect_target(target).await;
+    spawn_timeout_kill(db.clone(), target.clone(), command.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
