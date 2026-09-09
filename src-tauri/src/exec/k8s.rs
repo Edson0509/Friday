@@ -71,7 +71,7 @@ pub fn validate_pod_path(path: &str) -> Result<(), String> {
 }
 
 /// K8s 容器通道：run 语义 = 在 Pod 容器内执行（sh -c，busybox 无 bash）；
-/// upload = 两跳注入（Task 2 实现）。连接生命周期完全委托 base SSH 通道。
+/// upload/download = 两跳传输（宿主机 staging 中转）。连接生命周期完全委托 base SSH 通道。
 pub struct K8sChannel {
     pub base: Arc<dyn ExecChannel>,
     pub pod: String,
@@ -182,6 +182,91 @@ impl ExecChannel for K8sChannel {
             )
             .into());
         }
+        Ok(())
+    }
+
+    async fn download(
+        &self,
+        remote_path: &str,
+        local: &std::path::Path,
+        offset: u64,
+        progress: &(dyn Fn(u64, u64) + Sync),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        validate_pod_path(remote_path)?;
+        let basename = remote_path.rsplit('/').next().unwrap_or("file");
+        let staging = format!("{}/{}-{}", STAGING_DIR, uuid::Uuid::new_v4(), basename);
+        let q = shell_quote_single(remote_path);
+        let staging_q = shell_quote_single(&staging);
+
+        // ① Pod 内文件大小（完整性校验基准；失败说明文件不存在或 stat 缺失）
+        let stat_out = self
+            .run(&format!("stat -c %s {q}"))
+            .await
+            .map_err(|e| format!("k8s download: stat {remote_path} failed: {e}"))?;
+        if stat_out.exit_code != 0 {
+            tracing::warn!(pod = %self.pod, remote_path, exit_code = stat_out.exit_code, stderr = %stat_out.stderr, "k8s download: pod-side stat failed");
+            return Err(format!(
+                "k8s download: 容器内文件不存在或不可读 {remote_path} (exit {}): {}",
+                stat_out.exit_code, stat_out.stderr
+            )
+            .into());
+        }
+        let pod_size: u64 = stat_out.stdout.trim().parse().map_err(|_| {
+            format!("k8s download: unexpected stat output: {:?}", stat_out.stdout)
+        })?;
+
+        // ② leg1：kubectl exec cat → 宿主机 staging（重定向在宿主机 bash 侧，
+        //    数据不流经 Friday 内存）。容器内依赖仅 cat。
+        //    注：base.run 持连接锁期间无法并发轮询 staging 大小，leg1 不产生
+        //    进度事件（进度由 leg2 SFTP 驱动）——大文件场景 leg2（跨网）本就是
+        //    瓶颈腿，可接受。重试时 leg1 整段重跑（宿主机本地，快）。
+        let host_cmd = format!(
+            "kubectl exec {}{} -- cat {} > {}",
+            self.ctr_flag(),
+            shell_quote_single(&self.pod),
+            q,
+            staging_q,
+        );
+        let out = self.base.run(&host_cmd).await?;
+        if out.exit_code != 0 {
+            tracing::warn!(pod = %self.pod, remote_path, staging = %staging, exit_code = out.exit_code, stderr = out.stderr, "k8s download: leg 1 kubectl exec cat failed");
+            // staging 半截清理（best-effort）
+            let _ = self.base.run(&format!("rm -f {staging_q}")).await;
+            return Err(format!(
+                "k8s download: leg 1 (kubectl exec cat) failed (exit {}): {}",
+                out.exit_code, out.stderr
+            )
+            .into());
+        }
+
+        // ③ leg2：宿主机 staging → Friday 本地（现有 SFTP，offset 续传 + progress）
+        if let Err(e) = self.base.download(&staging, local, offset, progress).await {
+            tracing::warn!(pod = %self.pod, remote_path, staging = %staging, error = %e, "k8s download: leg 2 sftp failed");
+            // 半截 staging 即时清理（失败路径唯一防线：用户已否决周期扫描）；
+            // 连接级失败时 rm 也会失败——best-effort，与 upload 同语义
+            let _ = self.base.run(&format!("rm -f {staging_q}")).await;
+            return Err(format!(
+                "k8s download: leg 2 (sftp from host staging {staging}) failed: {e}"
+            )
+            .into());
+        }
+
+        // ④ staging 清理（best-effort，成败不影响结果）
+        let _ = self.base.run(&format!("rm -f {staging_q}")).await;
+
+        // ⑤ 完整性校验：本地最终大小 == Pod 内源大小。
+        //    offset 续传语义：本地文件 = 已有 offset 字节 + 本次新增，最终应为 pod_size。
+        //    Pod 内源文件删除不在这里做——TransferState.cleanup_remote_on_success
+        //    走 channel.run（kubectl exec rm）由传输层负责。
+        let local_size = tokio::fs::metadata(local).await.map(|m| m.len()).unwrap_or(0);
+        if local_size != pod_size {
+            tracing::error!(pod = %self.pod, remote_path, pod_size, local_size, offset, "k8s download: size mismatch after two-leg transfer");
+            return Err(format!(
+                "k8s download: size mismatch (pod {pod_size} bytes, local {local_size} bytes) for {remote_path}"
+            )
+            .into());
+        }
+        tracing::info!(pod = %self.pod, remote_path, pod_size, "k8s download: two-leg transfer done");
         Ok(())
     }
 
@@ -394,6 +479,157 @@ mod tests {
             let (_base, ch) = chan(vec![]);
             let err = ch.upload(Path::new("/local/x"), "relative/x").await.unwrap_err();
             assert!(err.to_string().contains("absolute"), "err: {err}");
+        }
+    }
+
+    mod download_tests {
+        use super::super::*;
+        use crate::exec::channel::ExecChannel;
+        use async_trait::async_trait;
+        use std::path::Path;
+
+        /// 可编排响应的 base：run 第 n 次返回脚本第 n 条 (stdout, exit_code)；
+        /// download 记录 (remote, local, offset) 并按 download_sizes 注入的大小
+        /// 写本地文件（模拟 SFTP 落盘的最终状态，供完整性校验用例控制大小）。
+        struct ScriptedBase {
+            script: std::sync::Mutex<std::collections::VecDeque<(String, i32)>>,
+            runs: tokio::sync::Mutex<Vec<String>>,
+            downloads: tokio::sync::Mutex<Vec<(String, std::path::PathBuf, u64)>>,
+            download_sizes: std::sync::Mutex<std::collections::VecDeque<u64>>,
+        }
+
+        impl ScriptedBase {
+            fn new(script: Vec<(&str, i32)>) -> Self {
+                Self {
+                    script: std::sync::Mutex::new(
+                        script.into_iter().map(|(s, c)| (s.to_string(), c)).collect(),
+                    ),
+                    runs: tokio::sync::Mutex::new(Vec::new()),
+                    downloads: tokio::sync::Mutex::new(Vec::new()),
+                    download_sizes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl ExecChannel for ScriptedBase {
+            async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+                self.runs.lock().await.push(cmd.to_string());
+                let (stdout, exit_code) = self
+                    .script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or((String::new(), 0));
+                Ok(ExecOutput { stdout, stderr: String::new(), exit_code })
+            }
+            async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+            async fn disconnect(&self) {}
+            async fn is_alive(&self) -> bool { true }
+            async fn download(&self, remote: &str, local: &Path, offset: u64, _progress: &(dyn Fn(u64, u64) + Sync))
+                -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                self.downloads.lock().await.push((remote.to_string(), local.to_path_buf(), offset));
+                let size = self.download_sizes.lock().unwrap().pop_front().unwrap_or(16);
+                std::fs::write(local, vec![0u8; size as usize])?;
+                Ok(())
+            }
+        }
+
+        fn chan(script: Vec<(&str, i32)>) -> (Arc<ScriptedBase>, K8sChannel) {
+            let base = Arc::new(ScriptedBase::new(script));
+            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), container: None };
+            (base, ch)
+        }
+
+        #[tokio::test]
+        async fn test_download_happy_path_two_legs() {
+            // 脚本顺序：①stat（容器内，输出 1024）②leg1 kubectl exec cat ③staging rm
+            let (base, ch) = chan(vec![("1024", 0), ("", 0), ("", 0)]);
+            base.download_sizes.lock().unwrap().push_back(1024);
+            let tmp = tempfile::tempdir().unwrap();
+            let local = tmp.path().join("dump.hprof");
+            ch.download("/opt/log/dump/coredump/dump.hprof", &local, 4096, &|_, _| {})
+                .await
+                .unwrap();
+            let runs = base.runs.lock().await;
+            // ① 容器内 stat（经 wrap_exec_command，sh -c 包裹 + 单引号转义）
+            assert!(runs[0].contains("kubectl exec"), "stat leg: {}", runs[0]);
+            assert!(runs[0].contains(r"stat -c %s '\''/opt/log/dump/coredump/dump.hprof'\''"), "stat leg: {}", runs[0]);
+            // ② leg1：kubectl exec cat '路径' > 'staging路径'（重定向在宿主机侧）
+            let leg1 = runs.iter().find(|c| c.contains(" -- cat ")).expect("leg 1 host cmd");
+            assert!(leg1.starts_with("kubectl exec 'svc-1' -- cat "), "leg1: {leg1}");
+            assert!(leg1.contains(r"cat '/opt/log/dump/coredump/dump.hprof'"), "leg1: {leg1}");
+            assert!(leg1.contains("> '/tmp/friday-tools/staging/"), "leg1 host redirect: {leg1}");
+            assert!(leg1.ends_with("-dump.hprof'"), "leg1 staging basename: {leg1}");
+            // ③ leg2：base.download 以 staging 为远端，offset 透传
+            let downloads = base.downloads.lock().await;
+            assert_eq!(downloads.len(), 1);
+            assert!(downloads[0].0.starts_with("/tmp/friday-tools/staging/"), "staging: {}", downloads[0].0);
+            assert!(downloads[0].0.ends_with("-dump.hprof"), "staging: {}", downloads[0].0);
+            assert_eq!(downloads[0].1, local);
+            assert_eq!(downloads[0].2, 4096, "offset must pass through to leg 2");
+            // ⑤ 完整性：本地最终大小 == Pod 内 stat 大小
+            assert_eq!(std::fs::metadata(&local).unwrap().len(), 1024);
+            // ④ staging 清理
+            assert!(runs.iter().any(|c| c.contains("rm -f '/tmp/friday-tools/staging/")), "staging cleanup: {runs:?}");
+        }
+
+        #[tokio::test]
+        async fn test_download_pod_file_missing() {
+            let (base, ch) = chan(vec![("", 1)]);
+            let tmp = tempfile::tempdir().unwrap();
+            let err = ch
+                .download("/opt/log/dump/coredump/none.hprof", &tmp.path().join("x.hprof"), 0, &|_, _| {})
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("容器内文件不存在"), "err: {err}");
+            let runs = base.runs.lock().await;
+            assert_eq!(runs.len(), 1, "only the stat leg should run: {runs:?}");
+            assert!(base.downloads.lock().await.is_empty(), "no leg 2");
+        }
+
+        #[tokio::test]
+        async fn test_download_leg1_failure_cleans_staging() {
+            // ①stat ok ②leg1 exit 1 ③staging rm
+            let (base, ch) = chan(vec![("1024", 0), ("", 1), ("", 0)]);
+            let tmp = tempfile::tempdir().unwrap();
+            let err = ch
+                .download("/opt/log/dump/coredump/d.hprof", &tmp.path().join("d.hprof"), 0, &|_, _| {})
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("leg 1"), "err: {err}");
+            let runs = base.runs.lock().await;
+            assert!(
+                runs.iter().any(|c| c.contains("rm -f '/tmp/friday-tools/staging/")),
+                "half-written staging must be cleaned: {runs:?}"
+            );
+            assert!(base.downloads.lock().await.is_empty(), "no leg 2");
+        }
+
+        #[tokio::test]
+        async fn test_download_size_mismatch_detected() {
+            // stat 说 1024，leg2 只落盘 512
+            let (base, ch) = chan(vec![("1024", 0), ("", 0), ("", 0)]);
+            base.download_sizes.lock().unwrap().push_back(512);
+            let tmp = tempfile::tempdir().unwrap();
+            let err = ch
+                .download("/opt/log/dump/coredump/d.hprof", &tmp.path().join("d.hprof"), 0, &|_, _| {})
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("size mismatch"), "err: {err}");
+        }
+
+        #[tokio::test]
+        async fn test_download_rejects_relative_path() {
+            let (base, ch) = chan(vec![]);
+            let tmp = tempfile::tempdir().unwrap();
+            let err = ch
+                .download("relative/x", &tmp.path().join("x"), 0, &|_, _| {})
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("absolute"), "err: {err}");
+            assert!(base.runs.lock().await.is_empty(), "no commands should run");
+            assert!(base.downloads.lock().await.is_empty(), "no downloads");
         }
     }
 }

@@ -10,20 +10,23 @@ const BACKOFF_SECS: [u64; 5] = [5, 15, 45, 120, 360];
 
 enum StatRemote {
     Size(u64),
-    Missing,      // exit_code != 0 → 远端文件不存在（终态）
-    Unavailable,  // run() 出错 → 连接问题（可重试）
+    /// exit_code != 0。远端文件不存在是最常见原因，但 k8s 通道下 kubectl 级失败
+    /// （API server 抖动/Unauthorized）也会走到这里——stderr 随附，调用方文案不得断言"文件不存在"。
+    Missing(String),
+    Unavailable, // run() 出错 → 连接问题（可重试）
 }
 
-/// stat 远端文件大小。Missing = 文件不存在（终态）；Unavailable = 通道错误（可重试）。
+/// stat 远端文件大小。Missing = 非 0 退出（文件缺失或 kubectl 级失败，含 stderr）；
+/// Unavailable = 通道错误（可重试）。
 async fn stat_remote(channel: &Arc<dyn ExecChannel>, remote_path: &str) -> StatRemote {
     let cmd = format!("stat -c %s {}", crate::exec::ssh::shell_quote_single(remote_path));
     match channel.run(&cmd).await {
         Err(_) => StatRemote::Unavailable,
         Ok(o) if o.exit_code == 0 => match o.stdout.trim().parse::<u64>() {
             Ok(n) => StatRemote::Size(n),
-            Err(_) => StatRemote::Missing,
+            Err(_) => StatRemote::Missing(format!("unexpected stat output: {:?}", o.stdout)),
         },
-        Ok(_) => StatRemote::Missing,
+        Ok(o) => StatRemote::Missing(format!("exit {}: {}", o.exit_code, o.stderr.trim())),
     }
 }
 
@@ -36,6 +39,8 @@ fn resume_offset(part_len: Option<u64>, total: u64) -> u64 {
 pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cancel: CancellationToken) {
     let id = state.id.clone();
     let env_id = state.env_id.clone();
+    let pod = state.pod.clone();
+    let container = state.container.clone();
     let remote_path = state.remote_path.clone();
     let local = state.local_path.clone();
     let cleanup = state.cleanup_remote_on_success;
@@ -45,7 +50,7 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
     let mut attempt: u32 = 0;
     let mut last_err: Option<String> = None;
 
-    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, remote_path = %remote_path, "transfer worker: download starting");
+    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), remote_path = %remote_path, "transfer worker: download starting");
 
     loop {
         if cancel.is_cancelled() {
@@ -79,7 +84,10 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
             }
         }
 
-        let channel = match mgr.dedicated_channel(&env_id).await {
+        let channel = match mgr
+            .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(transfer_id = %id, env_id = %env_id, attempt, error = %e, "transfer: connect failed");
@@ -91,12 +99,12 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
 
         let total = match stat_remote(&channel, &remote_path).await {
             StatRemote::Size(total) => total,
-            StatRemote::Missing => {
+            StatRemote::Missing(detail) => {
                 channel.disconnect().await;
                 mgr.finish(
                     &id,
                     Status::Failed,
-                    Some(format!("远端文件不存在或无法读取: {remote_path}")),
+                    Some(format!("远端文件不存在或无法读取: {remote_path}（{detail}；k8s 目标下也可能是 kubectl/API server 级失败，重试前请先核实）")),
                     0, 0,
                 ).await;
                 return; // 终态不重试
@@ -186,9 +194,17 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
                     mgr.finish(&id, Status::Failed, Some(format!("本地文件落盘失败: {e}")), local_size, total).await;
                     return;
                 }
-                // heap_dump 场景：下载成功后清理远端（失败仅告警）
+                // heap_dump 场景：下载成功后清理远端（失败仅告警）。
+                // pod 目标：新连接同为 K8sChannel，rm 经 kubectl exec 进容器删源文件
                 if cleanup {
-                    let rm = channel_cmd_after_disconnect(&mgr, &env_id, &remote_path).await;
+                    let rm = channel_cmd_after_disconnect(
+                        &mgr,
+                        &env_id,
+                        pod.as_deref(),
+                        container.as_deref(),
+                        &remote_path,
+                    )
+                    .await;
                     if let Err(e) = rm {
                         tracing::warn!(transfer_id = %id, error = %e, "transfer: remote cleanup failed (kept)");
                     }
@@ -200,13 +216,16 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
     }
 }
 
-/// 清理远端文件：再开一条短连接执行 rm（原连接已断开）
+/// 清理远端文件：再开一条短连接执行 rm（原连接已断开）。
+/// pod 目标下 dedicated_channel 构造 K8sChannel，rm 自动变容器内 rm。
 async fn channel_cmd_after_disconnect(
     mgr: &TransferManager,
     env_id: &str,
+    pod: Option<&str>,
+    container: Option<&str>,
     remote_path: &str,
 ) -> Result<(), String> {
-    let channel = mgr.dedicated_channel(env_id).await?;
+    let channel = mgr.dedicated_channel(env_id, pod, container).await?;
     let cmd = format!("rm -f {}", crate::exec::ssh::shell_quote_single(remote_path));
     match channel.run(&cmd).await {
         Err(e) => {
@@ -228,6 +247,8 @@ async fn channel_cmd_after_disconnect(
 pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel: CancellationToken) {
     let id = state.id.clone();
     let env_id = state.env_id.clone();
+    let pod = state.pod.clone();
+    let container = state.container.clone();
     let remote_path = state.remote_path.clone();
     let local = state.local_path.clone();
     let session_id = state.session_id.clone();
@@ -241,7 +262,7 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
     };
     let total = meta.len();
 
-    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, remote_path = %remote_path, total, "transfer worker: upload starting");
+    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), remote_path = %remote_path, total, "transfer worker: upload starting");
 
     loop {
         if cancel.is_cancelled() {
@@ -273,7 +294,10 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
             }
         }
 
-        let channel = match mgr.dedicated_channel(&env_id).await {
+        let channel = match mgr
+            .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(transfer_id = %id, env_id = %env_id, attempt, error = %e, "transfer: connect failed");
@@ -315,8 +339,11 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
                 continue;
             }
             Ok(()) => {
-                // 远端大小校验：再开短连接 stat
-                let check = match mgr.dedicated_channel(&env_id).await {
+                // 远端大小校验：再开短连接 stat（pod 目标下 stat 进容器）
+                let check = match mgr
+                    .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+                    .await
+                {
                     Ok(c) => {
                         let size = stat_remote(&c, &remote_path).await;
                         c.disconnect().await;
@@ -333,9 +360,9 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
                         tracing::warn!(transfer_id = %id, remote_size, total, "transfer: remote size mismatch after upload, retrying");
                         continue;
                     }
-                    Ok(StatRemote::Missing) => {
+                    Ok(StatRemote::Missing(detail)) => {
                         // 上传刚完成，文件理应存在；不存在视作异常，重试
-                        tracing::warn!(transfer_id = %id, "transfer: remote file missing after upload, retrying");
+                        tracing::warn!(transfer_id = %id, detail, "transfer: remote file missing after upload, retrying");
                         continue;
                     }
                     Ok(StatRemote::Unavailable) => {
@@ -412,7 +439,7 @@ mod tests {
             async fn is_alive(&self) -> bool { true }
         }
         let ch: Arc<dyn ExecChannel> = Arc::new(NoFileChan);
-        assert!(matches!(stat_remote(&ch, "/tmp/gone").await, StatRemote::Missing));
+        assert!(matches!(stat_remote(&ch, "/tmp/gone").await, StatRemote::Missing(_)));
     }
 
     #[tokio::test]
@@ -541,6 +568,8 @@ mod tests {
             "/tmp/a.hprof",
             local,
             false,
+            None,
+            None,
         );
         let id = mgr.start(state).await;
 
@@ -571,6 +600,8 @@ mod tests {
             "/tmp/up.jar",
             local,
             false,
+            None,
+            None,
         );
         let id = mgr.start(state).await;
 

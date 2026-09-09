@@ -40,6 +40,31 @@ pub async fn connect_arthas_client(
     })
 }
 
+/// 原生 HTTP 连接（T6 隧道主路径）：rmcp 自带 reqwest client（from_config：
+/// 禁连接池 + 禁重定向）直打本地隧道端口 http://127.0.0.1:{L}/mcp，不经 exec
+/// 通道、不依赖容器内 curl。auth_header 传**裸 token**（reqwest 侧 bearer_auth
+/// 拼 Bearer 前缀，与桥路径语义一致；双重前缀 = 401）。
+pub async fn connect_arthas_client_native(url: &str, token: &str) -> Result<McpArthasClient, String> {
+    use rmcp::ServiceExt;
+
+    let config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url)
+        .auth_header(token);
+    let transport =
+        rmcp::transport::StreamableHttpClientTransport::<reqwest::Client>::from_config(config);
+
+    let service = tokio::time::timeout(Duration::from_secs(30), ().serve(transport))
+        .await
+        .map_err(|_| format!("arthas MCP 握手超时（30s）: {url}"))?
+        .map_err(|e| format!("arthas MCP 连接失败: {e}"))?;
+
+    let peer = service.peer().clone();
+    tracing::info!(url, "arthas mcp client connected (native http via pf tunnel)");
+    Ok(McpArthasClient {
+        peer,
+        service: tokio::sync::Mutex::new(Some(service)),
+    })
+}
+
 #[async_trait]
 impl ArthasClient for McpArthasClient {
     async fn call_tool(&self, name: &str, args: &Value) -> Result<CallOutcome, String> {

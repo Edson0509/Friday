@@ -216,20 +216,10 @@ mod tests {
     }
 
     async fn setup_as(transport: &str) -> (tempfile::TempDir, sqlx::SqlitePool, Arc<Mutex<crate::exec::pool::ExecChannelPool>>, std::path::PathBuf, crate::app::events::EventBus) {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        crate::app::env_save::save_environment_with_transport(
-            &db, None, "prod", "10.0.0.1", 22, transport,
-            vec![crate::app::env_save::CredentialInput {
-                id: None,
-                username: "root".to_string(),
-                auth_type: "password".to_string(),
-                private_key_path: None,
-                secret: None,
-                is_default: true,
-            }],
-        ).await.unwrap();
-        let exec_pool = Arc::new(Mutex::new(crate::exec::pool::ExecChannelPool::new()));
+        // 不注入通道、不构造 JvmExecCore（EnsureToolHandler 直接持 db/exec_pool/cache/bus），
+        // 只复用共享夹具的环境创建层
+        let (tmp, db, exec_pool, _env_id) =
+            crate::tools::builtin::jvm::core::test_support::setup_env(transport).await;
         let cache = tmp.path().join("cache");
         std::fs::create_dir_all(&cache).unwrap();
         (tmp, db, exec_pool, cache, crate::app::events::EventBus::disabled())

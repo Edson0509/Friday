@@ -1,7 +1,7 @@
 pub mod mapping;
 
 use crate::arthas::manager::{ArthasManager, ManagerError};
-use crate::tools::builtin::jvm::core::{clamp_or, error_output, parse_pid};
+use crate::tools::builtin::jvm::core::{clamp_or, error_output, parse_pid, validate_target};
 use crate::tools::builtin::run_command::{artifact_dir_for, truncate_output};
 use crate::tools::category::ToolCategory;
 use crate::tools::registry::{ToolContext, ToolDef, ToolHandler, ToolOutput};
@@ -56,14 +56,14 @@ impl ToolHandler for ArthasToolHandler {
             Err(e) => return error_output("lookup_failed", &format!("查询环境失败: {e}")),
         };
 
-        // 容器门禁：arthas 容器内 attach 属 Phase 2（当前 attach 跑在宿主机，容器环境必然失败）
-        if env.transport_type == "container" {
-            tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, kind = ?self.kind, pid, "arthas rejected: container env not supported yet (phase 2)");
-            return error_output(
-                "arthas_container_not_supported",
-                "Arthas 容器内 attach 尚未支持（规划中）：当前 arthas 只能在虚机环境（服务直接跑在宿主机）使用。\
-                 容器环境诊断请用 jvm_* 工具（带 pod 参数）。",
-            );
+        // pod/container 提取（空串归一为 None，与 SessionKey::from_parts 一致）
+        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+
+        // 环境类型门禁：container 必填 pod（引导 k8s_find_pods）/ vm 拒 pod + k8s 名 DNS-1123 防呆
+        if let Err(msg) = validate_target(&env, pod, container) {
+            tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, kind = ?self.kind, pod = ?pod, error = %msg, "arthas target validation failed");
+            return error_output("environment_type_mismatch", &msg);
         }
 
         let timeout_secs = clamp_or(
@@ -78,13 +78,13 @@ impl ToolHandler for ArthasToolHandler {
         match self.kind {
             ArthasToolKind::Open => {
                 let java_bin = args.get("java_bin").and_then(|v| v.as_str()).unwrap_or("java");
-                match self.manager.open(&ctx.session_id, &env.id, pid as i64, java_bin, timeout_secs).await {
+                match self.manager.open(&ctx.session_id, &env.id, pod, container, pid as i64, java_bin, timeout_secs).await {
                     Ok(outcome) => render(&ctx.session_id, &self.artifacts_dir, "arthas_open", &label, &outcome.summary, start, true).await,
                     Err(e) => self.manager_error_output(e, &ctx.session_id, "arthas_open", &label, start).await,
                 }
             }
             ArthasToolKind::Close => {
-                let was_open = self.manager.close(&env.id, pid as i64).await;
+                let was_open = self.manager.close(&env.id, pod, container, pid as i64).await;
                 ToolOutput {
                     success: true,
                     data: serde_json::json!({
@@ -102,7 +102,7 @@ impl ToolHandler for ArthasToolHandler {
                     Ok(v) => v,
                     Err(e) => return error_output("invalid_params", &e),
                 };
-                match self.manager.query(&env.id, pid as i64, upstream, &upstream_args, timeout_secs).await {
+                match self.manager.query(&env.id, pod, container, pid as i64, upstream, &upstream_args, timeout_secs).await {
                     Ok(outcome) => {
                         render(&ctx.session_id, &self.artifacts_dir, upstream, &label, &outcome.text, start, !outcome.is_error).await
                     }
@@ -205,7 +205,7 @@ pub fn register_all(
     // (name, description, risk, timeouts, kind)
     let defs: Vec<(&str, &str, RiskLevel, Timeouts, ArthasToolKind)> = vec![
         ("arthas_open",
-         "attach arthas 到目标 JVM 并建立诊断通道（幂等，已 attach 秒回）。首次自动下发 arthas 工具包（需 Artifactory 已配置）；SSH 用户与 JVM 用户不一致时需要已录入对应用户凭证。加载 agent 侵入目标 JVM，需确认。",
+         "attach arthas 到目标 JVM 并建立诊断通道（幂等，已 attach 秒回）。首次自动下发 arthas 工具包（内置随应用分发，无需 Artifactory；仅目标机无 java 需补装 JDK 时才依赖 Artifactory）；SSH 用户与 JVM 用户不一致时需要已录入对应用户凭证。加载 agent 侵入目标 JVM，需确认。容器环境：先 k8s_find_pods 定位 Pod，再带 pod 参数调用（首次自动装备 arthas 到 Pod）。",
          RiskLevel::Low, OPEN, ArthasToolKind::Open),
         ("arthas_close",
          "停止目标 JVM 上的 arthas agent 并释放通道（卸载字节码增强与 agent，幂等）。诊断完成后调用，或留给空闲自动回收。",
@@ -304,6 +304,8 @@ fn arthas_tool_def(
     let mut props = serde_json::json!({
         "environment": { "type": "string", "description": "目标环境名（来自 list_environments）" },
         "pid": { "type": "string", "description": "目标 JVM 进程号（来自 list_processes）" },
+        "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
+        "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" },
         "timeout_secs": { "type": "integer", "description": format!("超时秒数，默认 {}，最大 {}", timeouts.0, timeouts.1) },
     });
     if !matches!(kind, ArthasToolKind::Open | ArthasToolKind::Close) {
@@ -318,6 +320,12 @@ fn arthas_tool_def(
             "description": "目标机 java 可执行文件路径（默认 java；目标机 PATH 无 java 时需指定）"
         });
     }
+    // close + 25 个代理工具：会话查找 key 含 pod，容器环境须带与 arthas_open 相同的 pod 参数
+    let description = if matches!(kind, ArthasToolKind::Open) {
+        description.to_string()
+    } else {
+        format!("{description}容器环境需带与 arthas_open 相同的 pod 参数。")
+    };
     ToolDef {
         name: name.to_string(),
         description: description.to_string(),
@@ -342,8 +350,87 @@ fn arthas_tool_def(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arthas::manager::{ArthasConfig, AttachFactory};
+    use crate::arthas::manager::{
+        ArthasClient, ArthasConfig, ArthasStopHandle, AttachRequest, AttachedSession, CallOutcome,
+        AttachFactory,
+    };
     use crate::tools::category::ToolCategory;
+
+    struct MockClient;
+
+    #[async_trait]
+    impl ArthasClient for MockClient {
+        async fn call_tool(&self, _name: &str, _args: &serde_json::Value) -> Result<CallOutcome, String> {
+            Ok(CallOutcome { text: "ok".to_string(), is_error: false })
+        }
+        async fn shutdown(&self) {}
+    }
+
+    struct MockStop;
+
+    #[async_trait]
+    impl ArthasStopHandle for MockStop {
+        async fn stop(&self) {}
+    }
+
+    fn ok_session() -> AttachedSession {
+        AttachedSession {
+            client: Arc::new(MockClient),
+            stop_handle: Arc::new(MockStop),
+            remote_port: 18563,
+        }
+    }
+
+    /// 建库 + 单环境（transport = vm | container）
+    async fn db_with_env(transport: &str) -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
+        crate::app::env_save::save_environment_with_transport(
+            &db, None, "prod", "10.0.0.1", 22, transport,
+            vec![crate::app::env_save::CredentialInput {
+                id: None,
+                username: "root".to_string(),
+                auth_type: "password".to_string(),
+                private_key_path: None,
+                secret: None,
+                is_default: true,
+            }],
+        )
+        .await
+        .unwrap();
+        (tmp, db)
+    }
+
+    /// 记录型工厂：捕获 AttachRequest 并返回就绪会话
+    fn recording_factory(
+        captured: Arc<std::sync::Mutex<Vec<AttachRequest>>>,
+    ) -> AttachFactory {
+        Arc::new(move |req| {
+            let captured = captured.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push(req);
+                Ok(ok_session())
+            })
+        })
+    }
+
+    fn handler(
+        manager: Arc<ArthasManager>,
+        db: sqlx::SqlitePool,
+        kind: ArthasToolKind,
+    ) -> ArthasToolHandler {
+        ArthasToolHandler {
+            manager,
+            db,
+            artifacts_dir: std::path::PathBuf::from("/tmp/x"),
+            kind,
+            timeouts: FAST,
+        }
+    }
+
+    fn ctx() -> ToolContext {
+        ToolContext { session_id: "s1".into(), channel: None }
+    }
 
     #[tokio::test]
     async fn test_arthas_tool_def_metadata() {
@@ -368,44 +455,164 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_container_env_rejected_upfront() {
-        // 容器环境 + arthas_open → 门禁明确报错，不触发 attach（dummy factory 必败佐证：
-        // 若门禁缺失会走到 attach，得到 arthas_attach_failed 而非门禁错误码）
-        let tmp = tempfile::tempdir().unwrap();
-        let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        crate::app::env_save::save_environment_with_transport(
-            &db, None, "prod", "10.0.0.1", 22, "container",
-            vec![crate::app::env_save::CredentialInput {
-                id: None,
-                username: "root".to_string(),
-                auth_type: "password".to_string(),
-                private_key_path: None,
-                secret: None,
-                is_default: true,
-            }],
-        ).await.unwrap();
+    async fn test_open_container_env_passes_pod_to_manager() {
+        // 门禁撤除后：容器环境 + pod 的 arthas_open 走到 manager（attach 收到 pod/container）
+        let (_tmp, db) = db_with_env("container").await;
+        let captured: Arc<std::sync::Mutex<Vec<AttachRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = Arc::new(ArthasManager::new(
+            recording_factory(captured.clone()),
+            ArthasConfig::default(),
+        ));
+        let out = handler(manager, db, ArthasToolKind::Open)
+            .execute(
+                serde_json::json!({
+                    "environment": "prod", "pid": "1234",
+                    "pod": "oom-service-7d9b-x2vkl", "container": "main"
+                }),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "attach factory must be called exactly once");
+        assert_eq!(reqs[0].pod.as_deref(), Some("oom-service-7d9b-x2vkl"));
+        assert_eq!(reqs[0].container.as_deref(), Some("main"));
+        assert_eq!(reqs[0].pid, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_open_vm_env_normalizes_empty_pod() {
+        // 虚机环境不带 pod（空串归一为 None）正常走 manager
+        let (_tmp, db) = db_with_env("vm").await;
+        let captured: Arc<std::sync::Mutex<Vec<AttachRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = Arc::new(ArthasManager::new(
+            recording_factory(captured.clone()),
+            ArthasConfig::default(),
+        ));
+        let out = handler(manager, db, ArthasToolKind::Open)
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "", "container": ""}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].pod, None, "empty string must normalize to None");
+        assert_eq!(reqs[0].container, None);
+    }
+
+    #[tokio::test]
+    async fn test_container_env_missing_pod_rejected() {
+        // 容器环境缺 pod → environment_type_mismatch（不触发 attach）
+        let (_tmp, db) = db_with_env("container").await;
         let factory: AttachFactory =
             Arc::new(|_req| Box::pin(async { Err(ManagerError::Attach("must not reach attach".to_string())) }));
         let manager = Arc::new(ArthasManager::new(factory, ArthasConfig::default()));
-        let handler = ArthasToolHandler {
-            manager,
-            db,
-            artifacts_dir: std::path::PathBuf::from("/tmp/x"),
-            kind: ArthasToolKind::Open,
-            timeouts: OPEN,
-        };
-        let out = handler
+        let out = handler(manager, db, ArthasToolKind::Open)
             .execute(
                 serde_json::json!({"environment": "prod", "pid": "1234"}),
-                &ToolContext { session_id: "s1".into(), channel: None },
+                &ctx(),
             )
             .await;
         assert!(!out.success, "out: {}", out.data);
-        assert_eq!(out.data["error"], "arthas_container_not_supported");
+        assert_eq!(out.data["error"], "environment_type_mismatch");
         assert!(
-            out.data["message"].as_str().unwrap().contains("jvm_*"),
-            "message must guide to jvm_* tools: {}",
+            out.data["message"].as_str().unwrap().contains("k8s_find_pods"),
+            "message must guide to k8s_find_pods: {}",
             out.data["message"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_vm_env_with_pod_rejected() {
+        // 虚机环境带 pod → environment_type_mismatch（不触发 attach）
+        let (_tmp, db) = db_with_env("vm").await;
+        let factory: AttachFactory =
+            Arc::new(|_req| Box::pin(async { Err(ManagerError::Attach("must not reach attach".to_string())) }));
+        let manager = Arc::new(ArthasManager::new(factory, ArthasConfig::default()));
+        let out = handler(manager, db, ArthasToolKind::Open)
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "some-pod"}),
+                &ctx(),
+            )
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "environment_type_mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_pod_participates_in_session_key() {
+        // 容器环境：open 建会话（pod-a）→ 同 pod 代理工具命中会话；不同 pod 报 not_open
+        let (_tmp, db) = db_with_env("container").await;
+        let manager = Arc::new(ArthasManager::new(
+            Arc::new(|_req| Box::pin(async { Ok(ok_session()) })),
+            ArthasConfig::default(),
+        ));
+
+        let out = handler(manager.clone(), db.clone(), ArthasToolKind::Open)
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-a"}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "open: {}", out.data);
+
+        let dash = handler(manager, db, ArthasToolKind::Dashboard);
+        let out = dash
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-a"}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "same-pod query: {}", out.data);
+        assert_eq!(out.data["output"], "ok");
+
+        let out = dash
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "pod": "pod-b"}),
+                &ctx(),
+            )
+            .await;
+        assert!(!out.success, "different pod must not hit pod-a session");
+        assert_eq!(out.data["error"], "arthas_not_open");
+    }
+
+    #[tokio::test]
+    async fn test_all_tool_schemas_have_pod_and_container() {
+        // 工厂集中生成 schema：27 个工具全部带 pod/container 参数
+        let factory: AttachFactory =
+            Arc::new(|_req| Box::pin(async { Err(ManagerError::Attach("dummy".to_string())) }));
+        let manager = Arc::new(ArthasManager::new(factory, ArthasConfig::default()));
+        let mut registry = crate::tools::registry::ToolRegistry::new();
+        register_all(
+            &mut registry,
+            manager,
+            sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            std::path::PathBuf::from("/tmp/x"),
+        );
+        let defs = registry.list();
+        assert_eq!(defs.len(), 27, "arthas tool count");
+        for def in defs {
+            let props = &def.input_schema["properties"];
+            assert!(props["pod"]["type"] == "string", "{} missing pod", def.name);
+            assert!(props["container"]["type"] == "string", "{} missing container", def.name);
+            assert!(
+                props["pod"]["description"].as_str().unwrap().contains("k8s_find_pods"),
+                "{} pod description must guide to k8s_find_pods",
+                def.name
+            );
+            if def.name == "arthas_open" {
+                assert!(def.description.contains("k8s_find_pods"), "open desc must cover container flow");
+            } else {
+                assert!(
+                    def.description.contains("相同的 pod 参数"),
+                    "{} desc must mention same-pod requirement",
+                    def.name
+                );
+            }
+        }
     }
 }

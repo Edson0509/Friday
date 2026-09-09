@@ -464,6 +464,8 @@ mod tests {
                 "/tmp/r.jfr",
                 PathBuf::from(format!("C:/tmp/{name}")),
                 false,
+                None,
+                None,
             )
         };
         hook(&mk("a.jfr"));

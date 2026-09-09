@@ -132,7 +132,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let exec_pool = Arc::new(Mutex::new(crate::exec::pool::ExecChannelPool::new()));
 
             // SSH 隧道（direct-tcpip 本地转发）：通用基础设施（环境删除时统一清理）；
-            // arthas MCP 已改走 exec HTTP 桥，后续 JMX 等复用
+            // arthas MCP k8s 主路径走 pf 隧道（T6），VM 路径 exec HTTP 桥，后续 JMX 等复用
             let tunnels = Arc::new(crate::exec::tunnel::TunnelManager::new(pool.clone()));
 
             // 文件传输：TransferManager（后台异步传输引擎）+ 4 个工具；
@@ -173,7 +173,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             // arthas 动态诊断：共享状态先行（active_ports_fn 进 AttachDeps，manager 后接管同一份 inner；
-            // 构造顺序 shared → deps → factory → manager，避免 manager↔factory 循环依赖）
+            // 构造顺序 shared → deps → factory → manager，避免 manager↔factory 循环依赖）。
+            // tunnels 进 AttachDeps：T6 pf 隧道主路径（k8s Pod MCP 经 TunnelManager direct-tcpip）
             let arthas_shared = crate::arthas::manager::ArthasSharedState::new();
             let attach_deps = crate::arthas::attach::AttachDeps {
                 db: pool.clone(),
@@ -183,6 +184,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 arthas_zip,
                 bus: EventBus::new(handle.clone()),
                 active_ports_fn: arthas_shared.active_ports_fn(),
+                tunnels: tunnels.clone(),
             };
             let arthas_manager = Arc::new(crate::arthas::manager::ArthasManager::with_shared_state(
                 crate::arthas::attach::production_attach_factory(attach_deps),

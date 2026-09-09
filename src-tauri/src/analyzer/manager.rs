@@ -1335,6 +1335,8 @@ mod tests {
             "/tmp/remote/a.hprof",
             a.clone(),
             false,
+            None,
+            None,
         );
         hook(&st);
         // 非 hprof 不触发

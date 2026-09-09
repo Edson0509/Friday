@@ -123,7 +123,7 @@ Pod 内文件 ──leg1──▶ 宿主机 staging ──leg2──▶ Friday �
 ```
 
 - **leg1 用 `cat` 重定向而非 kubectl cp**：重定向发生在宿主机 bash 上，数据**不流经 Friday 内存**（dump 可达 GB 级，`ExecOutput` 是整段缓冲的 String，绝不走 SSH stdout 回传）；容器内只需 `cat`（比 kubectl cp 更通用，cp 需要容器内有 tar）
-- **leg1 进度**：先 `stat` 得 Pod 内源文件大小 → 每秒轮询宿主机 staging 文件大小 → 与 leg2 的 SFTP 进度拼接为完整进度条
+- **leg1 进度**（Phase 2 实现修订）：先 `stat` 得 Pod 内源文件大小作完整性基准；leg1 期间**不产生进度事件**——base.run 全程持连接锁（SshTransport 单命令串行），无法并发轮询 staging 大小，且 leg2（跨网 SFTP）本就是瓶颈腿，进度由 leg2 驱动
 - **leg1 完整性**：完成后对比源大小；失败重试时 leg1 整段重跑（宿主机本地，快），leg2 照旧 .part 续传
 - **清理**：全部成功后删 Pod 内源文件（消灭驱逐源）+ 删宿主机 staging。Pod 内删除走 `channel.run`（装饰器），现有 `cleanup_remote_on_success` 语义不变
 - **实现位置**：`K8sChannel::download/upload` 内部 → TransferManager、下载完成钩子（.hprof→MAT 预热 / .jfr→JMC 预热）**一行不改**

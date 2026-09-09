@@ -97,13 +97,9 @@ impl ToolHandler for RunCommandHandler {
             Err(_) => {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "run_command timed out, dropping connection to terminate remote process");
                 // 断开连接以终止远端进程（russh channel 无 Drop impl，仅取消 future 不会杀远端进程）
+                // + k8s 目标容器内补刀（VM no-op）
                 let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
-                {
-                    let mut pool = self.exec_pool.lock().await;
-                    pool.disconnect_target(&target).await;
-                }
-                // k8s 目标：断 SSH 只杀 kubectl，容器内进程可能存活 → 独立连接补刀（VM no-op）
-                crate::exec::pool::spawn_timeout_kill(self.db.clone(), target, command.to_string());
+                crate::exec::pool::drop_target_and_kill(&self.exec_pool, &self.db, &target, command).await;
                 ToolOutput {
                     success: false,
                     data: serde_json::json!({

@@ -72,11 +72,7 @@ impl ToolHandler for ListProcessesHandler {
             Err(_) => {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "list_processes timed out, dropping connection");
                 let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
-                {
-                    let mut pool = self.core.exec_pool.lock().await;
-                    pool.disconnect_target(&target).await;
-                }
-                crate::exec::pool::spawn_timeout_kill(self.core.db.clone(), target, command.clone());
+                crate::exec::pool::drop_target_and_kill(&self.core.exec_pool, &self.core.db, &target, &command).await;
                 error_output("timeout_error", &format!("command timed out after {timeout_secs}s"))
             }
             Ok(Err(e)) => {
@@ -158,29 +154,8 @@ mod tests {
     }
 
     async fn setup_as(channel: Arc<dyn ExecChannel>, transport: &str) -> (tempfile::TempDir, Arc<JvmExecCore>) {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-        let env_id = crate::app::env_save::save_environment_with_transport(
-            &db, None, "prod", "10.0.0.1", 22, transport,
-            vec![crate::app::env_save::CredentialInput {
-                id: None,
-                username: "root".to_string(),
-                auth_type: "password".to_string(),
-                private_key_path: None,
-                secret: None,
-                is_default: true,
-            }],
-        ).await.unwrap().environment.id;
-        let exec_pool = Arc::new(tokio::sync::Mutex::new(crate::exec::pool::ExecChannelPool::new()));
-        exec_pool.lock().await.insert_channel(env_id, channel).await;
-        let artifacts = tmp.path().join("artifacts");
-        std::fs::create_dir_all(&artifacts).unwrap();
-        let core = Arc::new(JvmExecCore {
-            db,
-            exec_pool,
-            jdk_cache: Arc::new(crate::tools::builtin::jvm::jdk_cache::JdkCache::new()),
-            artifacts_dir: artifacts,
-        });
+        let (tmp, core, _env_id) =
+            crate::tools::builtin::jvm::core::test_support::setup_env_with_channel(transport, channel).await;
         (tmp, core)
     }
 

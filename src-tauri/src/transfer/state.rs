@@ -33,6 +33,9 @@ pub struct TransferState {
     pub direction: Direction,
     pub session_id: String,
     pub env_id: String,
+    /// k8s 目标定位（容器内传输时两跳通道用；VM 目标 None）
+    pub pod: Option<String>,
+    pub container: Option<String>,
     pub remote_path: String,
     pub local_path: PathBuf,
     pub status: Status,
@@ -54,12 +57,16 @@ impl TransferState {
         remote_path: &str,
         local_path: PathBuf,
         cleanup_remote_on_success: bool,
+        pod: Option<&str>,
+        container: Option<&str>,
     ) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             direction,
             session_id: session_id.to_string(),
             env_id: env_id.to_string(),
+            pod: pod.map(|s| s.to_string()),
+            container: container.map(|s| s.to_string()),
             remote_path: remote_path.to_string(),
             local_path,
             status: Status::Pending,
@@ -106,6 +113,8 @@ mod tests {
             "/tmp/a.hprof",
             PathBuf::from("/local/a.hprof"),
             false,
+            None,
+            None,
         );
         assert_eq!(s.status, Status::Pending);
         assert_eq!(s.attempt, 0);
@@ -113,6 +122,28 @@ mod tests {
         assert!(!s.cleanup_remote_on_success);
         assert!(s.error.is_none());
         assert!(uuid::Uuid::parse_str(&s.id).is_ok());
+        assert!(s.pod.is_none());
+        assert!(s.container.is_none());
+    }
+
+    #[test]
+    fn test_new_state_carries_pod_target() {
+        // VM 目标 None / None；k8s 目标 Some(pod) / Some(container) 原样透传
+        let s = TransferState::new(
+            Direction::Download,
+            "sess",
+            "env",
+            "/opt/log/dump/coredump/a.hprof",
+            PathBuf::from("/local/a.hprof"),
+            true,
+            Some("pod-1"),
+            Some("main"),
+        );
+        assert_eq!(s.pod.as_deref(), Some("pod-1"));
+        assert_eq!(s.container.as_deref(), Some("main"));
+        // 空串在工具层已过滤，这里只验透传语义：None 序列化/反序列化不炸
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"pod\":\"pod-1\""));
     }
 
     #[test]

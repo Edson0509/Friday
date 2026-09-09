@@ -60,6 +60,40 @@ pub struct AttachRequest {
     pub pid: i64,
     /// 目标机 java 可执行文件路径或 java 命令名（arthas-boot 运行需要；默认 "java"）
     pub java_bin: String,
+    /// k8s 目标定位（VM attach 为 None）：Pod 名
+    pub pod: Option<String>,
+    /// k8s 目标定位（VM attach 为 None）：容器名（缺省 = Pod spec 首容器）
+    pub container: Option<String>,
+}
+
+/// arthas 会话键：(env, pod, container, pid)。k8s 目标下同 env 同 pid 不同 Pod
+/// 是各自独立的会话（独立 attach/关闭/回收）；空串归一为 None
+/// （归一规则与 exec::pool::TargetKey::from_parts 一致，防同一目标两种键并存）。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub env_id: String,
+    pub pod: Option<String>,
+    pub container: Option<String>,
+    pub pid: i64,
+}
+
+impl SessionKey {
+    pub fn from_parts(env_id: &str, pod: Option<&str>, container: Option<&str>, pid: i64) -> Self {
+        match pod.filter(|p| !p.is_empty()) {
+            None => Self {
+                env_id: env_id.to_string(),
+                pod: None,
+                container: None,
+                pid,
+            },
+            Some(pod) => Self {
+                env_id: env_id.to_string(),
+                pod: Some(pod.to_string()),
+                container: container.filter(|c| !c.is_empty()).map(|s| s.to_string()),
+                pid,
+            },
+        }
+    }
 }
 
 pub type AttachFactory = Arc<
@@ -129,7 +163,7 @@ pub struct ArthasManager {
 }
 
 struct ManagerInner {
-    sessions: HashMap<(String, i64), ArthasEntry>,
+    sessions: HashMap<SessionKey, ArthasEntry>,
     reaper_spawned: bool,
     next_task_id: u64,
 }
@@ -178,7 +212,7 @@ fn collect_active_ports(inner: &ManagerInner, env_id: &str) -> Vec<u16> {
     inner
         .sessions
         .iter()
-        .filter(|((e, _), _)| e == env_id)
+        .filter(|(k, _)| k.env_id == env_id)
         .filter_map(|(_, entry)| {
             if matches!(*entry.phase_tx.borrow(), ArthasPhase::Ready) {
                 entry.remote_port
@@ -220,12 +254,14 @@ impl ArthasManager {
         }
     }
 
-    /// attach arthas 到 (env_id, pid)。幂等：Ready 秒回；Attaching 等待合流；
-    /// 失败条目即时清除（下次 open 走全新 attach）。
+    /// attach arthas 到 (env_id, pod, container, pid)。幂等：Ready 秒回；Attaching 等待合流；
+    /// 失败条目即时清除（下次 open 走全新 attach）。pod=None 为 VM 目标（宿主机 attach）。
     pub async fn open(
         &self,
         session_id: &str,
         env_id: &str,
+        pod: Option<&str>,
+        container: Option<&str>,
         pid: i64,
         java_bin: &str,
         timeout_secs: u64,
@@ -233,7 +269,7 @@ impl ArthasManager {
         let mut rx = {
             let mut inner = self.inner.lock().await;
             self.ensure_reaper(&mut inner);
-            let key = (env_id.to_string(), pid);
+            let key = SessionKey::from_parts(env_id, pod, container, pid);
             if let Some(entry) = inner.sessions.get_mut(&key) {
                 if matches!(*entry.phase_tx.borrow(), ArthasPhase::Ready) {
                     entry.last_active = Instant::now();
@@ -251,7 +287,7 @@ impl ArthasManager {
                     let Some(victim) = victim else { break };
                     if let Some(entry) = inner.sessions.remove(&victim) {
                         if let Some(stop) = entry.stop_handle {
-                            tracing::info!(env_id = %victim.0, pid = victim.1, "arthas session evicted (LRU)");
+                            tracing::info!(env_id = %victim.env_id, pod = ?victim.pod, pid = victim.pid, "arthas session evicted (LRU)");
                             tokio::spawn(async move { stop.stop().await; });
                         }
                     }
@@ -279,6 +315,8 @@ impl ArthasManager {
                     env_id: env_id.to_string(),
                     pid,
                     java_bin: java_bin.to_string(),
+                    pod: key.pod.clone(),
+                    container: key.container.clone(),
                 };
                 tokio::spawn(async move {
                     run_attach_task(inner_clone, factory, req, task_id).await;
@@ -302,7 +340,11 @@ impl ArthasManager {
                 }
                 ArthasPhase::Failed { error } => {
                     // 清除失败条目，让下次 open 走全新 attach
-                    self.inner.lock().await.sessions.remove(&(env_id.to_string(), pid));
+                    self.inner
+                        .lock()
+                        .await
+                        .sessions
+                        .remove(&SessionKey::from_parts(env_id, pod, container, pid));
                     return Err(error);
                 }
                 ArthasPhase::Attaching => {}
@@ -330,14 +372,16 @@ impl ArthasManager {
     pub async fn query(
         &self,
         env_id: &str,
+        pod: Option<&str>,
+        container: Option<&str>,
         pid: i64,
         tool: &str,
         args: &Value,
         timeout_secs: u64,
     ) -> Result<CallOutcome, ManagerError> {
+        let key = SessionKey::from_parts(env_id, pod, container, pid);
         let client = {
             let mut inner = self.inner.lock().await;
-            let key = (env_id.to_string(), pid);
             let Some(entry) = inner.sessions.get_mut(&key) else {
                 return Err(ManagerError::NotOpen { attaching: false });
             };
@@ -367,7 +411,7 @@ impl ArthasManager {
         // inflight 回落 + touch（会话可能已被并发关闭，忽略即可）
         {
             let mut inner = self.inner.lock().await;
-            if let Some(entry) = inner.sessions.get_mut(&(env_id.to_string(), pid)) {
+            if let Some(entry) = inner.sessions.get_mut(&key) {
                 entry.inflight = entry.inflight.saturating_sub(1);
                 entry.last_active = Instant::now();
             }
@@ -376,8 +420,8 @@ impl ArthasManager {
         match result {
             Err(_) => Err(ManagerError::Timeout(timeout_secs)),
             Ok(Err(transport)) => {
-                tracing::warn!(env_id, pid, tool, error = %transport, "arthas transport error, invalidating session");
-                self.invalidate(env_id, pid).await;
+                tracing::warn!(env_id, pod = ?pod, pid, tool, error = %transport, "arthas transport error, invalidating session");
+                self.invalidate(env_id, pod, container, pid).await;
                 Err(ManagerError::Transport(transport))
             }
             Ok(Ok(outcome)) => Ok(outcome),
@@ -385,8 +429,9 @@ impl ArthasManager {
     }
 
     /// 显式关闭（arthas_close 工具）。返回是否原本处于打开状态。
-    pub async fn close(&self, env_id: &str, pid: i64) -> bool {
-        let entry = { self.inner.lock().await.sessions.remove(&(env_id.to_string(), pid)) };
+    pub async fn close(&self, env_id: &str, pod: Option<&str>, container: Option<&str>, pid: i64) -> bool {
+        let key = SessionKey::from_parts(env_id, pod, container, pid);
+        let entry = { self.inner.lock().await.sessions.remove(&key) };
         match entry {
             Some(e) => {
                 if let Some(stop) = e.stop_handle {
@@ -395,21 +440,21 @@ impl ArthasManager {
                 if let Some(client) = e.client {
                     tokio::spawn(async move { client.shutdown().await; });
                 }
-                tracing::info!(env_id, pid, "arthas session closed");
+                tracing::info!(env_id, pod = ?pod, pid, "arthas session closed");
                 true
             }
             None => false,
         }
     }
 
-    /// 关闭某环境全部会话（环境删除联动）
+    /// 关闭某环境全部会话（VM + 所有 Pod 目标；环境删除联动）
     pub async fn close_for_environment(&self, env_id: &str) {
         let entries: Vec<ArthasEntry> = {
             let mut inner = self.inner.lock().await;
-            let keys: Vec<(String, i64)> = inner
+            let keys: Vec<SessionKey> = inner
                 .sessions
                 .keys()
-                .filter(|(e, _)| e == env_id)
+                .filter(|k| k.env_id == env_id)
                 .cloned()
                 .collect();
             keys.iter().filter_map(|k| inner.sessions.remove(k)).collect()
@@ -435,12 +480,12 @@ impl ArthasManager {
     }
 
     /// 传输错误 → 移除会话 + best-effort stop（下次 open 重新 attach）
-    async fn invalidate(&self, env_id: &str, pid: i64) {
+    async fn invalidate(&self, env_id: &str, pod: Option<&str>, container: Option<&str>, pid: i64) {
         let stop = {
             let mut inner = self.inner.lock().await;
             inner
                 .sessions
-                .remove(&(env_id.to_string(), pid))
+                .remove(&SessionKey::from_parts(env_id, pod, container, pid))
                 .and_then(|e| e.stop_handle)
         };
         if let Some(stop) = stop {
@@ -460,9 +505,9 @@ impl ArthasManager {
             let mut interval = tokio::time::interval(config.idle_tick);
             loop {
                 interval.tick().await;
-                let stops: Vec<((String, i64), Arc<dyn ArthasStopHandle>)> = {
+                let stops: Vec<(SessionKey, Arc<dyn ArthasStopHandle>)> = {
                     let mut inner = inner_clone.lock().await;
-                    let keys: Vec<(String, i64)> = inner
+                    let keys: Vec<SessionKey> = inner
                         .sessions
                         .iter()
                         .filter(|(_, e)| is_reapable(e, config.idle_timeout))
@@ -473,8 +518,8 @@ impl ArthasManager {
                         .filter_map(|(k, stop)| stop.map(|s| (k, s)))
                         .collect()
                 };
-                for ((env_id, pid), stop) in stops {
-                    tracing::info!(env_id = %env_id, pid = pid, "arthas session idle, stopping");
+                for (key, stop) in stops {
+                    tracing::info!(env_id = %key.env_id, pod = ?key.pod, pid = key.pid, "arthas session idle, stopping");
                     tokio::spawn(async move { stop.stop().await; });
                 }
             }
@@ -483,7 +528,7 @@ impl ArthasManager {
 }
 
 /// 找最久未访问的 Ready 条目 key（Attaching/Failed 不参与逐出）
-fn lru_ready_victim(sessions: &HashMap<(String, i64), ArthasEntry>) -> Option<(String, i64)> {
+fn lru_ready_victim(sessions: &HashMap<SessionKey, ArthasEntry>) -> Option<SessionKey> {
     sessions
         .iter()
         .filter(|(_, e)| matches!(*e.phase_tx.borrow(), ArthasPhase::Ready))
@@ -500,7 +545,7 @@ async fn run_attach_task(
     req: AttachRequest,
     task_id: u64,
 ) {
-    let key = (req.env_id.clone(), req.pid);
+    let key = SessionKey::from_parts(&req.env_id, req.pod.as_deref(), req.container.as_deref(), req.pid);
     let result = tokio::time::timeout(
         Duration::from_secs(ATTACH_TASK_TIMEOUT_SECS),
         factory(req.clone()),
@@ -549,7 +594,7 @@ fn release_stale_attach(
     match result {
         Ok(Ok(attached)) => {
             tracing::warn!(
-                env_id = %req.env_id, pid = req.pid,
+                env_id = %req.env_id, pod = ?req.pod, pid = req.pid,
                 "stale arthas attach task settled after entry removal/replacement, releasing orphaned session"
             );
             tokio::spawn(async move {
@@ -559,13 +604,13 @@ fn release_stale_attach(
         }
         Ok(Err(e)) => {
             tracing::warn!(
-                env_id = %req.env_id, pid = req.pid, error = %e,
+                env_id = %req.env_id, pod = ?req.pod, pid = req.pid, error = %e,
                 "stale arthas attach task failed, discarding result"
             );
         }
         Err(_) => {
             tracing::warn!(
-                env_id = %req.env_id, pid = req.pid,
+                env_id = %req.env_id, pod = ?req.pod, pid = req.pid,
                 "stale arthas attach task timed out, discarding result"
             );
         }
@@ -649,8 +694,8 @@ mod tests {
     async fn test_open_then_query_roundtrip() {
         let factory = Arc::new(CountingFactory { calls: Arc::new(AtomicUsize::new(0)), fail_first: 0 });
         let mgr = ArthasManager::new(factory.into_factory(), ArthasConfig::default());
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
-        let out = mgr.query("env-1", 123, "dashboard", &json!({}), 10).await.unwrap();
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
+        let out = mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 10).await.unwrap();
         assert_eq!(out.text, "ok");
         assert!(!out.is_error);
     }
@@ -675,8 +720,8 @@ mod tests {
             ArthasConfig::default(),
         );
         let (a, b) = tokio::join!(
-            mgr.open("sess-1", "env-1", 123, "java", 30),
-            mgr.open("sess-2", "env-1", 123, "java", 30),
+            mgr.open("sess-1", "env-1", None, None, 123, "java", 30),
+            mgr.open("sess-2", "env-1", None, None, 123, "java", 30),
         );
         a.unwrap();
         b.unwrap();
@@ -687,7 +732,7 @@ mod tests {
     async fn test_query_without_open_errors() {
         let factory = Arc::new(CountingFactory { calls: Arc::new(AtomicUsize::new(0)), fail_first: 0 });
         let mgr = ArthasManager::new(factory.into_factory(), ArthasConfig::default());
-        let err = mgr.query("env-1", 123, "dashboard", &json!({}), 10).await.unwrap_err();
+        let err = mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 10).await.unwrap_err();
         assert!(matches!(err, ManagerError::NotOpen { attaching: false }));
     }
 
@@ -712,11 +757,11 @@ mod tests {
         ));
         let mgr_for_task = mgr.clone();
         let open_task = tokio::spawn(async move {
-            mgr_for_task.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
+            mgr_for_task.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
         });
         // 等 attach 条目进入 Attaching
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let err = mgr.query("env-1", 123, "dashboard", &json!({}), 10).await.unwrap_err();
+        let err = mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 10).await.unwrap_err();
         assert!(matches!(err, ManagerError::NotOpen { attaching: true }));
         gate.add_permits(1);
         open_task.await.unwrap();
@@ -740,11 +785,11 @@ mod tests {
             }),
             ArthasConfig::default(),
         );
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
-        let err = mgr.query("env-1", 123, "dashboard", &json!({}), 10).await.unwrap_err();
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
+        let err = mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 10).await.unwrap_err();
         assert!(matches!(err, ManagerError::Transport(_)));
         // 会话已移除：再查报 NotOpen
-        let err2 = mgr.query("env-1", 123, "dashboard", &json!({}), 10).await.unwrap_err();
+        let err2 = mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 10).await.unwrap_err();
         assert!(matches!(err2, ManagerError::NotOpen { attaching: false }));
     }
 
@@ -753,10 +798,10 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let factory = Arc::new(CountingFactory { calls: calls.clone(), fail_first: 1 });
         let mgr = ArthasManager::new(factory.into_factory(), ArthasConfig::default());
-        let err = mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap_err();
+        let err = mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap_err();
         assert!(matches!(err, ManagerError::Attach(_)));
         // 失败条目已清除：重试成功
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -777,9 +822,9 @@ mod tests {
             }),
             ArthasConfig::default(),
         );
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
-        assert!(mgr.close("env-1", 123).await);
-        assert!(!mgr.close("env-1", 123).await); // 幂等
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
+        assert!(mgr.close("env-1", None, None, 123).await);
+        assert!(!mgr.close("env-1", None, None, 123).await); // 幂等
         // stop 由后台 spawn：轮询断言最终恰好 1 次
         let mut waited = 0;
         while stops.load(Ordering::SeqCst) == 0 && waited < 50 {
@@ -792,18 +837,18 @@ mod tests {
     #[tokio::test]
     async fn test_lru_eviction_at_capacity() {
         let mgr = ArthasManager::new(always_ok_factory(), ArthasConfig::default());
-        mgr.open("s", "env-1", 1, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", None, None, 1, "java", 30).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        mgr.open("s", "env-1", 2, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", None, None, 2, "java", 30).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        mgr.open("s", "env-1", 3, "java", 30).await.unwrap();
-        mgr.open("s", "env-1", 4, "java", 30).await.unwrap(); // 逐出 pid=1
-        let err = mgr.query("env-1", 1, "dashboard", &json!({}), 10).await.unwrap_err();
+        mgr.open("s", "env-1", None, None, 3, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", None, None, 4, "java", 30).await.unwrap(); // 逐出 pid=1
+        let err = mgr.query("env-1", None, None, 1, "dashboard", &json!({}), 10).await.unwrap_err();
         assert!(matches!(err, ManagerError::NotOpen { .. }));
         // 其余仍在
-        mgr.query("env-1", 2, "dashboard", &json!({}), 10).await.unwrap();
-        mgr.query("env-1", 3, "dashboard", &json!({}), 10).await.unwrap();
-        mgr.query("env-1", 4, "dashboard", &json!({}), 10).await.unwrap();
+        mgr.query("env-1", None, None, 2, "dashboard", &json!({}), 10).await.unwrap();
+        mgr.query("env-1", None, None, 3, "dashboard", &json!({}), 10).await.unwrap();
+        mgr.query("env-1", None, None, 4, "dashboard", &json!({}), 10).await.unwrap();
     }
 
     #[tokio::test]
@@ -827,9 +872,9 @@ mod tests {
             }),
             config,
         );
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let err = mgr.query("env-1", 123, "dashboard", &json!({}), 10).await.unwrap_err();
+        let err = mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 10).await.unwrap_err();
         assert!(matches!(err, ManagerError::NotOpen { attaching: false }));
         // stop 由 reaper 后台 spawn：轮询断言恰好 1 次
         let mut waited = 0;
@@ -863,22 +908,79 @@ mod tests {
             }),
             ArthasConfig::default(),
         );
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
-        let err = mgr.query("env-1", 123, "watch", &json!({}), 1).await.unwrap_err();
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
+        let err = mgr.query("env-1", None, None, 123, "watch", &json!({}), 1).await.unwrap_err();
         assert!(matches!(err, ManagerError::Timeout(_)));
     }
 
     #[tokio::test]
     async fn test_close_for_environment_removes_all() {
         let mgr = ArthasManager::new(always_ok_factory(), ArthasConfig::default());
-        mgr.open("s", "env-1", 1, "java", 30).await.unwrap();
-        mgr.open("s", "env-1", 2, "java", 30).await.unwrap();
-        mgr.open("s", "env-2", 3, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", None, None, 1, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", None, None, 2, "java", 30).await.unwrap();
+        mgr.open("s", "env-2", None, None, 3, "java", 30).await.unwrap();
+        // pod 维度会话也在同环境下，close_for_environment 必须一并清理
+        mgr.open("s", "env-1", Some("pod-a"), None, 7, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", Some("pod-b"), Some("c1"), 8, "java", 30).await.unwrap();
         mgr.close_for_environment("env-1").await;
-        assert!(mgr.query("env-1", 1, "d", &json!({}), 5).await.is_err());
-        assert!(mgr.query("env-1", 2, "d", &json!({}), 5).await.is_err());
+        assert!(mgr.query("env-1", None, None, 1, "d", &json!({}), 5).await.is_err());
+        assert!(mgr.query("env-1", None, None, 2, "d", &json!({}), 5).await.is_err());
+        assert!(mgr.query("env-1", Some("pod-a"), None, 7, "d", &json!({}), 5).await.is_err());
+        assert!(mgr.query("env-1", Some("pod-b"), Some("c1"), 8, "d", &json!({}), 5).await.is_err());
         // 其他环境不受影响
-        mgr.query("env-2", 3, "d", &json!({}), 5).await.unwrap();
+        mgr.query("env-2", None, None, 3, "d", &json!({}), 5).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pod_dimension_partitions_sessions() {
+        // 同 env 同 pid 不同 pod = 两个独立会话（各自 attach），close 只关一个
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_factory = calls.clone();
+        let mgr = ArthasManager::new(
+            Arc::new(move |_req| {
+                let calls = calls_for_factory.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(AttachedSession {
+                        client: ok_client(),
+                        stop_handle: Arc::new(MockStop { stops: Arc::new(AtomicUsize::new(0)) }),
+                        remote_port: 18563,
+                    })
+                })
+            }),
+            ArthasConfig::default(),
+        );
+        mgr.open("s", "env-1", Some("pod-a"), None, 123, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", Some("pod-b"), None, 123, "java", 30).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "same pid in different pods must attach separately"
+        );
+        // 两个会话独立可用
+        mgr.query("env-1", Some("pod-a"), None, 123, "d", &json!({}), 5).await.unwrap();
+        mgr.query("env-1", Some("pod-b"), None, 123, "d", &json!({}), 5).await.unwrap();
+        // close pod-a 只关 pod-a
+        assert!(mgr.close("env-1", Some("pod-a"), None, 123).await);
+        let err = mgr.query("env-1", Some("pod-a"), None, 123, "d", &json!({}), 5).await.unwrap_err();
+        assert!(matches!(err, ManagerError::NotOpen { .. }));
+        mgr.query("env-1", Some("pod-b"), None, 123, "d", &json!({}), 5).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_container_dimension_and_empty_string_normalization() {
+        // 同 pod 不同 container = 不同会话；空串 pod/container 归一为 VM 目标（与池键同规）
+        let mgr = ArthasManager::new(always_ok_factory(), ArthasConfig::default());
+        mgr.open("s", "env-1", Some("pod-a"), Some("c1"), 123, "java", 30).await.unwrap();
+        mgr.open("s", "env-1", Some("pod-a"), Some("c2"), 123, "java", 30).await.unwrap();
+        // Some("") 归一为 VM 会话（pod 维度丢弃）
+        mgr.open("s", "env-1", Some(""), None, 123, "java", 30).await.unwrap();
+        mgr.query("env-1", Some("pod-a"), Some("c1"), 123, "d", &json!({}), 5).await.unwrap();
+        mgr.query("env-1", Some("pod-a"), Some("c2"), 123, "d", &json!({}), 5).await.unwrap();
+        mgr.query("env-1", None, None, 123, "d", &json!({}), 5).await.unwrap();
+        // VM 会话与 pod 会话互不干扰：close VM 目标不动 pod 会话
+        assert!(mgr.close("env-1", None, None, 123).await);
+        mgr.query("env-1", Some("pod-a"), Some("c1"), 123, "d", &json!({}), 5).await.unwrap();
     }
 
     #[tokio::test]
@@ -913,15 +1015,15 @@ mod tests {
 
         // open#1（挂起在 gate1）
         let mgr1 = mgr.clone();
-        let t1 = tokio::spawn(async move { mgr1.open("s1", "env-1", 123, "java", 30).await });
+        let t1 = tokio::spawn(async move { mgr1.open("s1", "env-1", None, None, 123, "java", 30).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // close 移除 Attaching 条目（open#1 的 waiter 随后因 sender drop 得到 Err）
-        mgr.close("env-1", 123).await;
+        mgr.close("env-1", None, None, 123).await;
 
         // open#2（新条目，挂起在 gate2）
         let mgr2 = mgr.clone();
-        let t2 = tokio::spawn(async move { mgr2.open("s2", "env-1", 123, "java", 30).await });
+        let t2 = tokio::spawn(async move { mgr2.open("s2", "env-1", None, None, 123, "java", 30).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 释放 gate1：task#1 成功返回 —— 但它是 stale 的，不得把新条目置 Ready
@@ -930,7 +1032,7 @@ mod tests {
         // t1 因条目移除而失败（Attach 错误：已回收）
         assert!(t1.await.unwrap().is_err());
         // 新条目不得被 stale 任务置 Ready：仍应 Attaching
-        let err = mgr.query("env-1", 123, "dashboard", &json!({}), 1).await.unwrap_err();
+        let err = mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 1).await.unwrap_err();
         assert!(
             matches!(err, ManagerError::NotOpen { attaching: true }),
             "stale task must not mark the new entry Ready, got: {err:?}"
@@ -946,7 +1048,7 @@ mod tests {
         // 释放 gate2：task#2 正常落定
         gate2.add_permits(1);
         t2.await.unwrap().unwrap();
-        mgr.query("env-1", 123, "dashboard", &json!({}), 5).await.unwrap();
+        mgr.query("env-1", None, None, 123, "dashboard", &json!({}), 5).await.unwrap();
     }
 
     #[tokio::test]
@@ -978,11 +1080,11 @@ mod tests {
         ));
 
         // pid 123 → Ready
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
         // pid 456 → Attaching（挂起在 gate 上）
         let mgr_for_task = mgr.clone();
         let attaching_task =
-            tokio::spawn(async move { mgr_for_task.open("sess-2", "env-1", 456, "java", 30).await });
+            tokio::spawn(async move { mgr_for_task.open("sess-2", "env-1", None, None, 456, "java", 30).await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // 只有 Ready 会话的端口计入
@@ -1008,13 +1110,13 @@ mod tests {
         let mgr = ArthasManager::with_shared_state(always_ok_factory(), ArthasConfig::default(), shared);
 
         assert!(ports_fn("env-1").await.is_empty());
-        mgr.open("sess-1", "env-1", 123, "java", 30).await.unwrap();
+        mgr.open("sess-1", "env-1", None, None, 123, "java", 30).await.unwrap();
         assert_eq!(ports_fn("env-1").await, vec![18563]);
         assert_eq!(mgr.active_remote_ports("env-1").await, vec![18563]);
         assert!(ports_fn("other-env").await.is_empty());
 
         // close 后端口即释放（残留清理不再排除它）
-        mgr.close("env-1", 123).await;
+        mgr.close("env-1", None, None, 123).await;
         assert!(ports_fn("env-1").await.is_empty());
     }
 }
