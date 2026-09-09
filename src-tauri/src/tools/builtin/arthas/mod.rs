@@ -78,13 +78,14 @@ impl ToolHandler for ArthasToolHandler {
         match self.kind {
             ArthasToolKind::Open => {
                 let java_bin = args.get("java_bin").and_then(|v| v.as_str()).unwrap_or("java");
-                match self.manager.open(&ctx.session_id, &env.id, pid as i64, java_bin, timeout_secs).await {
+                // TODO(T7)：容器环境解除门禁后从工具参数透传 pod/container（工具层接线属 T7）
+                match self.manager.open(&ctx.session_id, &env.id, None, None, pid as i64, java_bin, timeout_secs).await {
                     Ok(outcome) => render(&ctx.session_id, &self.artifacts_dir, "arthas_open", &label, &outcome.summary, start, true).await,
                     Err(e) => self.manager_error_output(e, &ctx.session_id, "arthas_open", &label, start).await,
                 }
             }
             ArthasToolKind::Close => {
-                let was_open = self.manager.close(&env.id, pid as i64).await;
+                let was_open = self.manager.close(&env.id, None, None, pid as i64).await;
                 ToolOutput {
                     success: true,
                     data: serde_json::json!({
@@ -102,7 +103,7 @@ impl ToolHandler for ArthasToolHandler {
                     Ok(v) => v,
                     Err(e) => return error_output("invalid_params", &e),
                 };
-                match self.manager.query(&env.id, pid as i64, upstream, &upstream_args, timeout_secs).await {
+                match self.manager.query(&env.id, None, None, pid as i64, upstream, &upstream_args, timeout_secs).await {
                     Ok(outcome) => {
                         render(&ctx.session_id, &self.artifacts_dir, upstream, &label, &outcome.text, start, !outcome.is_error).await
                     }

@@ -20,8 +20,19 @@ pub const ARTHAS_PORT_CANDIDATES: u16 = 10;
 /// ip=127.0.0.1 为官方包默认（stop 走 /api 本地免密、只绑回环），此前覆盖时丢失。
 /// 内容不含单引号/美元符，可安全嵌入 shell 单引号（见测试）。
 pub fn arthas_properties_content(http_port: u16, token: &str) -> String {
+    arthas_properties_content_with_bind(http_port, token, "127.0.0.1")
+}
+
+/// 容器分支 properties：额外把绑定地址换成 0.0.0.0——宿主机侧探活（/dev/tcp 打
+/// podIP）与 T6 正向隧道都从 Pod 网络进入，127.0.0.1 绑定不可达；MCP 桥的 curl
+/// 127.0.0.1 在容器内本地执行，回环仍通。VM 模式维持官方默认 127.0.0.1 不变。
+pub fn arthas_properties_content_pod(http_port: u16, token: &str) -> String {
+    arthas_properties_content_with_bind(http_port, token, "0.0.0.0")
+}
+
+fn arthas_properties_content_with_bind(http_port: u16, token: &str, bind_ip: &str) -> String {
     format!(
-        "arthas.config.overrideAll=true\narthas.mcpEndpoint=/mcp\narthas.telnetPort=-1\narthas.httpPort={http_port}\narthas.password={token}\narthas.localConnectionNonAuth=true\narthas.ip=127.0.0.1\n"
+        "arthas.config.overrideAll=true\narthas.mcpEndpoint=/mcp\narthas.telnetPort=-1\narthas.httpPort={http_port}\narthas.password={token}\narthas.localConnectionNonAuth=true\narthas.ip={bind_ip}\n"
     )
 }
 
@@ -62,6 +73,31 @@ pub fn port_probe_command(port: u16) -> String {
     format!(
         "if (exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null; then exec 3>&- 3<&-; echo busy; else echo free; fi"
     )
+}
+
+/// 宿主机侧查询 Pod IP（k8s 探活用）。kubectl 不带 -n——依赖 kubeconfig context 的
+/// 当前 namespace（见 attach_arthas_in_pod 的已知假设注释）。
+pub fn pod_ip_command(pod: &str) -> String {
+    format!(
+        "kubectl get pod {} -o jsonpath='{{.status.podIP}}'",
+        shell_quote_single(pod)
+    )
+}
+
+/// 宿主机侧 Pod 端口探测（bash /dev/tcp 打 podIP）：busy = 可连。timeout 1 兜底
+/// 网络黑洞（无 timeout 时连接挂起会拖到内核 TCP 超时，拖爆探活循环）。
+/// pod_ip 必须先过 validate_pod_ip（防注入）。
+pub fn pod_ip_probe_command(pod_ip: &str, port: u16) -> String {
+    format!(
+        "timeout 1 bash -c 'exec 3<>/dev/tcp/{pod_ip}/{port}' 2>/dev/null && echo busy || echo free"
+    )
+}
+
+/// kubectl 输出的 PodIP 校验：只接受 IPv4/IPv6 字面量（防命令注入）。
+pub fn validate_pod_ip(ip: &str) -> Result<(), String> {
+    ip.parse::<std::net::IpAddr>()
+        .map(|_| ())
+        .map_err(|_| format!("kubectl 返回的 PodIP 不是合法 IP: {ip:?}"))
 }
 
 /// 从 start 起找两个空闲端口（http + telnet 预检用）：探测候选 count 个，输出两行。
@@ -165,8 +201,23 @@ enum AttachExecKind {
 }
 
 async fn attach_arthas(deps: AttachDeps, req: AttachRequest) -> Result<AttachedSession, ManagerError> {
+    // 0. 宿主机默认连接（连接池）：VM 分支的命令执行主通道；k8s 分支的
+    //    装备中转（staging unzip/tar）与探活（podIP 查询 + /dev/tcp）通道
+    let base = get_default_channel(&deps, &req.env_id).await?;
+    match req.pod.clone() {
+        Some(pod) => attach_arthas_in_pod(deps, req, base, &pod).await,
+        None => attach_arthas_on_vm(deps, req, base).await,
+    }
+}
+
+/// VM 分支（原单通道流程）：所有命令在宿主机上执行。
+async fn attach_arthas_on_vm(
+    deps: AttachDeps,
+    req: AttachRequest,
+    channel: Arc<dyn ExecChannel>,
+) -> Result<AttachedSession, ManagerError> {
     let progress = |stage: &str, detail: String| {
-        tracing::info!(session_id = %req.session_id, env_id = %req.env_id, stage, detail = %detail, "arthas attach progress");
+        tracing::info!(session_id = %req.session_id, env_id = %req.env_id, stage, detail = %detail, "arthas attach progress (vm)");
         deps.bus.emit(
             &req.session_id,
             AppEvent::ProvisionProgress {
@@ -177,9 +228,6 @@ async fn attach_arthas(deps: AttachDeps, req: AttachRequest) -> Result<AttachedS
             },
         );
     };
-
-    // 0. 默认连接（连接池）
-    let channel = get_default_channel(&deps, &req.env_id).await?;
 
     // 1. 确保 arthas 工具包（幂等，cached 快路径）
     progress("ensure_package", "确保 arthas 工具包".to_string());
@@ -193,7 +241,7 @@ async fn attach_arthas(deps: AttachDeps, req: AttachRequest) -> Result<AttachedS
     let arthas_home = arthas_result.tool_home;
 
     // 2. 解析 attach 用 java（JdkCache → PATH java → ensure JDK），返回可执行文件完整路径
-    let java = resolve_attach_java(&deps, &req, &pctx).await?;
+    let java = resolve_attach_java(&deps, &req, &channel).await?;
 
     // 3. 用户对齐 pre-flight
     progress("check_user", "检查目标 JVM 运行用户".to_string());
@@ -272,6 +320,8 @@ async fn attach_arthas(deps: AttachDeps, req: AttachRequest) -> Result<AttachedS
         db: deps.db.clone(),
         exec_pool: deps.exec_pool.clone(),
         env_id: req.env_id.clone(),
+        pod: None,
+        container: None,
         remote_port: port,
         token,
         client: client.clone(),
@@ -279,11 +329,172 @@ async fn attach_arthas(deps: AttachDeps, req: AttachRequest) -> Result<AttachedS
     Ok(AttachedSession { client, stop_handle, remote_port: port })
 }
 
-/// best-effort stop：HTTP stop arthas（卸载 agent）+ 关 MCP client
+/// 容器分支（k8s）：双通道编排——base = 宿主机（装备中转、podIP 查询与探活），
+/// k8s_ch = 容器内执行（properties/attach/残留清理/MCP curl 桥）。
+async fn attach_arthas_in_pod(
+    deps: AttachDeps,
+    req: AttachRequest,
+    base: Arc<dyn ExecChannel>,
+    pod: &str,
+) -> Result<AttachedSession, ManagerError> {
+    let progress = |stage: &str, detail: String| {
+        tracing::info!(session_id = %req.session_id, env_id = %req.env_id, pod, stage, detail = %detail, "arthas attach progress (pod)");
+        deps.bus.emit(
+            &req.session_id,
+            AppEvent::ProvisionProgress {
+                session_id: req.session_id.clone(),
+                tool: "arthas_open".to_string(),
+                stage: stage.to_string(),
+                detail,
+            },
+        );
+    };
+
+    // 已知假设（记录，暂不修）：kubectl exec / kubectl get pod 均不带 -n，依赖
+    // kubeconfig context 的当前 namespace（与 Phase 1 kubectl exec 行为一致；
+    // k8s_find_pods 用 -A 全局发现）。若未来跨 namespace 环境出问题，需把
+    // namespace 从 find_pods 贯通到工具参数。
+
+    // 0. 容器执行通道（kubectl exec 包装；池内独立键，不复用 base 连接）
+    progress("channel", format!("建立容器执行通道（pod {pod}）"));
+    let k8s_ch = get_target_channel(&deps, &req.env_id, Some(pod), req.container.as_deref()).await?;
+
+    // 1~6 前半程：装备 → java 解析 → 残留清理 → 端口/properties → attach → 探活
+    let (port, token) = pod_attach_prepare(
+        &deps,
+        &req,
+        &base,
+        &k8s_ch,
+        pod,
+        std::time::Duration::from_secs(POD_PROBE_BUDGET_SECS),
+        &progress,
+    )
+    .await?;
+
+    // 7. MCP 通路（本任务临时主路径）：exec HTTP 桥挂 k8s_ch——curl 在容器内执行，
+    //    打 127.0.0.1（容器回环；properties 已绑 0.0.0.0，回环仍通）。
+    //    容器内没 curl 时握手失败（可接受：T6 正向隧道才是主路径）。
+    //    探活未通过/被跳过时 arthas 可能仍在启动，握手带重试预算兜底。
+    progress("bridge", "建立 MCP 通路（exec HTTP 桥，容器内 curl）".to_string());
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let client: Arc<dyn ArthasClient> =
+        match connect_with_retry(&k8s_ch, &url, &token, std::time::Duration::from_secs(POD_HANDSHAKE_RETRY_BUDGET_SECS)).await {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                cleanup_partial_attach(k8s_ch.as_ref(), port, &token).await;
+                return Err(ManagerError::Attach(format!("arthas MCP 握手失败: {e}")));
+            }
+        };
+
+    progress("ready", format!("arthas 就绪（pod {pod} 容器内端口 {port}，exec HTTP 桥）"));
+    let stop_handle: Arc<dyn ArthasStopHandle> = Arc::new(ProductionStopHandle {
+        db: deps.db.clone(),
+        exec_pool: deps.exec_pool.clone(),
+        env_id: req.env_id.clone(),
+        pod: Some(pod.to_string()),
+        container: req.container.clone(),
+        remote_port: port,
+        token,
+        client: client.clone(),
+    });
+    Ok(AttachedSession { client, stop_handle, remote_port: port })
+}
+
+/// 容器分支探活预算 / 握手重试预算 / 轮询间隔（秒）
+const POD_PROBE_BUDGET_SECS: u64 = 60;
+const POD_HANDSHAKE_RETRY_BUDGET_SECS: u64 = 60;
+const POD_POLL_INTERVAL_SECS: u64 = 3;
+
+/// 容器 attach 前半程编排（装备 → java 解析 → 残留清理 → 端口/properties →
+/// attach → 探活），返回 (http_port, token) 供 MCP 建桥握手。
+/// base = 宿主机通道（ensure_k8s 中转 + podIP 查询/探活）；k8s_ch = 容器内通道
+/// （java 解析/properties/attach/残留清理）。探活失败不硬失败（宿主→Pod 网络
+/// 可能被 NetworkPolicy 拦截），最终可达性由 MCP 握手判定。
+async fn pod_attach_prepare(
+    deps: &AttachDeps,
+    req: &AttachRequest,
+    base: &Arc<dyn ExecChannel>,
+    k8s_ch: &Arc<dyn ExecChannel>,
+    pod: &str,
+    probe_budget: std::time::Duration,
+    progress: &(dyn Fn(&str, String) + Sync),
+) -> Result<(u16, String), ManagerError> {
+    // 1. 装备（宿主机中转 unzip→tar→kubectl exec -i 注入；幂等，cached 快路径；
+    //    zip 缺失只在缓存未命中且需要下发时报，对齐 VM ensure 语义）
+    progress("ensure_package", format!("确保容器内 arthas 工具包（pod {pod}）"));
+    let arthas_pkg = crate::provision::arthas::ArthasPackage;
+    arthas_pkg
+        .ensure_k8s(
+            base,
+            pod,
+            req.container.as_deref(),
+            deps.arthas_zip.as_deref(),
+            &req.session_id,
+            &req.env_id,
+        )
+        .await
+        .map_err(|e| ManagerError::Attach(format!("arthas 工具包下发失败: {}", e.message)))?;
+    // 容器内 arthas 安装目录 = ensure_k8s 的注入目标（POD_TOOLS_DIR/arthas-dist）
+    let arthas_home = format!("{}/arthas-dist", crate::exec::k8s::POD_TOOLS_DIR);
+
+    // 2. 解析 attach 用 java（容器内语义：JdkCache 复合键 → 容器 PATH java → ensure K8s JDK）
+    progress("resolve_java", "解析容器内 attach 用 java".to_string());
+    let java = resolve_attach_java(deps, req, k8s_ch).await?;
+
+    // 3. 用户对齐：跳过——容器 exec 用户 = ossadm = JVM 用户（设计决策），
+    //    VM 分支的跨用户临时连接流程不适用。
+
+    // 3.5 残留实例清理（经 k8s_ch = 容器内语义；容器 sh 无 bash /dev/tcp 时探测
+    //     恒 free，清理退化为 no-op——already-bind 由探活/握手超时兜底报错）
+    progress("cleanup", "清理容器内残留 arthas 实例".to_string());
+    let active_ports = (deps.active_ports_fn)(&req.env_id).await;
+    cleanup_stale_instances(k8s_ch.as_ref(), &active_ports).await?;
+
+    // 4. 端口分配 + properties 写入（容器内 dist 目录；绑 0.0.0.0 供宿主侧探活/T6 隧道接入）
+    progress("allocate_port", "分配 arthas 端口".to_string());
+    let (port, telnet_det_port) = find_free_remote_port(k8s_ch.as_ref()).await?;
+    let token = generate_token();
+    progress("write_config", format!("写入 arthas.properties（httpPort={port}，绑定 0.0.0.0）"));
+    write_properties(k8s_ch.as_ref(), &arthas_home, &arthas_properties_content_pod(port, &token)).await?;
+
+    // 5. attach（容器内 nohup；日志 /tmp/arthas-friday-{pid}.log 为 Pod 内路径，语义正确）
+    progress("attach", format!("attach arthas 到 PID {}（java={java}）", req.pid));
+    run_attach_command(k8s_ch.as_ref(), &java, &arthas_home, port, telnet_det_port, req.pid).await?;
+
+    // 6. 探活：宿主机侧 /dev/tcp 打 podIP（容器 sh 无 /dev/tcp，容器内探测不可行）。
+    //    失败兜底：不硬失败——宿主→Pod 网络可能被拦截，交由 MCP 握手（容器内
+    //    curl 127.0.0.1）+ 重试做最终判定。
+    progress("probe", "等待 arthas HTTP 服务就绪（宿主机侧探 podIP）".to_string());
+    match get_pod_ip(base.as_ref(), pod).await {
+        Ok(pod_ip) => {
+            if let Err(e) = wait_pod_port_ready(
+                base.as_ref(),
+                &pod_ip,
+                port,
+                probe_budget,
+                std::time::Duration::from_secs(POD_POLL_INTERVAL_SECS),
+            )
+            .await
+            {
+                tracing::warn!(session_id = %req.session_id, env_id = %req.env_id, pod, port, error = %e, "podIP 探活未通过，交由 MCP 握手兜底判定");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %req.session_id, env_id = %req.env_id, pod, error = %e, "podIP 查询失败，跳过探活，交由 MCP 握手兜底判定");
+        }
+    }
+    Ok((port, token))
+}
+
+/// best-effort stop：HTTP stop arthas（卸载 agent）+ 关 MCP client。
+/// k8s 目标（pod=Some）stop curl 必须在容器内执行（127.0.0.1 是容器回环），
+/// 经 pod 维度池键取 k8s 通道；VM 目标走 base 池键。
 struct ProductionStopHandle {
     db: sqlx::SqlitePool,
     exec_pool: Arc<Mutex<ExecChannelPool>>,
     env_id: String,
+    pod: Option<String>,
+    container: Option<String>,
     remote_port: u16,
     token: String,
     client: Arc<dyn ArthasClient>,
@@ -296,12 +507,20 @@ impl ArthasStopHandle for ProductionStopHandle {
         // 反过来会因服务已死导致 DELETE 连接拒绝（虽已容错，但语义上先清会话更正确）。
         self.client.shutdown().await;
         // HTTP stop（尽力而为，失败仅告警——残留 agent 由用户 arthas_close 重试或目标机重启解决）
-        match get_default_channel_raw(&self.db, &self.exec_pool, &self.env_id).await {
+        match get_target_channel_raw(
+            &self.db,
+            &self.exec_pool,
+            &self.env_id,
+            self.pod.as_deref(),
+            self.container.as_deref(),
+        )
+        .await
+        {
             Ok(channel) => match run_with_timeout(channel.as_ref(), &stop_command(self.remote_port, &self.token), 15).await {
-                Ok(_) => tracing::info!(env_id = %self.env_id, port = self.remote_port, "arthas stopped via http api"),
-                Err(e) => tracing::warn!(env_id = %self.env_id, port = self.remote_port, error = %e, "arthas http stop failed (best-effort)"),
+                Ok(_) => tracing::info!(env_id = %self.env_id, pod = ?self.pod, port = self.remote_port, "arthas stopped via http api"),
+                Err(e) => tracing::warn!(env_id = %self.env_id, pod = ?self.pod, port = self.remote_port, error = %e, "arthas http stop failed (best-effort)"),
             },
-            Err(e) => tracing::warn!(env_id = %self.env_id, port = self.remote_port, error = %e, "failed to get exec channel for arthas http stop (best-effort skip)"),
+            Err(e) => tracing::warn!(env_id = %self.env_id, pod = ?self.pod, port = self.remote_port, error = %e, "failed to get exec channel for arthas http stop (best-effort skip)"),
         }
     }
 }
@@ -312,13 +531,33 @@ async fn get_default_channel(deps: &AttachDeps, env_id: &str) -> Result<Arc<dyn 
     get_default_channel_raw(&deps.db, &deps.exec_pool, env_id).await
 }
 
+/// 按目标取通道（pod=None = 宿主机 VM 模式；k8s 分支容器执行通道同源）
+async fn get_target_channel(
+    deps: &AttachDeps,
+    env_id: &str,
+    pod: Option<&str>,
+    container: Option<&str>,
+) -> Result<Arc<dyn ExecChannel>, ManagerError> {
+    get_target_channel_raw(&deps.db, &deps.exec_pool, env_id, pod, container).await
+}
+
 async fn get_default_channel_raw(
     db: &sqlx::SqlitePool,
     exec_pool: &Arc<Mutex<ExecChannelPool>>,
     env_id: &str,
 ) -> Result<Arc<dyn ExecChannel>, ManagerError> {
+    get_target_channel_raw(db, exec_pool, env_id, None, None).await
+}
+
+async fn get_target_channel_raw(
+    db: &sqlx::SqlitePool,
+    exec_pool: &Arc<Mutex<ExecChannelPool>>,
+    env_id: &str,
+    pod: Option<&str>,
+    container: Option<&str>,
+) -> Result<Arc<dyn ExecChannel>, ManagerError> {
     let mut pool = exec_pool.lock().await;
-    pool.get_or_create(env_id, None, None, db)
+    pool.get_or_create(env_id, pod, container, db)
         .await
         .map_err(|e| ManagerError::Attach(format!("SSH 连接失败: {e}")))
 }
@@ -352,18 +591,27 @@ async fn provision_context(
     })
 }
 
-/// attach 用 java 可执行文件解析：JdkCache → PATH java → ensure JDK（结果回写 JdkCache）。
-/// 返回可执行文件完整路径（已做字符集校验，可安全嵌入 shell 命令）。
+/// attach 用 java 可执行文件解析：JdkCache（目标复合键：VM = env_id，k8s =
+/// env|pod=..|ctr=..）→ PATH java（channel 上执行：VM = 宿主机 / k8s = 容器内）
+/// → ensure JDK（VM = JdkPackage，k8s = K8sJdkPackage 装进 POD_TOOLS_DIR；
+/// 结果回写 JdkCache）。返回可执行文件完整路径（已做字符集校验）。
+/// ProvisionContext 只在 ensure 兜底路径构建——容器有 PATH java 时不强制 Artifactory 配置。
 async fn resolve_attach_java(
     deps: &AttachDeps,
     req: &AttachRequest,
-    pctx: &crate::provision::package::ProvisionContext,
+    channel: &Arc<dyn ExecChannel>,
 ) -> Result<String, ManagerError> {
-    if let Some(layout) = deps.jdk_cache.get(&req.env_id).await {
+    let target = crate::exec::pool::TargetKey::from_parts(
+        &req.env_id,
+        req.pod.as_deref(),
+        req.container.as_deref(),
+    );
+    let cache_key = crate::tools::builtin::jvm::jdk_cache::cache_key(&target);
+    if let Some(layout) = deps.jdk_cache.get(&cache_key).await {
         return Ok(format!("{}/bin/java", layout.tool_home));
     }
     // PATH 上有 java：直接用（JRE 也够跑 arthas-boot）
-    if let Ok(out) = run_with_timeout(pctx.channel.as_ref(), "command -v java", 15).await {
+    if let Ok(out) = run_with_timeout(channel.as_ref(), "command -v java", 15).await {
         let java = out.stdout.trim().to_string();
         if out.exit_code == 0 && !java.is_empty() {
             // 字符集校验（防 shell 注入，与 ensure_tool 的 java_bin 同款规则）
@@ -374,12 +622,22 @@ async fn resolve_attach_java(
         }
     }
     // 兜底：ensure JDK（依赖 java_bin 参数指向可用 java；目标机无 java 时给 agent 可行动的错误）
-    let jdk = crate::provision::jdk::JdkPackage;
-    match jdk.ensure(pctx, &req.java_bin).await {
+    let remote_tools_dir = if req.pod.is_some() {
+        crate::exec::k8s::POD_TOOLS_DIR
+    } else {
+        crate::provision::jdk::REMOTE_TOOLS_DIR
+    };
+    let pctx = provision_context(deps, req, channel.clone(), remote_tools_dir).await?;
+    let jdk: Box<dyn crate::provision::package::ToolPackage> = if req.pod.is_some() {
+        Box::new(crate::provision::k8s::K8sJdkPackage)
+    } else {
+        Box::new(crate::provision::jdk::JdkPackage)
+    };
+    match jdk.ensure(&pctx, &req.java_bin).await {
         Ok(result) => {
             deps.jdk_cache
                 .set(
-                    &req.env_id,
+                    &cache_key,
                     crate::tools::builtin::jvm::jdk_cache::JdkLayout {
                         tool_home: result.tool_home.clone(),
                         bins: result.bins.clone(),
@@ -478,6 +736,77 @@ async fn wait_http_ready(
 
 /// attach 日志位置提示（错误消息用）
 const ARTHAS_LOG_HINT: &str = "/tmp/arthas-friday-<pid>.log";
+
+/// 查询 Pod IP（宿主机侧 kubectl，输出经 IpAddr 校验防注入）
+async fn get_pod_ip(base: &dyn ExecChannel, pod: &str) -> Result<String, ManagerError> {
+    let out = run_with_timeout(base, &pod_ip_command(pod), 20).await?;
+    let ip = out.stdout.trim().to_string();
+    if out.exit_code != 0 || ip.is_empty() {
+        return Err(ManagerError::Attach(format!(
+            "查询 Pod {pod} 的 IP 失败（kubectl get pod，exit {}）: {}",
+            out.exit_code,
+            out.stderr.trim()
+        )));
+    }
+    validate_pod_ip(&ip).map_err(ManagerError::Attach)?;
+    Ok(ip)
+}
+
+/// 容器分支探活循环（宿主机侧 /dev/tcp 打 podIP）：可连即认为 arthas HTTP
+/// server 就绪。budget/interval 参数化（测试用快参数，生产 60s/3s）。
+async fn wait_pod_port_ready(
+    base: &dyn ExecChannel,
+    pod_ip: &str,
+    port: u16,
+    budget: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<(), ManagerError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let out = run_with_timeout(base, &pod_ip_probe_command(pod_ip, port), 15)
+            .await
+            .map_err(|e| ManagerError::Attach(format!("podIP 探活失败: {e}")))?;
+        if out.stdout.trim() == "busy" {
+            tracing::info!(pod_ip, port, attempt, "arthas http server ready (pod ip probe)");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ManagerError::Attach(format!(
+                "arthas HTTP 服务在 {}s 内未就绪（podIP {pod_ip}:{port} 不可达）。\
+                 可能原因：attach 失败、目标 JVM 拒绝 attach、宿主机到 Pod 网络不通。\
+                 可用 k8s_find_pods / run_command 查看 Pod 内 {ARTHAS_LOG_HINT} 日志",
+                budget.as_secs()
+            )));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// MCP 握手（带重试预算）：容器分支探活兜底路径下 arthas 可能仍在启动，
+/// 连接拒绝类失败按间隔重试直至预算耗尽（每次尝试独立建桥）。
+async fn connect_with_retry(
+    channel: &Arc<dyn ExecChannel>,
+    url: &str,
+    token: &str,
+    budget: std::time::Duration,
+) -> Result<crate::arthas::client::McpArthasClient, String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let bridge = crate::arthas::bridge::ExecHttpBridge::new(channel.clone(), 60);
+        match crate::arthas::client::connect_arthas_client(bridge, url, token).await {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tracing::warn!(url, error = %e, "arthas MCP 握手失败，重试中");
+                tokio::time::sleep(std::time::Duration::from_secs(POD_POLL_INTERVAL_SECS)).await;
+            }
+        }
+    }
+}
 
 /// 残留 arthas 实例清理：探测段内端口，被占且非活跃 → HTTP stop + 等释放。
 /// v0.11.2+ 实例（localConnectionNonAuth）本地 stop 免密；更早残留会 401 → 报错指路重启目标服务。
@@ -857,5 +1186,244 @@ mod tests {
 
         // 通道失败路径：best-effort（仅告警），不 panic、不向上抛错
         cleanup_partial_attach(&FailingChannel, 18563, "tok123").await;
+    }
+
+    // ── 容器分支（pod_attach_prepare：双通道编排 + podIP 探活 + 用户对齐跳过）──
+
+    use crate::exec::k8s::K8sChannel;
+    use crate::exec::pool::ExecChannelPool;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// 容器分支探活快参数（预算 200ms / 轮询 50ms），避免 60s 生产等待拖慢 CI
+    const FAST_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+    const FAST_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn pod_req() -> AttachRequest {
+        AttachRequest {
+            session_id: "s1".into(),
+            env_id: "env-1".into(),
+            pid: 1234,
+            java_bin: "java".into(),
+            pod: Some("svc-1".into()),
+            container: None,
+        }
+    }
+
+    fn pod_deps() -> AttachDeps {
+        let active_ports_fn: ActivePortsFn = Arc::new(|_env_id: &str| {
+            Box::pin(async { Vec::new() }) as Pin<Box<dyn Future<Output = Vec<u16>> + Send>>
+        });
+        AttachDeps {
+            db: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            exec_pool: Arc::new(Mutex::new(ExecChannelPool::new())),
+            jdk_cache: Arc::new(crate::tools::builtin::jvm::jdk_cache::JdkCache::new()),
+            cache_dir: PathBuf::from("/tmp/unused-cache"),
+            arthas_zip: None, // 缓存命中路径不触 zip；装备失败路径由 provision::arthas 测试覆盖
+            bus: crate::app::events::EventBus::disabled(),
+            active_ports_fn,
+        }
+    }
+
+    /// 容器内命令脚本：java 解析 + 残留清理 ×10（全 free）+ 端口分配 + 写 properties + attach
+    fn pod_channel_script() -> Vec<(&'static str, i32)> {
+        let mut script = vec![("/usr/lib/jvm/java-21/bin/java", 0)];
+        for _ in 0..ARTHAS_PORT_CANDIDATES {
+            script.push(("free", 0));
+        }
+        script.push(("18563\n18564", 0));
+        script.push(("", 0));
+        script.push(("attach-started", 0));
+        script
+    }
+
+    /// 真实 K8sChannel 包装的容器通道（记录到底层 base，命令带 kubectl exec 包装）
+    fn k8s_recording_channel(script: Vec<(&'static str, i32)>) -> (Arc<RecordingChannel>, Arc<dyn ExecChannel>) {
+        let inner = RecordingChannel::new(script);
+        let k8s: Arc<dyn ExecChannel> = Arc::new(K8sChannel {
+            base: inner.clone(),
+            pod: "svc-1".into(),
+            container: None,
+        });
+        (inner, k8s)
+    }
+
+    #[tokio::test]
+    async fn test_pod_attach_prepare_orchestration() {
+        // base（宿主机）：ensure_k8s 缓存命中 + podIP 查询 + /dev/tcp 探活成功
+        let base = RecordingChannel::new(vec![
+            ("", 0),           // kubectl exec test -f arthas-boot.jar（缓存命中）
+            ("10.244.1.5", 0), // kubectl get pod jsonpath
+            ("busy", 0),       // /dev/tcp podIP 探活：就绪
+        ]);
+        let base_ch: Arc<dyn ExecChannel> = base.clone();
+        let (pod_ch, k8s_ch) = k8s_recording_channel(pod_channel_script());
+        let deps = pod_deps();
+        let req = pod_req();
+        let (port, token) = pod_attach_prepare(
+            &deps,
+            &req,
+            &base_ch,
+            &k8s_ch,
+            "svc-1",
+            FAST_PROBE_BUDGET,
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(port, 18563);
+        assert_eq!(token.len(), 32);
+
+        let base_calls = base.calls().await;
+        assert_eq!(base_calls.len(), 3, "base_calls: {base_calls:?}");
+        // ① 装备走 ensure_k8s：宿主机侧 kubectl exec 缓存检查（POD_TOOLS_DIR/arthas-dist）
+        assert!(base_calls[0].contains("kubectl exec"), "ensure_k8s check: {}", base_calls[0]);
+        assert!(
+            base_calls[0].contains("arthas-dist/arthas-boot.jar"),
+            "ensure_k8s check: {}",
+            base_calls[0]
+        );
+        // ② 探活走 base 通道探 podIP：kubectl get pod jsonpath + /dev/tcp 打 podIP
+        assert!(base_calls[1].contains("kubectl get pod"), "podIP cmd: {}", base_calls[1]);
+        assert!(base_calls[1].contains(".status.podIP"), "podIP cmd: {}", base_calls[1]);
+        assert!(base_calls[2].contains("/dev/tcp/10.244.1.5/18563"), "probe cmd: {}", base_calls[2]);
+
+        let pod_calls = pod_ch.calls().await;
+        assert_eq!(pod_calls.len(), 14, "pod_calls: {pod_calls:?}");
+        // 容器内命令全部经 kubectl exec 包装（真实 K8sChannel 语义）
+        for c in &pod_calls {
+            assert!(c.contains("kubectl exec 'svc-1' -- sh -c"), "must be kubectl-wrapped: {c}");
+        }
+        // java 解析在容器内（第一个容器命令）
+        assert!(pod_calls[0].contains("command -v java"), "java resolve: {}", pod_calls[0]);
+        // ③ properties 写到容器内 dist 目录，内容绑 0.0.0.0（宿主侧探活/T6 隧道可达）
+        let write = pod_calls.iter().find(|c| c.contains("arthas.properties")).expect("write props cmd");
+        assert!(
+            write.contains("/opt/log/dump/coredump/friday-tools/arthas-dist/arthas.properties"),
+            "write: {write}"
+        );
+        assert!(write.contains("arthas.ip=0.0.0.0"), "write: {write}");
+        assert!(!write.contains("arthas.ip=127.0.0.1"), "write: {write}");
+        // attach 命令：容器内 dist 目录 + arthas-boot.jar
+        let attach = pod_calls.iter().find(|c| c.contains("arthas-boot.jar")).expect("attach cmd");
+        assert!(attach.contains("cd /opt/log/dump/coredump/friday-tools/arthas-dist"), "attach: {attach}");
+        assert!(attach.contains("--attach-only"), "attach: {attach}");
+        assert!(attach.contains("1234"), "attach pid: {attach}");
+        // 容器执行不泄漏到宿主机通道（properties/attach/java 都不在 base 上）
+        assert!(
+            base_calls.iter().all(|c| !c.contains("arthas.properties") && !c.contains("arthas-boot.jar --attach-only")),
+            "container cmds must not run on base: {base_calls:?}"
+        );
+        // 用户对齐被跳过：双通道均无 ps -o user= / id -un
+        for c in base_calls.iter().chain(pod_calls.iter()) {
+            assert!(
+                !c.contains("ps -o user=") && !c.contains("id -un"),
+                "user alignment must be skipped in pod branch: {c}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pod_attach_prepare_probe_unreachable_falls_back() {
+        // 探活恒 free（宿主→Pod 网络不通）+ 短预算：prepare 仍成功（交由 MCP 握手兜底）
+        let mut base_script = vec![("", 0), ("10.244.1.5", 0)]; // ensure_k8s 命中 + podIP
+        for _ in 0..8 {
+            base_script.push(("free", 0)); // 探活循环：始终不可达
+        }
+        let base = RecordingChannel::new(base_script);
+        let base_ch: Arc<dyn ExecChannel> = base.clone();
+        let (pod_ch, k8s_ch) = k8s_recording_channel(pod_channel_script());
+        let deps = pod_deps();
+        let req = pod_req();
+        let (port, _token) = pod_attach_prepare(
+            &deps,
+            &req,
+            &base_ch,
+            &k8s_ch,
+            "svc-1",
+            FAST_PROBE_BUDGET,
+            &|_, _| {},
+        )
+        .await
+        .expect("probe failure must fall through to mcp handshake, not hard-fail");
+        assert_eq!(port, 18563);
+        let base_calls = base.calls().await;
+        assert!(base_calls.len() >= 3, "probe loop must have run: {base_calls:?}");
+        assert!(base_calls[2].contains("/dev/tcp/10.244.1.5/18563"), "probe: {}", base_calls[2]);
+    }
+
+    #[tokio::test]
+    async fn test_pod_attach_prepare_bad_pod_ip_falls_back() {
+        // kubectl 返回非 IP（垃圾输出）：跳过探活，prepare 仍成功
+        let base = RecordingChannel::new(vec![
+            ("", 0),        // ensure_k8s 缓存命中
+            ("garbage", 0), // kubectl get pod 输出非 IP
+        ]);
+        let base_ch: Arc<dyn ExecChannel> = base.clone();
+        let (_pod_ch, k8s_ch) = k8s_recording_channel(pod_channel_script());
+        let deps = pod_deps();
+        let req = pod_req();
+        let result = pod_attach_prepare(
+            &deps,
+            &req,
+            &base_ch,
+            &k8s_ch,
+            "svc-1",
+            FAST_PROBE_BUDGET,
+            &|_, _| {},
+        )
+        .await;
+        assert!(result.is_ok(), "bad podIP must fall through to mcp handshake: {result:?}");
+        let calls = base.calls().await;
+        assert_eq!(calls.len(), 2, "no probe must run after bad podIP: {calls:?}");
+    }
+
+    #[test]
+    fn test_pod_ip_command_shape() {
+        let cmd = pod_ip_command("svc-abc");
+        assert!(cmd.contains("kubectl get pod 'svc-abc'"), "cmd: {cmd}");
+        assert!(cmd.contains("jsonpath='{.status.podIP}'"), "cmd: {cmd}");
+        // pod 名注入防护：单引号转义
+        let evil = pod_ip_command("x'; rm -rf /; '");
+        assert!(evil.contains(r"'\''"), "must escape quotes: {evil}");
+    }
+
+    #[test]
+    fn test_pod_ip_probe_command_shape() {
+        let cmd = pod_ip_probe_command("10.244.1.5", 18563);
+        assert!(cmd.contains("timeout 1"), "cmd: {cmd}");
+        assert!(cmd.contains("/dev/tcp/10.244.1.5/18563"), "cmd: {cmd}");
+        assert!(cmd.contains("busy"), "cmd: {cmd}");
+        assert!(cmd.contains("free"), "cmd: {cmd}");
+    }
+
+    #[test]
+    fn test_validate_pod_ip() {
+        assert!(validate_pod_ip("10.244.1.5").is_ok());
+        assert!(validate_pod_ip("fd00::1").is_ok());
+        // 非 IP 字面量一律拒绝（防注入）
+        assert!(validate_pod_ip("garbage").is_err());
+        assert!(validate_pod_ip("10.244.1.5; rm -rf /").is_err());
+        assert!(validate_pod_ip("127.0.0.1/24").is_err());
+        assert!(validate_pod_ip("").is_err());
+    }
+
+    #[test]
+    fn test_arthas_properties_content_pod_binds_wildcard() {
+        let content = arthas_properties_content_pod(18563, "abc123");
+        // 容器分支绑 0.0.0.0（宿主侧探活 / T6 隧道从 Pod 网络进入）
+        assert!(content.contains("arthas.ip=0.0.0.0\n"));
+        // 其余键与 VM 模式一致
+        assert!(content.contains("arthas.config.overrideAll=true\n"));
+        assert!(content.contains("arthas.mcpEndpoint=/mcp\n"));
+        assert!(content.contains("arthas.telnetPort=-1\n"));
+        assert!(content.contains("arthas.httpPort=18563\n"));
+        assert!(content.contains("arthas.password=abc123\n"));
+        assert!(content.contains("arthas.localConnectionNonAuth=true\n"));
+        // 无单引号/美元符（安全嵌入 shell 单引号）
+        assert!(!content.contains('\''));
+        assert!(!content.contains('$'));
+        // VM 模式维持官方默认回环绑定
+        assert!(arthas_properties_content(18563, "abc123").contains("arthas.ip=127.0.0.1\n"));
     }
 }

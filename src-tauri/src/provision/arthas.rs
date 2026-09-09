@@ -151,20 +151,18 @@ impl ArthasPackage {
     /// 容器环境装备：宿主机中转（SFTP zip → 宿主机 unzip+tar → kubectl exec -i 注入），
     /// 容器内依赖仅 sh + tar（精简镜像无 unzip/python3，VM 模式的"upload zip → 容器内
     /// 解压"链路不可用）。base = 宿主机通道；pod/container 定位目标容器。
-    /// 幂等：Pod 内已装备直接 cached 返回（Pod 重启容器层丢失后自动重装）。
+    /// 幂等：Pod 内已装备直接 cached 返回（Pod 重启容器层丢失后自动重装）；
+    /// zip=None 仅在缓存未命中时报 vendored_package_missing（对齐 VM ensure 语义）。
     ///
     /// 不进 ToolPackage trait（那是 VM 语义——run/upload 都作用于目标机本身）：
     /// 本流程的解包/打包是宿主机侧活动、注入的 stdin 重定向源是宿主机文件，
     /// 整条流水线以 base 通道为主轴、kubectl exec 命令内联。
-    ///
-    /// 调用方（arthas attach 的 k8s 分支）在 T5 接入，非测试构建下暂时豁免 dead_code 警告。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn ensure_k8s(
         &self,
         base: &std::sync::Arc<dyn crate::exec::channel::ExecChannel>,
         pod: &str,
         container: Option<&str>,
-        zip: &std::path::Path,
+        zip: Option<&std::path::Path>,
         session_id: &str,
         env_id: &str,
     ) -> Result<ProvisionResult, ProvisionError> {
@@ -203,6 +201,17 @@ impl ArthasPackage {
                 elapsed_ms: start.elapsed().as_millis() as u64,
             });
         }
+
+        // vendored zip（随应用分发；None = 安装缺资源，仅在真正需要下发时报）
+        let Some(zip) = zip else {
+            return Err(ProvisionError::new(
+                "vendored_package_missing",
+                "vendored_package",
+                format!(
+                    "arthas 工具包未随应用分发（resources/arthas/arthas-bin-{ARTHAS_VERSION}.zip），请重新安装 Friday"
+                ),
+            ));
+        };
 
         // vendored zip 完整性守卫（与 VM 模式同款）
         if let Err(e) = crate::provision::transfer::validate_download(zip, 5 * 1024 * 1024) {
@@ -377,8 +386,6 @@ impl ArthasPackage {
     }
 
     /// 失败路径容器内半截清理（best-effort）：kubectl exec rm -rf dist
-    /// （仅 ensure_k8s 使用，随其一起暂时豁免 dead_code）
-    #[cfg_attr(not(test), allow(dead_code))]
     async fn rm_pod_dist(
         base: &std::sync::Arc<dyn crate::exec::channel::ExecChannel>,
         ctr: &str,
@@ -559,7 +566,7 @@ mod tests {
         ch: &Arc<RecordingChannel>,
         pod: &str,
         container: Option<&str>,
-        zip: &std::path::Path,
+        zip: Option<&std::path::Path>,
     ) -> Result<ProvisionResult, ProvisionError> {
         let base: Arc<dyn ExecChannel> = ch.clone();
         ArthasPackage.ensure_k8s(&base, pod, container, zip, "s1", "env-1").await
@@ -567,12 +574,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_k8s_cache_hit() {
-        // kubectl exec test -f 命中（exit 0）→ cached，零上传
+        // kubectl exec test -f 命中（exit 0）→ cached，零上传（zip 缺失也不报——
+        // vendored_package_missing 只在缓存未命中且需要下发时报，对齐 VM ensure 语义）
         let ch = RecordingChannel::new(vec![("", 0)]);
-        let result =
-            ensure_k8s_with(&ch, "svc-1", None, std::path::Path::new("/local/arthas.zip"))
-                .await
-                .unwrap();
+        let result = ensure_k8s_with(&ch, "svc-1", None, None).await.unwrap();
         assert!(result.cached);
         assert_eq!(result.tool_home, K8S_DIST);
         assert!(ch.uploads.lock().await.is_empty(), "cache hit must not upload");
@@ -580,6 +585,16 @@ mod tests {
         assert_eq!(calls.len(), 1, "only the cache check should run: {calls:?}");
         assert!(calls[0].contains("kubectl exec"), "check: {}", calls[0]);
         assert!(calls[0].contains(K8S_BOOT_CHECK), "check: {}", calls[0]);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_k8s_missing_zip_on_miss_reports_error() {
+        // 缓存未命中 + zip=None（安装缺资源）→ vendored_package_missing，零上传
+        let ch = RecordingChannel::new(vec![("", 1)]);
+        let err = ensure_k8s_with(&ch, "svc-1", None, None).await.unwrap_err();
+        assert_eq!(err.code, "vendored_package_missing");
+        assert!(err.message.contains("重新安装"), "err: {err:?}");
+        assert!(ch.uploads.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -596,7 +611,7 @@ mod tests {
             ("", 0),
             ("", 0),
         ]);
-        let result = ensure_k8s_with(&ch, "svc-1", None, &zip).await.unwrap();
+        let result = ensure_k8s_with(&ch, "svc-1", None, Some(zip.as_path())).await.unwrap();
         assert!(!result.cached);
         assert_eq!(result.tool_home, K8S_DIST);
         assert_eq!(result.tool, "arthas");
@@ -644,7 +659,7 @@ mod tests {
         let zip = make_zip(tmp.path());
         // ①cache miss ②mkdir ③extract ④inject exit 1
         let ch = RecordingChannel::new(vec![("", 1), ("", 0), ("", 0), ("", 1)]);
-        let err = ensure_k8s_with(&ch, "svc-1", None, &zip).await.unwrap_err();
+        let err = ensure_k8s_with(&ch, "svc-1", None, Some(zip.as_path())).await.unwrap_err();
         assert_eq!(err.code, "provision_failed");
         assert_eq!(err.stage, "inject");
         assert!(err.message.contains("svc-1"), "err must carry pod: {err:?}");
@@ -676,7 +691,7 @@ mod tests {
             ("", 0),
             ("", 0),
         ]);
-        let result = ensure_k8s_with(&ch, "svc-1", Some("main"), &zip).await.unwrap();
+        let result = ensure_k8s_with(&ch, "svc-1", Some("main"), Some(zip.as_path())).await.unwrap();
         assert!(!result.cached);
         let calls = ch.calls.lock().await;
         let kubectl_cmds: Vec<&String> = calls.iter().filter(|c| c.contains("kubectl exec")).collect();
