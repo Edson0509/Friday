@@ -3,13 +3,17 @@ use crate::exec::channel::ExecChannel;
 use crate::exec::pool::ExecChannelPool;
 use crate::exec::ssh::shell_quote_single;
 use crate::provision::package::ToolPackage;
+use async_trait::async_trait;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::manager::{
     ActivePortsFn, ArthasClient, ArthasStopHandle, AttachFactory, AttachRequest, AttachedSession, ManagerError,
 };
+use super::tunnel::{establish_pf_tunnel, teardown_pf, ArthasTunnels, PfLease, PfTunnelParams};
 
 /// 远端 arthas HTTP 端口分配起点（顺序向上探测）
 pub const ARTHAS_PORT_START: u16 = 18563;
@@ -184,6 +188,8 @@ pub struct AttachDeps {
     pub bus: EventBus,
     /// 活跃会话端口查询（manager 共享；残留清理排除活跃会话）
     pub active_ports_fn: ActivePortsFn,
+    /// SSH 隧道管理器（T6 pf 隧道主路径；测试注入 mock）
+    pub tunnels: Arc<dyn ArthasTunnels>,
 }
 
 pub fn production_attach_factory(deps: AttachDeps) -> AttachFactory {
@@ -325,6 +331,8 @@ async fn attach_arthas_on_vm(
         remote_port: port,
         token,
         client: client.clone(),
+        tunnels: deps.tunnels.clone(),
+        pf: None,
     });
     Ok(AttachedSession { client, stop_handle, remote_port: port })
 }
@@ -371,22 +379,36 @@ async fn attach_arthas_in_pod(
     )
     .await?;
 
-    // 7. MCP 通路（本任务临时主路径）：exec HTTP 桥挂 k8s_ch——curl 在容器内执行，
-    //    打 127.0.0.1（容器回环；properties 已绑 0.0.0.0，回环仍通）。
-    //    容器内没 curl 时握手失败（可接受：T6 正向隧道才是主路径）。
-    //    探活未通过/被跳过时 arthas 可能仍在启动，握手带重试预算兜底。
-    progress("bridge", "建立 MCP 通路（exec HTTP 桥，容器内 curl）".to_string());
-    let url = format!("http://127.0.0.1:{port}/mcp");
-    let client: Arc<dyn ArthasClient> =
-        match connect_with_retry(&k8s_ch, &url, &token, std::time::Duration::from_secs(POD_HANDSHAKE_RETRY_BUDGET_SECS)).await {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                cleanup_partial_attach(k8s_ch.as_ref(), port, &token).await;
-                return Err(ManagerError::Attach(format!("arthas MCP 握手失败: {e}")));
-            }
-        };
+    // 7. MCP 通路（T6 主路径）：port-forward 隧道（宿主机 nohup kubectl
+    //    port-forward → Pod mcp_port，TunnelManager direct-tcpip 到宿主机
+    //    127.0.0.1:P）+ rmcp 原生 reqwest transport 握手 http://127.0.0.1:{L}/mcp；
+    //    任一步失败 → 拆隧道 → 降级 exec HTTP 桥（T5 路径，容器需 curl）。
+    //    隧道模式的 pf/隧道生命周期挂 stop handle（所有会话销毁路径统一经
+    //    stop() 释放：close / LRU 逐出 / reaper / invalidate / close_for_environment）。
+    let connector = ProductionPodMcpConnector {
+        token: token.clone(),
+        bridge_budget: std::time::Duration::from_secs(POD_HANDSHAKE_RETRY_BUDGET_SECS),
+    };
+    let (client, pf_lease) = establish_pod_mcp(
+        &base,
+        &k8s_ch,
+        deps.tunnels.as_ref(),
+        &connector,
+        &req.env_id,
+        pod,
+        req.container.as_deref(),
+        port,
+        &token,
+        &PfTunnelParams::default(),
+        &progress,
+    )
+    .await?;
 
-    progress("ready", format!("arthas 就绪（pod {pod} 容器内端口 {port}，exec HTTP 桥）"));
+    let transport_desc = if pf_lease.is_some() { "port-forward 隧道" } else { "exec HTTP 桥" };
+    progress(
+        "ready",
+        format!("arthas 就绪（pod {pod} 容器内端口 {port}，{transport_desc}）"),
+    );
     let stop_handle: Arc<dyn ArthasStopHandle> = Arc::new(ProductionStopHandle {
         db: deps.db.clone(),
         exec_pool: deps.exec_pool.clone(),
@@ -396,6 +418,8 @@ async fn attach_arthas_in_pod(
         remote_port: port,
         token,
         client: client.clone(),
+        tunnels: deps.tunnels.clone(),
+        pf: pf_lease,
     });
     Ok(AttachedSession { client, stop_handle, remote_port: port })
 }
@@ -404,6 +428,110 @@ async fn attach_arthas_in_pod(
 const POD_PROBE_BUDGET_SECS: u64 = 60;
 const POD_HANDSHAKE_RETRY_BUDGET_SECS: u64 = 60;
 const POD_POLL_INTERVAL_SECS: u64 = 3;
+
+/// 容器分支 MCP 客户端连接器（注入 seam：生产 = 原生 reqwest transport /
+/// exec HTTP 桥；测试 = scripted mock）
+#[async_trait]
+trait PodMcpConnector: Sync {
+    /// 原生 HTTP 握手（rmcp reqwest transport 打本地隧道端口）
+    async fn connect_native(&self, url: &str) -> Result<Arc<dyn ArthasClient>, String>;
+    /// exec HTTP 桥握手（容器内 curl；带重试预算——探活失败兜底路径下
+    /// arthas 可能仍在启动）
+    async fn connect_bridge(&self, k8s_ch: &Arc<dyn ExecChannel>, url: &str) -> Result<Arc<dyn ArthasClient>, String>;
+}
+
+/// 生产连接器：token / 桥重试预算随 attach 会话固定
+struct ProductionPodMcpConnector {
+    token: String,
+    bridge_budget: std::time::Duration,
+}
+
+#[async_trait]
+impl PodMcpConnector for ProductionPodMcpConnector {
+    async fn connect_native(&self, url: &str) -> Result<Arc<dyn ArthasClient>, String> {
+        crate::arthas::client::connect_arthas_client_native(url, &self.token)
+            .await
+            .map(|c| Arc::new(c) as Arc<dyn ArthasClient>)
+    }
+
+    async fn connect_bridge(&self, k8s_ch: &Arc<dyn ExecChannel>, url: &str) -> Result<Arc<dyn ArthasClient>, String> {
+        connect_with_retry(k8s_ch, url, &self.token, self.bridge_budget)
+            .await
+            .map(|c| Arc::new(c) as Arc<dyn ArthasClient>)
+    }
+}
+
+/// 容器分支 MCP 通路编排（T6 主路径）：① port-forward 隧道（宿主机 nohup pf
+/// + TunnelManager direct-tcpip）+ rmcp 原生 reqwest transport 握手；
+/// ② 任一步失败 → 拆隧道（kill pf + close）→ 降级 exec HTTP 桥（T5 路径，
+/// 容器需 curl）。返回 (client, pf lease)——lease=Some 表示隧道模式
+/// （stop 走隧道原生 HTTP，见 run_production_stop）。
+async fn establish_pod_mcp(
+    base: &Arc<dyn ExecChannel>,
+    k8s_ch: &Arc<dyn ExecChannel>,
+    tunnels: &dyn ArthasTunnels,
+    connector: &dyn PodMcpConnector,
+    env_id: &str,
+    pod: &str,
+    container: Option<&str>,
+    mcp_port: u16,
+    token: &str,
+    pf_params: &PfTunnelParams,
+    progress: &(dyn Fn(&str, String) + Sync),
+) -> Result<(Arc<dyn ArthasClient>, Option<PfLease>), ManagerError> {
+    progress("tunnel", format!("建立 MCP 通路（port-forward 隧道，pod {pod}）"));
+    match establish_pf_tunnel(base.as_ref(), tunnels, env_id, pod, container, mcp_port, pf_params).await {
+        Ok(lease) => {
+            let url = format!("http://127.0.0.1:{}/mcp", lease.local_port);
+            progress("handshake", format!("MCP 握手（原生 HTTP 隧道 {url}）"));
+            match connector.connect_native(&url).await {
+                Ok(client) => {
+                    tracing::info!(env_id, pod, mcp_port, pf_pid = lease.pf_pid,
+                        host_port = lease.host_port, local_port = lease.local_port,
+                        "pod arthas mcp established via pf tunnel");
+                    Ok((client, Some(lease)))
+                }
+                Err(e) => {
+                    tracing::warn!(env_id, pod, url = %url, error = %e,
+                        "原生 MCP 握手失败，拆除隧道并降级 exec HTTP 桥（容器内 curl）");
+                    progress("bridge", "原生握手失败，拆除隧道并降级 exec HTTP 桥（容器内 curl）".to_string());
+                    teardown_pf(base.as_ref(), tunnels, env_id, lease.pf_pid, Some(lease.host_port)).await;
+                    pod_bridge_fallback(k8s_ch, connector, mcp_port, token, progress)
+                        .await
+                        .map(|c| (c, None))
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(env_id, pod, mcp_port, error = %e,
+                "port-forward 隧道建立失败，降级 exec HTTP 桥（容器需 curl）");
+            progress("bridge", format!("隧道建立失败（{e}），降级 exec HTTP 桥（容器内 curl）"));
+            pod_bridge_fallback(k8s_ch, connector, mcp_port, token, progress)
+                .await
+                .map(|c| (c, None))
+        }
+    }
+}
+
+/// MCP 兜底路径：exec HTTP 桥（T5 主路径，T6 起降级兜底；容器需 curl）。
+/// 桥也失败 → cleanup_partial_attach（best-effort 停 arthas）后报错。
+async fn pod_bridge_fallback(
+    k8s_ch: &Arc<dyn ExecChannel>,
+    connector: &dyn PodMcpConnector,
+    mcp_port: u16,
+    token: &str,
+    progress: &(dyn Fn(&str, String) + Sync),
+) -> Result<Arc<dyn ArthasClient>, ManagerError> {
+    let url = format!("http://127.0.0.1:{mcp_port}/mcp");
+    progress("handshake", format!("MCP 握手（exec HTTP 桥 {url}）"));
+    match connector.connect_bridge(k8s_ch, &url).await {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            cleanup_partial_attach(k8s_ch.as_ref(), mcp_port, token).await;
+            Err(ManagerError::Attach(format!("arthas MCP 握手失败: {e}")))
+        }
+    }
+}
 
 /// 容器 attach 前半程编排（装备 → java 解析 → 残留清理 → 端口/properties →
 /// attach → 探活），返回 (http_port, token) 供 MCP 建桥握手。
@@ -487,8 +615,10 @@ async fn pod_attach_prepare(
 }
 
 /// best-effort stop：HTTP stop arthas（卸载 agent）+ 关 MCP client。
-/// k8s 目标（pod=Some）stop curl 必须在容器内执行（127.0.0.1 是容器回环），
-/// 经 pod 维度池键取 k8s 通道；VM 目标走 base 池键。
+/// pf=Some（T6 隧道模式）时 stop 编排见 run_production_stop：经隧道原生 HTTP
+/// 停 arthas → kill 宿主机 pf → 关 TunnelManager 隧道；隧道不可用回落
+/// exec 通道 curl（k8s = kubectl exec 容器内；VM = 宿主机本地）。
+/// pf=None（VM / 桥降级模式）：exec 通道 curl stop（原 T5 行为）。
 struct ProductionStopHandle {
     db: sqlx::SqlitePool,
     exec_pool: Arc<Mutex<ExecChannelPool>>,
@@ -498,29 +628,129 @@ struct ProductionStopHandle {
     remote_port: u16,
     token: String,
     client: Arc<dyn ArthasClient>,
+    /// SSH 隧道管理器（pf 隧道关闭）
+    tunnels: Arc<dyn ArthasTunnels>,
+    /// T6 隧道模式的 pf/隧道租约（桥降级 / VM 模式为 None）
+    pf: Option<PfLease>,
 }
 
 #[async_trait::async_trait]
 impl ArthasStopHandle for ProductionStopHandle {
     async fn stop(&self) {
-        // 先关 MCP client（DELETE 会话清理需要 arthas 还活着），再停 arthas。
-        // 反过来会因服务已死导致 DELETE 连接拒绝（虽已容错，但语义上先清会话更正确）。
-        self.client.shutdown().await;
-        // HTTP stop（尽力而为，失败仅告警——残留 agent 由用户 arthas_close 重试或目标机重启解决）
-        match get_target_channel_raw(
-            &self.db,
-            &self.exec_pool,
+        // 通道懒解析（stop 可能发生在 attach 很久之后，池连接可能已换/重建）
+        let get_base_channel = {
+            let db = self.db.clone();
+            let exec_pool = self.exec_pool.clone();
+            let env_id = self.env_id.clone();
+            move || {
+                let db = db.clone();
+                let exec_pool = exec_pool.clone();
+                let env_id = env_id.clone();
+                Box::pin(async move {
+                    get_default_channel_raw(&db, &exec_pool, &env_id)
+                        .await
+                        .map_err(|e| e.to_string())
+                }) as Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>>
+            }
+        };
+        let get_target_channel = {
+            let db = self.db.clone();
+            let exec_pool = self.exec_pool.clone();
+            let env_id = self.env_id.clone();
+            let pod = self.pod.clone();
+            let container = self.container.clone();
+            move || {
+                let db = db.clone();
+                let exec_pool = exec_pool.clone();
+                let env_id = env_id.clone();
+                let pod = pod.clone();
+                let container = container.clone();
+                Box::pin(async move {
+                    get_target_channel_raw(&db, &exec_pool, &env_id, pod.as_deref(), container.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())
+                }) as Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>>
+            }
+        };
+        let tunnel_stop = {
+            let token = self.token.clone();
+            move |port: u16| {
+                let token = token.clone();
+                Box::pin(async move { super::tunnel::http_stop_via_tunnel(port, &token).await })
+                    as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+            }
+        };
+        run_production_stop(
+            self.client.as_ref(),
+            self.tunnels.as_ref(),
+            self.pf.as_ref(),
             &self.env_id,
             self.pod.as_deref(),
-            self.container.as_deref(),
+            self.remote_port,
+            &self.token,
+            &tunnel_stop,
+            &get_base_channel,
+            &get_target_channel,
         )
-        .await
-        {
-            Ok(channel) => match run_with_timeout(channel.as_ref(), &stop_command(self.remote_port, &self.token), 15).await {
-                Ok(_) => tracing::info!(env_id = %self.env_id, pod = ?self.pod, port = self.remote_port, "arthas stopped via http api"),
-                Err(e) => tracing::warn!(env_id = %self.env_id, pod = ?self.pod, port = self.remote_port, error = %e, "arthas http stop failed (best-effort)"),
+        .await;
+    }
+}
+
+/// stop 编排核心（参数全注入，测试 seam）。固定顺序：
+/// ① client.shutdown()（DELETE MCP 会话——隧道模式经原生 transport 走隧道，
+///    此时 arthas 与隧道都还活着，语义与 T5 一致：先清会话再停 arthas）
+/// ② pf 存在（隧道模式）：经隧道原生 HTTP stop arthas → kill pf → 关隧道
+///    （teardown_pod_tunnel_session；kill pf 固定先于 tunnels.close——反序时
+///    close 失败会泄漏宿主机 pf 进程）。宿主机通道拿不到：仍关隧道，kill pf
+///    交由下次 attach 的 pkill 清残留兜底
+/// ③ arthas 尚未停掉（无 pf / 隧道 stop 失败）：exec 通道 curl stop 兜底
+async fn run_production_stop(
+    client: &dyn ArthasClient,
+    tunnels: &dyn ArthasTunnels,
+    pf: Option<&PfLease>,
+    env_id: &str,
+    pod: Option<&str>,
+    remote_port: u16,
+    token: &str,
+    tunnel_stop: &(dyn Fn(u16) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Sync),
+    get_base_channel: &(dyn Fn() -> Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>> + Sync),
+    get_target_channel: &(dyn Fn() -> Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>> + Sync),
+) {
+    // ① DELETE MCP 会话
+    client.shutdown().await;
+
+    // ② 隧道段
+    let mut agent_stopped = false;
+    if let Some(pf) = pf {
+        match get_base_channel().await {
+            Ok(base) => {
+                agent_stopped = super::tunnel::teardown_pod_tunnel_session(
+                    base.as_ref(),
+                    tunnels,
+                    tunnel_stop,
+                    env_id,
+                    pf,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    env_id, pod = ?pod, error = %e,
+                    "拿不到宿主机通道，kill pf 失败（宿主机残留 pf 由下次 attach 的 pkill 清理兜底）；隧道条目仍关闭"
+                );
+                tunnels.close(env_id, super::tunnel::TUNNEL_REMOTE_HOST, pf.host_port).await;
+            }
+        }
+    }
+
+    // ③ exec 通道 stop 兜底（VM / 桥降级 / 隧道 stop 失败）
+    if !agent_stopped {
+        match get_target_channel().await {
+            Ok(channel) => match run_with_timeout(channel.as_ref(), &stop_command(remote_port, token), 15).await {
+                Ok(_) => tracing::info!(env_id, pod = ?pod, port = remote_port, "arthas stopped via http api (exec channel)"),
+                Err(e) => tracing::warn!(env_id, pod = ?pod, port = remote_port, error = %e, "arthas http stop failed (best-effort)"),
             },
-            Err(e) => tracing::warn!(env_id = %self.env_id, pod = ?self.pod, port = self.remote_port, error = %e, "failed to get exec channel for arthas http stop (best-effort skip)"),
+            Err(e) => tracing::warn!(env_id, pod = ?pod, port = remote_port, error = %e, "failed to get exec channel for arthas http stop (best-effort skip)"),
         }
     }
 }
@@ -1222,7 +1452,23 @@ mod tests {
             arthas_zip: None, // 缓存命中路径不触 zip；装备失败路径由 provision::arthas 测试覆盖
             bus: crate::app::events::EventBus::disabled(),
             active_ports_fn,
+            tunnels: noop_tunnels(),
         }
+    }
+
+    /// no-op tunnels 替身（不触隧道路径的测试用）
+    fn noop_tunnels() -> Arc<dyn ArthasTunnels> {
+        Arc::new(NoopTunnels)
+    }
+
+    struct NoopTunnels;
+
+    #[async_trait]
+    impl ArthasTunnels for NoopTunnels {
+        async fn open(&self, _env_id: &str, _remote_host: &str, _remote_port: u16) -> Result<u16, String> {
+            unreachable!("test must not open tunnels")
+        }
+        async fn close(&self, _env_id: &str, _remote_host: &str, _remote_port: u16) {}
     }
 
     /// 容器内命令脚本：java 解析 + 残留清理 ×10（全 free）+ 端口分配 + 写 properties + attach
@@ -1425,5 +1671,531 @@ mod tests {
         assert!(!content.contains('$'));
         // VM 模式维持官方默认回环绑定
         assert!(arthas_properties_content(18563, "abc123").contains("arthas.ip=127.0.0.1\n"));
+    }
+
+    // ── T6 pf 隧道：MCP 通路编排（establish_pod_mcp）──
+
+    use crate::arthas::manager::CallOutcome;
+
+    type EventLog = Arc<Mutex<Vec<String>>>;
+
+    fn mock_client(events: EventLog) -> Arc<dyn ArthasClient> {
+        Arc::new(MockArthasClient { events })
+    }
+
+    struct MockArthasClient {
+        events: EventLog,
+    }
+
+    #[async_trait]
+    impl ArthasClient for MockArthasClient {
+        async fn call_tool(&self, _name: &str, _args: &serde_json::Value) -> Result<CallOutcome, String> {
+            Ok(CallOutcome { text: "ok".into(), is_error: false })
+        }
+        async fn shutdown(&self) {
+            self.events.lock().await.push("client-shutdown".into());
+        }
+    }
+
+    /// 事件记录 + 脚本化输出通道：每次 run 把 "label:cmd" 记入事件日志
+    /// （跨组件顺序断言用），响应按脚本顺序返回
+    struct ScriptedEventChannel {
+        events: EventLog,
+        label: &'static str,
+        script: Mutex<VecDeque<(&'static str, i32)>>,
+    }
+
+    impl ScriptedEventChannel {
+        fn new(events: EventLog, label: &'static str, script: Vec<(&'static str, i32)>) -> Arc<Self> {
+            Arc::new(Self {
+                events,
+                label,
+                script: Mutex::new(script.into_iter().collect()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ExecChannel for ScriptedEventChannel {
+        async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
+            self.events.lock().await.push(format!("{}:{}", self.label, cmd));
+            let (stdout, exit_code) = self.script.lock().await.pop_front().unwrap_or(("", 0));
+            Ok(ExecOutput { stdout: stdout.to_string(), stderr: String::new(), exit_code })
+        }
+        async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+        async fn is_alive(&self) -> bool {
+            true
+        }
+    }
+
+    /// tunnels mock：open/close 记入事件日志；open 按脚本返回
+    struct MockTunnels {
+        events: EventLog,
+        opens: Mutex<VecDeque<Result<u16, String>>>,
+    }
+
+    impl MockTunnels {
+        fn new(events: EventLog, opens: Vec<Result<u16, String>>) -> Arc<Self> {
+            Arc::new(Self { events, opens: Mutex::new(opens.into_iter().collect()) })
+        }
+    }
+
+    #[async_trait]
+    impl ArthasTunnels for MockTunnels {
+        async fn open(&self, env_id: &str, remote_host: &str, remote_port: u16) -> Result<u16, String> {
+            self.events
+                .lock()
+                .await
+                .push(format!("tunnels-open:{env_id}/{remote_host}/{remote_port}"));
+            self.opens.lock().await.pop_front().unwrap_or(Ok(0))
+        }
+        async fn close(&self, env_id: &str, remote_host: &str, remote_port: u16) {
+            self.events
+                .lock()
+                .await
+                .push(format!("tunnels-close:{env_id}/{remote_host}/{remote_port}"));
+        }
+    }
+
+    /// MCP 连接器 mock：native/bridge 各按脚本成败，URL 记入事件日志
+    struct ScriptedConnector {
+        events: EventLog,
+        native: Mutex<VecDeque<Result<(), String>>>,
+        bridge: Mutex<VecDeque<Result<(), String>>>,
+    }
+
+    impl ScriptedConnector {
+        fn new(events: EventLog, native: Vec<Result<(), String>>, bridge: Vec<Result<(), String>>) -> Self {
+            Self {
+                events,
+                native: Mutex::new(native.into_iter().collect()),
+                bridge: Mutex::new(bridge.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PodMcpConnector for ScriptedConnector {
+        async fn connect_native(&self, url: &str) -> Result<Arc<dyn ArthasClient>, String> {
+            self.events.lock().await.push(format!("native-connect:{url}"));
+            match self.native.lock().await.pop_front() {
+                Some(Ok(())) => Ok(mock_client(self.events.clone())),
+                Some(Err(e)) => Err(e),
+                None => unreachable!("native script exhausted"),
+            }
+        }
+        async fn connect_bridge(&self, _k8s_ch: &Arc<dyn ExecChannel>, url: &str) -> Result<Arc<dyn ArthasClient>, String> {
+            self.events.lock().await.push(format!("bridge-connect:{url}"));
+            match self.bridge.lock().await.pop_front() {
+                Some(Ok(())) => Ok(mock_client(self.events.clone())),
+                Some(Err(e)) => Err(e),
+                None => unreachable!("bridge script exhausted"),
+            }
+        }
+    }
+
+    /// 绑一个本地监听端口（保持存活供健康检查连通）
+    async fn live_local_port() -> (u16, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (port, listener)
+    }
+
+    /// 建立成功的 base 脚本：清残留 → pf 启动（PID 4242）→ 日志空 → Forwarding（P=54321）
+    fn pf_base_script() -> Vec<(&'static str, i32)> {
+        vec![
+            ("", 0),
+            ("4242", 0),
+            ("", 0),
+            ("Forwarding from 127.0.0.1:54321 -> 18563", 0),
+        ]
+    }
+
+    /// pf 隧道快参数（预算 300ms / 轮询 20ms / 健康检查 400ms），避免 10s 生产等待拖慢 CI
+    fn fast_pf_params() -> PfTunnelParams {
+        PfTunnelParams {
+            log_budget: std::time::Duration::from_millis(300),
+            log_interval: std::time::Duration::from_millis(20),
+            health_budget: std::time::Duration::from_millis(400),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_establish_pod_mcp_tunnel_happy_path() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let base = ScriptedEventChannel::new(events.clone(), "base", pf_base_script());
+        let base_ch: Arc<dyn ExecChannel> = base;
+        let k8s_ch: Arc<dyn ExecChannel> = ScriptedEventChannel::new(events.clone(), "k8s", vec![]);
+        let (live_port, _guard) = live_local_port().await;
+        let tunnels = MockTunnels::new(events.clone(), vec![Ok(live_port)]);
+        let connector = ScriptedConnector::new(events.clone(), vec![Ok(())], vec![]);
+
+        let (client, lease) = establish_pod_mcp(
+            &base_ch,
+            &k8s_ch,
+            tunnels.as_ref(),
+            &connector,
+            "env-1",
+            "svc-1",
+            None,
+            18563,
+            "tok123",
+            &fast_pf_params(),
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        client.shutdown().await; // mock 可正常 shutdown
+
+        let lease = lease.expect("tunnel lease");
+        assert_eq!(lease.pf_pid, 4242);
+        assert_eq!(lease.host_port, 54321);
+        assert_eq!(lease.local_port, live_port);
+
+        let ev = events.lock().await.clone();
+        // 顺序：清残留 → 起 pf → 日志轮询 → tunnels.open → 原生握手
+        let idx = |needle: &str| ev.iter().position(|e| e.contains(needle)).expect(needle);
+        assert!(idx("pkill -f") < idx("nohup kubectl port-forward"), "ev: {ev:?}");
+        assert!(idx("nohup kubectl port-forward") < idx("tunnels-open:"), "ev: {ev:?}");
+        assert!(
+            ev.iter().any(|e| e == &format!("tunnels-open:env-1/127.0.0.1/54321")),
+            "ev: {ev:?}"
+        );
+        assert!(
+            ev.iter().any(|e| e == &format!("native-connect:http://127.0.0.1:{live_port}/mcp")),
+            "ev: {ev:?}"
+        );
+        // 主路径成功：不走桥、不拆隧道
+        assert!(!ev.iter().any(|e| e.starts_with("bridge-connect:")), "ev: {ev:?}");
+        assert!(!ev.iter().any(|e| e.starts_with("tunnels-close:")), "ev: {ev:?}");
+        assert!(!ev.iter().any(|e| e.starts_with("base:kill")), "ev: {ev:?}");
+        // 容器通道不被触（原生 transport 不经 k8s exec）
+        assert!(!ev.iter().any(|e| e.starts_with("k8s:")), "ev: {ev:?}");
+    }
+
+    #[tokio::test]
+    async fn test_establish_pod_mcp_native_fail_falls_back_to_bridge() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let base = ScriptedEventChannel::new(events.clone(), "base", pf_base_script());
+        let base_ch: Arc<dyn ExecChannel> = base;
+        let k8s_ch: Arc<dyn ExecChannel> = ScriptedEventChannel::new(events.clone(), "k8s", vec![]);
+        let (live_port, _guard) = live_local_port().await;
+        let tunnels = MockTunnels::new(events.clone(), vec![Ok(live_port)]);
+        let connector = ScriptedConnector::new(
+            events.clone(),
+            vec![Err("native handshake boom".to_string())],
+            vec![Ok(())],
+        );
+
+        let (client, lease) = establish_pod_mcp(
+            &base_ch,
+            &k8s_ch,
+            tunnels.as_ref(),
+            &connector,
+            "env-1",
+            "svc-1",
+            None,
+            18563,
+            "tok123",
+            &fast_pf_params(),
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        client.shutdown().await;
+        assert!(lease.is_none(), "fallback session has no pf lease");
+
+        let ev = events.lock().await.clone();
+        // 拆隧道：kill pf + tunnels.close（kill 在 close 前）
+        let kill_idx = ev.iter().position(|e| e.starts_with("base:kill 4242")).expect("kill pf");
+        let close_idx = ev
+            .iter()
+            .position(|e| e == "tunnels-close:env-1/127.0.0.1/54321")
+            .expect("close tunnel");
+        assert!(kill_idx < close_idx, "kill must precede close: {ev:?}");
+        // 拆除先于桥握手
+        let bridge_idx = ev
+            .iter()
+            .position(|e| e == "bridge-connect:http://127.0.0.1:18563/mcp")
+            .expect("bridge fallback");
+        assert!(close_idx < bridge_idx, "teardown must precede bridge: {ev:?}");
+    }
+
+    #[tokio::test]
+    async fn test_establish_pod_mcp_tunnel_fail_falls_back_to_bridge() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        // pf 日志一直不出现 Forwarding（快预算内耗尽）→ 隧道建立失败 → 降级桥
+        let mut script = vec![("", 0), ("4242", 0)];
+        for _ in 0..50 {
+            script.push(("", 0));
+        }
+        let base = ScriptedEventChannel::new(events.clone(), "base", script);
+        let base_ch: Arc<dyn ExecChannel> = base;
+        let k8s_ch: Arc<dyn ExecChannel> = ScriptedEventChannel::new(events.clone(), "k8s", vec![]);
+        let tunnels = MockTunnels::new(events.clone(), vec![]); // open 不应被调
+        let connector = ScriptedConnector::new(events.clone(), vec![], vec![Ok(())]);
+
+        let (client, lease) = establish_pod_mcp(
+            &base_ch,
+            &k8s_ch,
+            tunnels.as_ref(),
+            &connector,
+            "env-1",
+            "svc-1",
+            None,
+            18563,
+            "tok123",
+            &fast_pf_params(),
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        client.shutdown().await;
+        assert!(lease.is_none());
+
+        let ev = events.lock().await.clone();
+        assert!(!ev.iter().any(|e| e.starts_with("tunnels-open:")), "open must not be called: {ev:?}");
+        assert!(
+            ev.iter().any(|e| e == "bridge-connect:http://127.0.0.1:18563/mcp"),
+            "ev: {ev:?}"
+        );
+        // 失败路径 pf 已被 kill（清残留）
+        assert!(ev.iter().any(|e| e.starts_with("base:kill 4242")), "ev: {ev:?}");
+    }
+
+    #[tokio::test]
+    async fn test_establish_pod_mcp_both_fail_cleans_partial_attach() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        // 隧道建立失败 + 桥握手失败 → 报错 + cleanup_partial_attach（k8s 通道 stop）
+        let mut script = vec![("", 0), ("4242", 0)];
+        for _ in 0..50 {
+            script.push(("", 0));
+        }
+        let base = ScriptedEventChannel::new(events.clone(), "base", script);
+        let base_ch: Arc<dyn ExecChannel> = base;
+        let k8s_ch: Arc<dyn ExecChannel> = ScriptedEventChannel::new(events.clone(), "k8s", vec![]);
+        let tunnels = MockTunnels::new(events.clone(), vec![]);
+        let connector = ScriptedConnector::new(
+            events.clone(),
+            vec![],
+            vec![Err("bridge handshake boom".to_string())],
+        );
+
+        let err = match establish_pod_mcp(
+            &base_ch,
+            &k8s_ch,
+            tunnels.as_ref(),
+            &connector,
+            "env-1",
+            "svc-1",
+            None,
+            18563,
+            "tok123",
+            &fast_pf_params(),
+            &|_, _| {},
+        )
+        .await
+        {
+            Ok(_) => panic!("both-fail path must return Err"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ManagerError::Attach(_)), "err: {err}");
+        assert!(err.to_string().contains("arthas MCP 握手失败"), "err: {err}");
+
+        let ev = events.lock().await.clone();
+        // cleanup_partial_attach 经 k8s 通道发 stop（/api + token）
+        assert!(
+            ev.iter()
+                .any(|e| e.starts_with("k8s:curl") && e.contains("http://127.0.0.1:18563/api")),
+            "ev: {ev:?}"
+        );
+        assert!(
+            ev.iter().any(|e| e.starts_with("k8s:curl") && e.contains("Bearer tok123")),
+            "ev: {ev:?}"
+        );
+        // pf 已被清理
+        assert!(ev.iter().any(|e| e.starts_with("base:kill 4242")), "ev: {ev:?}");
+    }
+
+    // ── T6 pf 隧道：stop 编排（run_production_stop）──
+
+    fn pf_lease() -> PfLease {
+        PfLease { pf_pid: 4242, host_port: 54321, local_port: 18080 }
+    }
+
+    fn channel_getter(
+        events: EventLog,
+        label: &'static str,
+    ) -> impl Fn() -> Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>> + Sync {
+        let ch: Arc<dyn ExecChannel> = ScriptedEventChannel::new(events, label, vec![]);
+        move || {
+            let ch = ch.clone();
+            Box::pin(async move { Ok(ch) })
+                as Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>>
+        }
+    }
+
+    fn tunnel_stop_fn(
+        events: EventLog,
+        ok: bool,
+    ) -> impl Fn(u16) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Sync {
+        move |port: u16| {
+            let events = events.clone();
+            Box::pin(async move {
+                events.lock().await.push(format!("tunnel-stop:{port}"));
+                if ok {
+                    Ok(())
+                } else {
+                    Err("tunnel dead".to_string())
+                }
+            }) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_stop_tunnel_mode_full_order_no_exec_fallback() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let client = MockArthasClient { events: events.clone() };
+        let tunnels = MockTunnels::new(events.clone(), vec![]);
+        let get_base = channel_getter(events.clone(), "base");
+        let get_target = channel_getter(events.clone(), "target");
+        let tunnel_stop = tunnel_stop_fn(events.clone(), true);
+
+        run_production_stop(
+            &client,
+            tunnels.as_ref(),
+            Some(&pf_lease()),
+            "env-1",
+            Some("svc-1"),
+            18563,
+            "tok123",
+            &tunnel_stop,
+            &get_base,
+            &get_target,
+        )
+        .await;
+
+        let ev = events.lock().await.clone();
+        // 固定顺序：client shutdown → 隧道 stop → kill pf → tunnels.close
+        let p = [
+            ev.iter().position(|e| e == "client-shutdown").expect("shutdown"),
+            ev.iter().position(|e| e == "tunnel-stop:18080").expect("tunnel stop"),
+            ev.iter().position(|e| e.starts_with("base:kill 4242")).expect("kill pf"),
+            ev.iter().position(|e| e == "tunnels-close:env-1/127.0.0.1/54321").expect("close tunnel"),
+        ];
+        assert!(p.windows(2).all(|w| w[0] < w[1]), "order: {ev:?}");
+        // 隧道 stop 成功 → 不走 exec 通道兜底
+        assert!(!ev.iter().any(|e| e.starts_with("target:")), "no exec fallback: {ev:?}");
+    }
+
+    #[tokio::test]
+    async fn test_run_stop_tunnel_stop_fails_falls_back_to_exec() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let client = MockArthasClient { events: events.clone() };
+        let tunnels = MockTunnels::new(events.clone(), vec![]);
+        let get_base = channel_getter(events.clone(), "base");
+        let get_target = channel_getter(events.clone(), "target");
+        let tunnel_stop = tunnel_stop_fn(events.clone(), false);
+
+        run_production_stop(
+            &client,
+            tunnels.as_ref(),
+            Some(&pf_lease()),
+            "env-1",
+            Some("svc-1"),
+            18563,
+            "tok123",
+            &tunnel_stop,
+            &get_base,
+            &get_target,
+        )
+        .await;
+
+        let ev = events.lock().await.clone();
+        // 拆隧道照常（kill + close），随后 exec 通道 curl stop 兜底
+        let p = [
+            ev.iter().position(|e| e == "client-shutdown").expect("shutdown"),
+            ev.iter().position(|e| e == "tunnel-stop:18080").expect("tunnel stop"),
+            ev.iter().position(|e| e.starts_with("base:kill 4242")).expect("kill pf"),
+            ev.iter().position(|e| e == "tunnels-close:env-1/127.0.0.1/54321").expect("close tunnel"),
+            ev.iter().position(|e| e.starts_with("target:curl")).expect("exec fallback stop"),
+        ];
+        assert!(p.windows(2).all(|w| w[0] < w[1]), "order: {ev:?}");
+        let stop_cmd = ev.iter().find(|e| e.starts_with("target:curl")).expect("stop cmd");
+        assert!(stop_cmd.contains("http://127.0.0.1:18563/api"), "cmd: {stop_cmd}");
+        assert!(stop_cmd.contains("Bearer tok123"), "cmd: {stop_cmd}");
+    }
+
+    #[tokio::test]
+    async fn test_run_stop_without_pf_uses_exec_channel_only() {
+        // VM / 桥降级模式（pf=None）：原 T5 行为——只走 exec 通道 stop
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let client = MockArthasClient { events: events.clone() };
+        let tunnels = MockTunnels::new(events.clone(), vec![]);
+        let get_base = channel_getter(events.clone(), "base");
+        let get_target = channel_getter(events.clone(), "target");
+        let tunnel_stop = tunnel_stop_fn(events.clone(), true);
+
+        run_production_stop(
+            &client,
+            tunnels.as_ref(),
+            None,
+            "env-1",
+            None,
+            18563,
+            "tok123",
+            &tunnel_stop,
+            &get_base,
+            &get_target,
+        )
+        .await;
+
+        let ev = events.lock().await.clone();
+        assert!(ev.iter().any(|e| e == "client-shutdown"), "ev: {ev:?}");
+        assert!(ev.iter().any(|e| e.starts_with("target:curl")), "exec stop issued: {ev:?}");
+        // 无 pf：不触隧道段
+        assert!(!ev.iter().any(|e| e.starts_with("tunnel-stop:")), "ev: {ev:?}");
+        assert!(!ev.iter().any(|e| e.starts_with("tunnels-close:")), "ev: {ev:?}");
+        assert!(!ev.iter().any(|e| e.starts_with("base:")), "ev: {ev:?}");
+    }
+
+    #[tokio::test]
+    async fn test_run_stop_base_channel_unavailable_still_closes_tunnel() {
+        // 宿主机通道拿不到（SSH 断）：仍关隧道条目 + exec 兜底；kill pf 失败
+        // 由下次 attach 的 pkill 清残留兜底
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let client = MockArthasClient { events: events.clone() };
+        let tunnels = MockTunnels::new(events.clone(), vec![]);
+        let get_base = || {
+            Box::pin(async { Err("ssh down".to_string()) })
+                as Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>>
+        };
+        let get_target = channel_getter(events.clone(), "target");
+        let tunnel_stop = tunnel_stop_fn(events.clone(), true);
+
+        run_production_stop(
+            &client,
+            tunnels.as_ref(),
+            Some(&pf_lease()),
+            "env-1",
+            Some("svc-1"),
+            18563,
+            "tok123",
+            &tunnel_stop,
+            &get_base,
+            &get_target,
+        )
+        .await;
+
+        let ev = events.lock().await.clone();
+        assert!(
+            ev.iter().any(|e| e == "tunnels-close:env-1/127.0.0.1/54321"),
+            "tunnel must still be closed: {ev:?}"
+        );
+        assert!(ev.iter().any(|e| e.starts_with("target:curl")), "exec fallback: {ev:?}");
+        assert!(!ev.iter().any(|e| e.starts_with("base:kill")), "no kill without base channel: {ev:?}");
     }
 }
