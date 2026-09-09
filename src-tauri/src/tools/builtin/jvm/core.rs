@@ -33,6 +33,31 @@ pub fn error_output(error: &str, message: &str) -> ToolOutput {
     }
 }
 
+/// 环境类型门禁（类型驱动差异逻辑；混合宿主机场景不存在）：
+/// - 容器环境：pod 必填（缺失引导先 k8s_find_pods）
+/// - 虚机环境：拒绝 pod 参数
+pub fn validate_target_type(
+    env: &crate::app::environments::EnvironmentRow,
+    pod: Option<&str>,
+) -> Result<(), String> {
+    match env.transport_type.as_str() {
+        "container" => match pod {
+            Some(_) => Ok(()),
+            None => Err(
+                "该环境是容器环境：请先用 k8s_find_pods 定位 Pod，再带 pod 参数调用本工具。"
+                    .to_string(),
+            ),
+        },
+        "vm" => match pod {
+            None => Ok(()),
+            Some(_) => Err(
+                "该环境是虚机环境：不支持 pod 参数（服务应直接跑在宿主机上）。".to_string(),
+            ),
+        },
+        other => Err(format!("未知环境类型 {other:?}（支持 vm / container）")),
+    }
+}
+
 /// pid 参数校验：必须正整数字符串（拼 shell 的注入面）
 pub fn parse_pid(value: &serde_json::Value) -> Option<u32> {
     let s = value.as_str()?;
@@ -213,6 +238,33 @@ mod tests {
         let artifacts = tmp_dir.join("artifacts");
         std::fs::create_dir_all(&artifacts).unwrap();
         (JvmExecCore { db: db.clone(), exec_pool: exec_pool.clone(), jdk_cache: jdk_cache.clone(), artifacts_dir: artifacts }, db, exec_pool, jdk_cache)
+    }
+
+    fn env_row(transport_type: &str) -> crate::app::environments::EnvironmentRow {
+        crate::app::environments::EnvironmentRow {
+            id: "e1".into(),
+            name: "prod".into(),
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: "opc".into(),
+            auth_type: "password".into(),
+            private_key_path: None,
+            transport_type: transport_type.into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn test_validate_target_type_rules() {
+        // vm：无 pod OK，有 pod 拒绝
+        assert!(validate_target_type(&env_row("vm"), None).is_ok());
+        assert!(validate_target_type(&env_row("vm"), Some("p1")).is_err());
+        // container：有 pod OK，缺 pod 拒绝（引导 k8s_find_pods）
+        assert!(validate_target_type(&env_row("container"), Some("p1")).is_ok());
+        let err = validate_target_type(&env_row("container"), None).unwrap_err();
+        assert!(err.contains("k8s_find_pods"), "err: {err}");
+        // 未知类型拒绝
+        assert!(validate_target_type(&env_row("ssh"), None).is_err());
     }
 
     #[test]

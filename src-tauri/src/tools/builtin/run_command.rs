@@ -202,7 +202,7 @@ pub fn run_command_tool_def(
 ) -> ToolDef {
     ToolDef {
         name: "run_command".to_string(),
-        description: "在目标远程环境上执行一条 shell 命令（登录 shell，PATH 完整）。这是兜底工具：优先使用结构化诊断工具，只有没有专用工具时才用本工具。每次执行都需要用户确认。传 pod 时命令在 Pod 容器内执行（sh -c）。".to_string(),
+        description: "在目标远程环境上执行一条 shell 命令（登录 shell，PATH 完整）。这是兜底工具：优先使用结构化诊断工具，只有没有专用工具时才用本工具。每次执行都需要用户确认。传 pod 时命令在 Pod 容器内执行（sh -c）。容器环境不传 pod 时命令在宿主机执行（可用于 kubectl 排查）。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -220,7 +220,7 @@ pub fn run_command_tool_def(
                 },
                 "pod": {
                     "type": "string",
-                    "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）"
+                    "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持）"
                 },
                 "container": {
                     "type": "string",

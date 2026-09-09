@@ -1,6 +1,6 @@
 //! K8s 服务发现：宿主机 kubectl get pods → Pod 列表（pattern 过滤）。
-//! 判定模型（spec）：不猜环境类型——服务在哪，通道走哪。
-//! kubectl 不存在的环境明确报错，Agent 自然切换 list_processes 路径。
+//! 环境类型驱动门禁（spec）：仅容器环境可用（虚机环境引导 list_processes）。
+//! kubectl 不存在的容器环境明确报错，Agent 自然切换 list_processes 路径。
 
 use crate::tools::builtin::jvm::core::{clamp_or, error_output, resolve_environment, JvmExecCore};
 use crate::tools::category::ToolCategory;
@@ -95,6 +95,17 @@ impl ToolHandler for FindPodsHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
+        // 环境类型门禁：find_pods 是容器环境的服务发现入口（虚机环境引导 list_processes）
+        if env.transport_type != "container" {
+            return error_output(
+                "environment_type_mismatch",
+                &match env.transport_type.as_str() {
+                    "vm" => "该环境是虚机环境：请用 list_processes 定位服务进程。".to_string(),
+                    other => format!("未知环境类型 {other:?}（支持 vm / container）"),
+                },
+            );
+        }
+
         let start = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
@@ -159,7 +170,7 @@ impl ToolHandler for FindPodsHandler {
 pub fn k8s_find_pods_tool_def(core: Arc<JvmExecCore>) -> ToolDef {
     ToolDef {
         name: "k8s_find_pods".to_string(),
-        description: "在 Kubernetes 宿主机上按服务名发现 Pod（kubectl get pods -A + 名称过滤），返回 Pod/命名空间/容器列表/状态/节点。诊断入口：用户说「检查 xx 服务的内存」而环境是 K8s 宿主机时，先用本工具定位 Pod；多实例时向用户确认选哪个。之后的诊断工具传 pod（+container）参数。宿主机与 Pod 内进程可分别用 list_processes（不传/传 pod）排查。".to_string(),
+        description: "容器环境的服务发现入口（虚机环境请用 list_processes）：kubectl get pods -A 按服务名过滤，返回 Pod/命名空间/容器列表/状态/节点。用户说「检查 xx 服务」且环境是容器类型时，先用本工具定位 Pod；多实例时向用户确认选哪个。之后的诊断工具传 pod（+container）参数。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -232,11 +243,11 @@ mod tests {
             async fn is_alive(&self) -> bool { true }
         }
 
-        async fn setup(channel: Arc<dyn ExecChannel>) -> (tempfile::TempDir, Arc<JvmExecCore>) {
+        async fn setup_as(channel: Arc<dyn ExecChannel>, transport: &str) -> (tempfile::TempDir, Arc<JvmExecCore>) {
             let tmp = tempfile::tempdir().unwrap();
             let db = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
-            let env_id = crate::app::env_save::save_environment(
-                &db, None, "prod", "10.0.0.1", 22,
+            let env_id = crate::app::env_save::save_environment_with_transport(
+                &db, None, "prod", "10.0.0.1", 22, transport,
                 vec![crate::app::env_save::CredentialInput {
                     id: None,
                     username: "root".to_string(),
@@ -257,6 +268,25 @@ mod tests {
                 artifacts_dir: artifacts,
             });
             (tmp, core)
+        }
+
+        /// find_pods 是容器环境的发现入口：handler 测试默认建容器环境
+        async fn setup(channel: Arc<dyn ExecChannel>) -> (tempfile::TempDir, Arc<JvmExecCore>) {
+            setup_as(channel, "container").await
+        }
+
+        #[tokio::test]
+        async fn test_vm_env_rejected() {
+            // 虚机环境 → environment_type_mismatch（引导 list_processes）
+            let ch = Arc::new(KubectlChannel { exit_code: 0, stderr: "" });
+            let (tmp, core) = setup_as(ch, "vm").await;
+            let handler = FindPodsHandler { core };
+            let ctx = ToolContext { session_id: "s1".into(), channel: None };
+            let out = handler.execute(serde_json::json!({"environment": "prod"}), &ctx).await;
+            assert!(!out.success, "out: {}", out.data);
+            assert_eq!(out.data["error"], "environment_type_mismatch");
+            assert!(out.data["message"].as_str().unwrap().contains("list_processes"));
+            drop(tmp);
         }
 
         #[tokio::test]
