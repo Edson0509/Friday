@@ -50,6 +50,13 @@ export interface SessionRow {
   archived_at: string | null;
 }
 
+// 字段 snake_case 与 Rust SessionLogExport serde 序列化对齐
+export interface SessionLogsExport {
+  path: string;
+  line_count: number;
+  files_scanned: number;
+}
+
 export type ChatPartType = "text" | "reasoning" | "tool" | "confirm" | "transfer";
 
 export interface ToolCallInfo {

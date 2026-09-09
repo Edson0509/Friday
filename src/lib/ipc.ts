@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { EventPayload, AgentRow, SessionRow, MessageRow, ToolInfo, EnvironmentRow, EnvCredentialRow, TestConnectionResult, CredentialInput, SaveEnvironmentResult, EnvironmentTransport } from "@/lib/types";
+import type { EventPayload, AgentRow, SessionRow, SessionLogsExport, MessageRow, ToolInfo, EnvironmentRow, EnvCredentialRow, TestConnectionResult, CredentialInput, SaveEnvironmentResult, EnvironmentTransport } from "@/lib/types";
 
 export async function sendMessage(sessionId: string | null, message: string): Promise<string> {
   return invoke<string>("send_message_cmd", { sessionId: sessionId, message: message });
@@ -32,6 +32,14 @@ export async function unarchiveSession(sessionId: string): Promise<void> {
 
 export async function deleteSession(sessionId: string): Promise<void> {
   return invoke<void>("delete_session_cmd", { sessionId });
+}
+
+export async function exportSessionLogs(sessionId: string): Promise<SessionLogsExport> {
+  return invoke<SessionLogsExport>("export_session_logs_cmd", { sessionId });
+}
+
+export async function openLogsDir(): Promise<void> {
+  return invoke<void>("open_logs_dir_cmd");
 }
 
 export async function confirmTool(confirmId: string, approved: boolean): Promise<void> {

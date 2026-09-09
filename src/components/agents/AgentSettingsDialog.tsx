@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { X, CircleNotch, Robot, CaretDown } from "@phosphor-icons/react";
+import { X, CircleNotch, Robot, CaretDown, FolderOpen } from "@phosphor-icons/react";
 import { useAgentStore } from "@/store/agentStore";
 import { useSettingsStore } from "@/store/settingsStore";
 import { AgentListItem } from "@/components/agents/AgentListItem";
+import { openLogsDir } from "@/lib/ipc";
 
 interface AgentSettingsDialogProps {
   open: boolean;
@@ -40,6 +41,16 @@ export function AgentSettingsDialog({ open, onClose }: AgentSettingsDialogProps)
 
   const [confirmAutoApprove, setConfirmAutoApprove] = useState(false);
   const [savingAutoApprove, setSavingAutoApprove] = useState(false);
+  const [logsError, setLogsError] = useState<string | null>(null);
+
+  const handleOpenLogsDir = async () => {
+    setLogsError(null);
+    try {
+      await openLogsDir();
+    } catch (e) {
+      setLogsError(String(e));
+    }
+  };
 
   const handleToggleAutoApprove = async (next: boolean) => {
     if (!next) {
@@ -213,6 +224,28 @@ export function AgentSettingsDialog({ open, onClose }: AgentSettingsDialogProps)
             </div>
             {settingsError && (
               <p className="text-xs text-destructive break-words">{settingsError}</p>
+            )}
+          </div>
+        </div>
+
+        {/* Runtime logs */}
+        <div className="border-t border-border shrink-0">
+          <div className="px-5 py-3 space-y-2">
+            <label className="text-sm text-foreground">运行日志</label>
+            <p className="text-xs text-muted-foreground">
+              运行日志按日落盘轮转、保留 7 天；会话日志可在会话列表右键菜单按会话导出
+            </p>
+            <div>
+              <button
+                onClick={handleOpenLogsDir}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-md border border-border bg-surface-2 text-xs text-foreground hover:bg-surface-3 transition-colors cursor-pointer"
+              >
+                <FolderOpen size={14} weight="regular" aria-hidden="true" />
+                打开日志目录
+              </button>
+            </div>
+            {logsError && (
+              <p className="text-xs text-destructive break-words">{logsError}</p>
             )}
           </div>
         </div>

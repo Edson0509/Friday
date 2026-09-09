@@ -331,6 +331,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             app::lifecycle::unarchive_session_cmd,
             app::lifecycle::delete_session_cmd,
             app::lifecycle::get_session_summary_cmd,
+            app::lifecycle::export_session_logs_cmd,
+            app::lifecycle::open_logs_dir_cmd,
             app::lifecycle::list_tools_cmd,
             app::agents::detect_agents_cmd,
             app::agents::list_agents_cmd,
