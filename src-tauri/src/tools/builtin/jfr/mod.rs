@@ -205,7 +205,8 @@ impl JfrRecordHandler {
             }
         };
 
-        // ③ 后台拉回：TransferManager（MCP 同步调用返回，Agent 轮询 transfer_status）
+        // ③ 后台拉回：TransferManager（MCP 同步调用返回，Agent 轮询 transfer_status）。
+        //    pod 目标 state 带 pod/container，worker 专用连接走 K8sChannel 两跳拉回
         let session_dir = artifact_dir_for(&self.core.artifacts_dir, &ctx.session_id);
         let local_path = session_dir.join(format!("recording-{pid}-{ts}.jfr"));
         let state = crate::transfer::state::TransferState::new(
@@ -215,6 +216,8 @@ impl JfrRecordHandler {
             &remote_path,
             local_path.clone(),
             true, // 下载成功后清理远端（Friday 自己生成的文件）
+            pod,
+            container,
         );
         let transfer_id = self.transfer.start(state).await;
 
@@ -751,11 +754,16 @@ mod tests {
         (tmp, reg)
     }
 
-    /// 容器环境 + pod 目标（k8s 复合键通道 + JDK 缓存条目）注册全量 jfr 工具
+    /// 容器环境 + pod 目标（k8s 复合键通道 + JDK 缓存条目）注册全量 jfr 工具。
+    /// 返回 TransferManager 供断言拉回任务 state。
     async fn registry_pod_target(
         channel: Arc<dyn ExecChannel>,
         mock: Arc<MockJmcClient>,
-    ) -> (tempfile::TempDir, ToolRegistry) {
+    ) -> (
+        tempfile::TempDir,
+        ToolRegistry,
+        Arc<crate::transfer::TransferManager>,
+    ) {
         let (tmp, core, transfer) = setup_as(channel.clone(), "container").await;
         let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
         let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None);
@@ -774,10 +782,10 @@ mod tests {
             jmc_manager(mock),
             core,
             EventBus::disabled(),
-            transfer,
+            transfer.clone(),
             tmp.path().join("artifacts"),
         );
-        (tmp, reg)
+        (tmp, reg, transfer)
     }
 
     fn jfr_file(dir: &std::path::Path) -> std::path::PathBuf {
@@ -925,12 +933,13 @@ mod tests {
         drop(tmp);
     }
 
-    /// 容器目标：录制落 POD_DUMP_DIR（coredump 卷），文件名 friday- 前缀。
+    /// 容器目标：录制落 POD_DUMP_DIR（coredump 卷），文件名 friday- 前缀；
+    /// 拉回任务 state 带 pod（worker 专用连接走 K8sChannel 两跳）。
     /// 起搏器说明同 test_record_full_flow_starts_background_download。
     #[tokio::test]
     async fn test_record_pod_target_uses_pod_dump_dir() {
         let ch = std_channel("54321");
-        let (tmp, reg) = registry_pod_target(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        let (tmp, reg, mgr) = registry_pod_target(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
         tokio::time::pause();
         let pacer = spawn_auto_advance_pacer();
         let out = def(&reg, "jfr_record")
@@ -947,6 +956,12 @@ mod tests {
             calls[0].contains("filename=/opt/log/dump/coredump/friday-recording-1234-"),
             "start cmd: {}", calls[0]
         );
+        drop(calls);
+        // 拉回任务带 pod 定位
+        let tid = out.data["transfer_id"].as_str().unwrap();
+        let st = mgr.get(tid).await.unwrap();
+        assert_eq!(st.pod.as_deref(), Some("pod-1"));
+        assert!(st.container.is_none());
         drop(tmp);
     }
 

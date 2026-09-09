@@ -36,6 +36,8 @@ fn resume_offset(part_len: Option<u64>, total: u64) -> u64 {
 pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cancel: CancellationToken) {
     let id = state.id.clone();
     let env_id = state.env_id.clone();
+    let pod = state.pod.clone();
+    let container = state.container.clone();
     let remote_path = state.remote_path.clone();
     let local = state.local_path.clone();
     let cleanup = state.cleanup_remote_on_success;
@@ -45,7 +47,7 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
     let mut attempt: u32 = 0;
     let mut last_err: Option<String> = None;
 
-    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, remote_path = %remote_path, "transfer worker: download starting");
+    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), remote_path = %remote_path, "transfer worker: download starting");
 
     loop {
         if cancel.is_cancelled() {
@@ -79,7 +81,10 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
             }
         }
 
-        let channel = match mgr.dedicated_channel(&env_id).await {
+        let channel = match mgr
+            .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(transfer_id = %id, env_id = %env_id, attempt, error = %e, "transfer: connect failed");
@@ -186,9 +191,17 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
                     mgr.finish(&id, Status::Failed, Some(format!("本地文件落盘失败: {e}")), local_size, total).await;
                     return;
                 }
-                // heap_dump 场景：下载成功后清理远端（失败仅告警）
+                // heap_dump 场景：下载成功后清理远端（失败仅告警）。
+                // pod 目标：新连接同为 K8sChannel，rm 经 kubectl exec 进容器删源文件
                 if cleanup {
-                    let rm = channel_cmd_after_disconnect(&mgr, &env_id, &remote_path).await;
+                    let rm = channel_cmd_after_disconnect(
+                        &mgr,
+                        &env_id,
+                        pod.as_deref(),
+                        container.as_deref(),
+                        &remote_path,
+                    )
+                    .await;
                     if let Err(e) = rm {
                         tracing::warn!(transfer_id = %id, error = %e, "transfer: remote cleanup failed (kept)");
                     }
@@ -200,13 +213,16 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
     }
 }
 
-/// 清理远端文件：再开一条短连接执行 rm（原连接已断开）
+/// 清理远端文件：再开一条短连接执行 rm（原连接已断开）。
+/// pod 目标下 dedicated_channel 构造 K8sChannel，rm 自动变容器内 rm。
 async fn channel_cmd_after_disconnect(
     mgr: &TransferManager,
     env_id: &str,
+    pod: Option<&str>,
+    container: Option<&str>,
     remote_path: &str,
 ) -> Result<(), String> {
-    let channel = mgr.dedicated_channel(env_id).await?;
+    let channel = mgr.dedicated_channel(env_id, pod, container).await?;
     let cmd = format!("rm -f {}", crate::exec::ssh::shell_quote_single(remote_path));
     match channel.run(&cmd).await {
         Err(e) => {
@@ -228,6 +244,8 @@ async fn channel_cmd_after_disconnect(
 pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel: CancellationToken) {
     let id = state.id.clone();
     let env_id = state.env_id.clone();
+    let pod = state.pod.clone();
+    let container = state.container.clone();
     let remote_path = state.remote_path.clone();
     let local = state.local_path.clone();
     let session_id = state.session_id.clone();
@@ -241,7 +259,7 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
     };
     let total = meta.len();
 
-    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, remote_path = %remote_path, total, "transfer worker: upload starting");
+    tracing::info!(transfer_id = %id, session_id = %session_id, env_id = %env_id, pod = pod.as_deref().unwrap_or("-"), remote_path = %remote_path, total, "transfer worker: upload starting");
 
     loop {
         if cancel.is_cancelled() {
@@ -273,7 +291,10 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
             }
         }
 
-        let channel = match mgr.dedicated_channel(&env_id).await {
+        let channel = match mgr
+            .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(transfer_id = %id, env_id = %env_id, attempt, error = %e, "transfer: connect failed");
@@ -315,8 +336,11 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
                 continue;
             }
             Ok(()) => {
-                // 远端大小校验：再开短连接 stat
-                let check = match mgr.dedicated_channel(&env_id).await {
+                // 远端大小校验：再开短连接 stat（pod 目标下 stat 进容器）
+                let check = match mgr
+                    .dedicated_channel(&env_id, pod.as_deref(), container.as_deref())
+                    .await
+                {
                     Ok(c) => {
                         let size = stat_remote(&c, &remote_path).await;
                         c.disconnect().await;
@@ -541,6 +565,8 @@ mod tests {
             "/tmp/a.hprof",
             local,
             false,
+            None,
+            None,
         );
         let id = mgr.start(state).await;
 
@@ -571,6 +597,8 @@ mod tests {
             "/tmp/up.jar",
             local,
             false,
+            None,
+            None,
         );
         let id = mgr.start(state).await;
 

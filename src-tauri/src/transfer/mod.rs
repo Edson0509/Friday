@@ -58,15 +58,21 @@ impl TransferManager {
         self.download_complete_hooks.push(hook);
     }
 
-    /// 后台任务专用连接：优先测试注入工厂，否则真实 SSH 直连（不走 ExecChannelPool）
-    pub(crate) async fn dedicated_channel(&self, env_id: &str) -> Result<Arc<dyn ExecChannel>, String> {
+    /// 后台任务专用连接：优先测试注入工厂，否则真实 SSH 直连（不走 ExecChannelPool）。
+    /// pod=Some 时构造 K8sChannel（两跳：宿主机 staging 中转），stat/rm/download 均进容器。
+    pub(crate) async fn dedicated_channel(
+        &self,
+        env_id: &str,
+        pod: Option<&str>,
+        container: Option<&str>,
+    ) -> Result<Arc<dyn ExecChannel>, String> {
         if let Some(factory) = &self.channel_factory {
             return factory().await;
         }
         let env = crate::exec::pool::fetch_environment(&self.db, env_id)
             .await
             .map_err(|e| e.to_string())?;
-        let channel = crate::exec::pool::build_transport(env_id, &env, None, None)
+        let channel = crate::exec::pool::build_transport(env_id, &env, pod, container)
             .map_err(|e| e.to_string())?;
         channel.connect().await.map_err(|e| e.to_string())?;
         Ok(channel)
@@ -305,6 +311,8 @@ mod tests {
             remote,
             PathBuf::from("/local/a.hprof"),
             false,
+            None,
+            None,
         )
     }
 
@@ -490,5 +498,48 @@ mod tests {
             vec!["mat:/tmp/a.jfr", "jmc:/tmp/a.jfr"],
             "both hooks fire in registration order"
         );
+    }
+
+    /// dedicated_channel：factory 分支优先——注入工厂时无论 pod/container 参数如何都返回工厂产物
+    /// （worker 测试依赖此语义跳过真实建连）。真实分支按 pod 构造 K8sChannel 依赖真实
+    /// SSH + kubectl，不在单测覆盖范围（集成验证）。
+    #[tokio::test]
+    async fn test_dedicated_channel_factory_takes_precedence_over_pod_args() {
+        use async_trait::async_trait;
+        struct MarkerChannel;
+        #[async_trait]
+        impl crate::exec::channel::ExecChannel for MarkerChannel {
+            async fn run(
+                &self,
+                _cmd: &str,
+            ) -> Result<crate::exec::channel::ExecOutput, Box<dyn std::error::Error + Send + Sync>>
+            {
+                unreachable!("marker channel only asserts identity")
+            }
+            async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+            async fn is_alive(&self) -> bool {
+                true
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::infra::db::init(tmp.path().join("t.db")).await.unwrap();
+        let mut mgr = TransferManager::new(db, EventBus::disabled());
+        let marker: Arc<dyn crate::exec::channel::ExecChannel> = Arc::new(MarkerChannel);
+        let m = marker.clone();
+        mgr.set_channel_factory(Arc::new(move || {
+            let m = m.clone();
+            Box::pin(async move { Ok(m.clone()) })
+        }));
+        // pod/container 有无不影响 factory 分支返回
+        let ch = mgr
+            .dedicated_channel("env-1", Some("pod-1"), Some("main"))
+            .await
+            .unwrap();
+        assert!(ch.is_alive().await);
+        let ch2 = mgr.dedicated_channel("env-1", None, None).await.unwrap();
+        assert!(ch2.is_alive().await);
     }
 }
