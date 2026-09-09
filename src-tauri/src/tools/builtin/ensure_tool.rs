@@ -61,7 +61,7 @@ impl ToolHandler for EnsureToolHandler {
         // 获取 channel
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, pod, container, &self.db).await {
+            match pool.get_or_create(&env.id, pod, None, container, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "ensure_tool: failed to get exec channel");
@@ -98,7 +98,7 @@ impl ToolHandler for EnsureToolHandler {
         // (env_id, pod, container) 串行化：并发请求排队，后者进锁后 ensure 会重新查远端缓存。
         // lock_key 与池键、JdkCache 键同源（TargetKey::from_parts 归一化 + cache_key），
         // 避免手写第三套键格式导致键空间错位（如 container-without-pod 与裸调用撞池键却各持不同锁）。
-        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
         let lock_key = crate::tools::builtin::jvm::jdk_cache::cache_key(&target);
         let per_key = {
             let mut inflight = self.inflight.lock().await;
@@ -342,7 +342,7 @@ mod tests {
         let env_id = crate::app::environments::find_by_name(&db, "prod").await.unwrap().unwrap().id;
         // 注入 k8s 目标通道（probe ok / musl 无 / native 命中）
         exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
             Arc::new(K8sNativeChannel) as Arc<dyn ExecChannel>,
         ).await;
         let jdk_cache = Arc::new(crate::tools::builtin::jvm::jdk_cache::JdkCache::new());
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(out.data["tool_home"], crate::exec::k8s::POD_TOOLS_DIR);
         // 复合键写入（env|pod=..）
         let layout = jdk_cache
-            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None)))
+            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None)))
             .await
             .expect("composite cache key must be populated");
         assert_eq!(layout.bins["jcmd"], "/usr/bin/jcmd");

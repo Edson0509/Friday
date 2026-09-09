@@ -75,7 +75,7 @@ impl ToolHandler for RunCommandHandler {
         // 获取或建连
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, pod, container, &self.db).await {
+            match pool.get_or_create(&env.id, pod, None, container, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "run_command: failed to get exec channel");
@@ -98,7 +98,7 @@ impl ToolHandler for RunCommandHandler {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "run_command timed out, dropping connection to terminate remote process");
                 // 断开连接以终止远端进程（russh channel 无 Drop impl，仅取消 future 不会杀远端进程）
                 // + k8s 目标容器内补刀（VM no-op）
-                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
                 crate::exec::pool::drop_target_and_kill(&self.exec_pool, &self.db, &target, command).await;
                 ToolOutput {
                     success: false,

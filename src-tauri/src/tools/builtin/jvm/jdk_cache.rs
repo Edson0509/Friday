@@ -97,11 +97,11 @@ mod tests {
     fn test_cache_key_composite_for_k8s() {
         use crate::exec::pool::TargetKey;
         assert_eq!(cache_key(&TargetKey::base("e1")), "e1");
-        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None)), "e1|pod=p1|ctr=-");
-        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", Some("c1"))), "e1|pod=p1|ctr=c1");
-        // from_parts 归一：空串视为未传；container without pod 归一到 base key
-        assert_eq!(cache_key(&TargetKey::from_parts("e1", Some(""), None)), "e1");
-        assert_eq!(cache_key(&TargetKey::from_parts("e1", None, Some("c1"))), "e1");
+        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None, None)), "e1|pod=p1|ctr=-");
+        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None, Some("c1"))), "e1|pod=p1|ctr=c1");
+        // from_parts 归一：空串视为未传；container/namespace without pod 归一到 base key
+        assert_eq!(cache_key(&TargetKey::from_parts("e1", Some(""), None, None)), "e1");
+        assert_eq!(cache_key(&TargetKey::from_parts("e1", None, None, Some("c1"))), "e1");
     }
 
     #[tokio::test]

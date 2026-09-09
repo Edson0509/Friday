@@ -19,17 +19,27 @@ pub const POD_DUMP_DIR: &str = "/opt/log/dump/coredump";
 /// 文件属组要求：非 ossgroup 无法被目标 JVM 用户使用（用户约束，exec 用户 = ossadm 非 root）
 pub const OSS_GROUP: &str = "ossgroup";
 
+/// kubectl exec 的 -n/-c 标志段（带尾空格；均缺省时为空）。
+/// -n 在 -c 前：`kubectl exec -n 'ns' -c 'ctr' 'pod' -- ...`
+fn kubectl_flags(namespace: Option<&str>, container: Option<&str>) -> String {
+    let mut flags = String::new();
+    if let Some(ns) = namespace {
+        flags.push_str(&format!("-n {} ", shell_quote_single(ns)));
+    }
+    if let Some(c) = container {
+        flags.push_str(&format!("-c {} ", shell_quote_single(c)));
+    }
+    flags
+}
+
 /// 构造 `kubectl exec ... -- sh -c ...`（纯函数）。
-/// container 缺省时省略 -c（kubectl 默认容器 = spec 第一个容器）。
+/// namespace/container 缺省时省略 -n/-c（kubectl 默认 = kubeconfig context ns /
+/// spec 第一个容器）。
 /// 整条命令会再经 SshTransport 的 bash -lc 包装，内嵌单引号由 shell_quote_single 转义。
-pub fn wrap_exec_command(pod: &str, container: Option<&str>, cmd: &str) -> String {
-    let ctr = match container {
-        Some(c) => format!("-c {} ", shell_quote_single(c)),
-        None => String::new(),
-    };
+pub fn wrap_exec_command(pod: &str, namespace: Option<&str>, container: Option<&str>, cmd: &str) -> String {
     format!(
         "kubectl exec {}{} -- sh -c {}",
-        ctr,
+        kubectl_flags(namespace, container),
         shell_quote_single(pod),
         shell_quote_single(cmd)
     )
@@ -75,23 +85,23 @@ pub fn validate_pod_path(path: &str) -> Result<(), String> {
 pub struct K8sChannel {
     pub base: Arc<dyn ExecChannel>,
     pub pod: String,
+    /// k8s namespace（kubectl exec 显式 -n；None 时省略——过渡兼容，NS-T2 后容器目标必有）
+    pub namespace: Option<String>,
     pub container: Option<String>,
 }
 
 impl K8sChannel {
-    pub fn ctr_flag(&self) -> String {
-        match &self.container {
-            Some(c) => format!("-c {} ", shell_quote_single(c)),
-            None => String::new(),
-        }
+    /// kubectl exec 前缀标志段（-n/-c），run/upload/download 共用保证一致
+    pub fn kubectl_flags(&self) -> String {
+        kubectl_flags(self.namespace.as_deref(), self.container.as_deref())
     }
 }
 
 #[async_trait]
 impl ExecChannel for K8sChannel {
     async fn run(&self, cmd: &str) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
-        let wrapped = wrap_exec_command(&self.pod, self.container.as_deref(), cmd);
-        tracing::debug!(pod = %self.pod, container = self.container.as_deref().unwrap_or("-"), "k8s exec");
+        let wrapped = wrap_exec_command(&self.pod, self.namespace.as_deref(), self.container.as_deref(), cmd);
+        tracing::debug!(pod = %self.pod, namespace = self.namespace.as_deref().unwrap_or("-"), container = self.container.as_deref().unwrap_or("-"), "k8s exec");
         self.base.run(&wrapped).await
     }
 
@@ -142,7 +152,7 @@ impl ExecChannel for K8sChannel {
         );
         let host_cmd = format!(
             "kubectl exec -i {}{} -- sh -c {} < {}",
-            self.ctr_flag(),
+            self.kubectl_flags(),
             shell_quote_single(&self.pod),
             shell_quote_single(&inner),
             shell_quote_single(&staging)
@@ -222,7 +232,7 @@ impl ExecChannel for K8sChannel {
         //    瓶颈腿，可接受。重试时 leg1 整段重跑（宿主机本地，快）。
         let host_cmd = format!(
             "kubectl exec {}{} -- cat {} > {}",
-            self.ctr_flag(),
+            self.kubectl_flags(),
             shell_quote_single(&self.pod),
             q,
             staging_q,
@@ -290,7 +300,7 @@ mod tests {
     #[test]
     fn test_wrap_exec_command_without_container() {
         assert_eq!(
-            wrap_exec_command("svc-abc", None, "jstat -gcutil 1"),
+            wrap_exec_command("svc-abc", None, None, "jstat -gcutil 1"),
             "kubectl exec 'svc-abc' -- sh -c 'jstat -gcutil 1'"
         );
     }
@@ -298,14 +308,30 @@ mod tests {
     #[test]
     fn test_wrap_exec_command_with_container() {
         assert_eq!(
-            wrap_exec_command("svc-abc", Some("main"), "ps -ef"),
+            wrap_exec_command("svc-abc", None, Some("main"), "ps -ef"),
             "kubectl exec -c 'main' 'svc-abc' -- sh -c 'ps -ef'"
         );
     }
 
     #[test]
+    fn test_wrap_exec_command_with_namespace() {
+        assert_eq!(
+            wrap_exec_command("svc-abc", Some("ns1"), None, "jstat -gcutil 1"),
+            "kubectl exec -n 'ns1' 'svc-abc' -- sh -c 'jstat -gcutil 1'"
+        );
+    }
+
+    #[test]
+    fn test_wrap_exec_command_namespace_before_container() {
+        assert_eq!(
+            wrap_exec_command("svc-abc", Some("ns1"), Some("main"), "ps -ef"),
+            "kubectl exec -n 'ns1' -c 'main' 'svc-abc' -- sh -c 'ps -ef'"
+        );
+    }
+
+    #[test]
     fn test_wrap_exec_command_escapes_inner_quotes() {
-        let wrapped = wrap_exec_command("p", None, "grep 'x' /log/a");
+        let wrapped = wrap_exec_command("p", None, None, "grep 'x' /log/a");
         assert!(wrapped.contains(r"-- sh -c 'grep '\''x'\'' /log/a'"), "got: {wrapped}");
     }
 
@@ -353,7 +379,7 @@ mod tests {
         #[tokio::test]
         async fn test_run_delegates_wrapped_command_to_base() {
             let base = Arc::new(RecordingBase { runs: tokio::sync::Mutex::new(Vec::new()) });
-            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), container: None };
+            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), namespace: None, container: None };
             ch.run("jstat -gcutil 7").await.unwrap();
             let runs = base.runs.lock().await;
             assert_eq!(runs[0], "kubectl exec 'svc-1' -- sh -c 'jstat -gcutil 7'");
@@ -362,10 +388,24 @@ mod tests {
         #[tokio::test]
         async fn test_run_with_container_flag() {
             let base = Arc::new(RecordingBase { runs: tokio::sync::Mutex::new(Vec::new()) });
-            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), container: Some("main".into()) };
+            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), namespace: None, container: Some("main".into()) };
             ch.run("ps -ef").await.unwrap();
             let runs = base.runs.lock().await;
             assert_eq!(runs[0], "kubectl exec -c 'main' 'svc-1' -- sh -c 'ps -ef'");
+        }
+
+        #[tokio::test]
+        async fn test_run_with_namespace_flag() {
+            let base = Arc::new(RecordingBase { runs: tokio::sync::Mutex::new(Vec::new()) });
+            let ch = K8sChannel {
+                base: base.clone(),
+                pod: "svc-1".into(),
+                namespace: Some("ns1".into()),
+                container: Some("main".into()),
+            };
+            ch.run("ps -ef").await.unwrap();
+            let runs = base.runs.lock().await;
+            assert_eq!(runs[0], "kubectl exec -n 'ns1' -c 'main' 'svc-1' -- sh -c 'ps -ef'");
         }
     }
 
@@ -418,8 +458,17 @@ mod tests {
         }
 
         fn chan(script: Vec<(&str, i32)>) -> (Arc<ScriptedBase>, K8sChannel) {
+            chan_with_namespace(script, Some("ns1"))
+        }
+
+        fn chan_with_namespace(script: Vec<(&str, i32)>, namespace: Option<&str>) -> (Arc<ScriptedBase>, K8sChannel) {
             let base = Arc::new(ScriptedBase::new(script));
-            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), container: None };
+            let ch = K8sChannel {
+                base: base.clone(),
+                pod: "svc-1".into(),
+                namespace: namespace.map(|s| s.to_string()),
+                container: None,
+            };
             (base, ch)
         }
 
@@ -434,18 +483,30 @@ mod tests {
             assert_eq!(uploads.len(), 1);
             assert!(uploads[0].1.starts_with("/tmp/friday-tools/staging/"), "staging: {}", uploads[0].1);
             assert!(uploads[0].1.ends_with("-jdk.tar.gz"));
-            // leg B：kubectl exec -i + host 侧重定向 + 父目录创建
+            // leg B：kubectl exec -i（-n 在 pod 前）+ host 侧重定向 + 父目录创建
             let runs = base.runs.lock().await;
             let host_leg = runs.iter().find(|c| c.contains("kubectl exec -i")).expect("host leg");
+            assert!(host_leg.starts_with("kubectl exec -i -n 'ns1' 'svc-1' -- sh -c "), "host leg ns flag: {host_leg}");
             assert!(host_leg.contains("< "), "host stdin redirect: {host_leg}");
             assert!(host_leg.contains(r"cat > '\''/opt/log/dump/coredump/friday-tools/jdk.tar.gz'\''"), "{host_leg}");
             assert!(host_leg.contains(r"mkdir -p '\''/opt/log/dump/coredump/friday-tools'\''"), "{host_leg}");
-            // 属组修正走 kubectl exec（容器内，不是宿主机）
+            // 属组修正走 kubectl exec（容器内，不是宿主机），同样带 -n
             let chgrp = runs.iter().find(|c| c.contains("chgrp ossgroup")).expect("chgrp leg");
-            assert!(chgrp.contains("kubectl exec"), "chgrp must run inside pod: {chgrp}");
+            assert!(chgrp.starts_with("kubectl exec -n 'ns1' 'svc-1' -- sh -c "), "chgrp must run inside pod with ns: {chgrp}");
             assert!(chgrp.contains("chmod g+r"));
             // staging 清理
             assert!(runs.iter().any(|c| c.contains("rm -f '/tmp/friday-tools/staging/")));
+        }
+
+        #[tokio::test]
+        async fn test_upload_without_namespace_omits_flag() {
+            let (base, ch) = chan_with_namespace(vec![], None);
+            ch.upload(Path::new("/local/x"), "/opt/log/dump/coredump/friday-tools/x")
+                .await
+                .unwrap();
+            let runs = base.runs.lock().await;
+            let host_leg = runs.iter().find(|c| c.contains("kubectl exec -i")).expect("host leg");
+            assert!(host_leg.starts_with("kubectl exec -i 'svc-1' -- sh -c "), "no -n when namespace absent: {host_leg}");
         }
 
         #[tokio::test]
@@ -536,8 +597,17 @@ mod tests {
         }
 
         fn chan(script: Vec<(&str, i32)>) -> (Arc<ScriptedBase>, K8sChannel) {
+            chan_with_namespace(script, Some("ns1"))
+        }
+
+        fn chan_with_namespace(script: Vec<(&str, i32)>, namespace: Option<&str>) -> (Arc<ScriptedBase>, K8sChannel) {
             let base = Arc::new(ScriptedBase::new(script));
-            let ch = K8sChannel { base: base.clone(), pod: "svc-1".into(), container: None };
+            let ch = K8sChannel {
+                base: base.clone(),
+                pod: "svc-1".into(),
+                namespace: namespace.map(|s| s.to_string()),
+                container: None,
+            };
             (base, ch)
         }
 
@@ -552,12 +622,12 @@ mod tests {
                 .await
                 .unwrap();
             let runs = base.runs.lock().await;
-            // ① 容器内 stat（经 wrap_exec_command，sh -c 包裹 + 单引号转义）
-            assert!(runs[0].contains("kubectl exec"), "stat leg: {}", runs[0]);
+            // ① 容器内 stat（经 wrap_exec_command，-n + sh -c 包裹 + 单引号转义）
+            assert!(runs[0].starts_with("kubectl exec -n 'ns1' 'svc-1' -- sh -c "), "stat leg: {}", runs[0]);
             assert!(runs[0].contains(r"stat -c %s '\''/opt/log/dump/coredump/dump.hprof'\''"), "stat leg: {}", runs[0]);
-            // ② leg1：kubectl exec cat '路径' > 'staging路径'（重定向在宿主机侧）
+            // ② leg1：kubectl exec -n 'ns' 'pod' -- cat '路径' > 'staging路径'（重定向在宿主机侧）
             let leg1 = runs.iter().find(|c| c.contains(" -- cat ")).expect("leg 1 host cmd");
-            assert!(leg1.starts_with("kubectl exec 'svc-1' -- cat "), "leg1: {leg1}");
+            assert!(leg1.starts_with("kubectl exec -n 'ns1' 'svc-1' -- cat "), "leg1: {leg1}");
             assert!(leg1.contains(r"cat '/opt/log/dump/coredump/dump.hprof'"), "leg1: {leg1}");
             assert!(leg1.contains("> '/tmp/friday-tools/staging/"), "leg1 host redirect: {leg1}");
             assert!(leg1.ends_with("-dump.hprof'"), "leg1 staging basename: {leg1}");
@@ -572,6 +642,19 @@ mod tests {
             assert_eq!(std::fs::metadata(&local).unwrap().len(), 1024);
             // ④ staging 清理
             assert!(runs.iter().any(|c| c.contains("rm -f '/tmp/friday-tools/staging/")), "staging cleanup: {runs:?}");
+        }
+
+        #[tokio::test]
+        async fn test_download_without_namespace_omits_flag() {
+            let (base, ch) = chan_with_namespace(vec![("16", 0), ("", 0), ("", 0)], None);
+            base.download_sizes.lock().unwrap().push_back(16);
+            let tmp = tempfile::tempdir().unwrap();
+            ch.download("/opt/log/dump/coredump/d.hprof", &tmp.path().join("d.hprof"), 0, &|_, _| {})
+                .await
+                .unwrap();
+            let runs = base.runs.lock().await;
+            let leg1 = runs.iter().find(|c| c.contains(" -- cat ")).expect("leg 1 host cmd");
+            assert!(leg1.starts_with("kubectl exec 'svc-1' -- cat "), "no -n when namespace absent: {leg1}");
         }
 
         #[tokio::test]

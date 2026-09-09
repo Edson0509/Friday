@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 /// 环境名 → env 记录 + channel（run_command / ensure_tool 同款语义，提取共享）。
 /// pod/container：k8s 目标定位（None = 宿主机 VM 模式）。
+/// namespace：NS-T1 通道层已贯通，工具参数尚未携带（NS-T2 接入），先传 None。
 /// Ok(None) = 环境不存在（调用方引导 list_environments）。
 pub async fn resolve_environment(
     db: &sqlx::SqlitePool,
@@ -20,7 +21,7 @@ pub async fn resolve_environment(
     };
     let channel = {
         let mut pool = exec_pool.lock().await;
-        pool.get_or_create(&env.id, pod, container, db).await.map_err(|e| e.to_string())?
+        pool.get_or_create(&env.id, pod, None, container, db).await.map_err(|e| e.to_string())?
     };
     Ok(Some((env, channel)))
 }

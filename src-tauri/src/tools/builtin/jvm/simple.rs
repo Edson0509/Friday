@@ -72,7 +72,7 @@ impl ToolHandler for JvmSimpleHandler {
             return error_output("environment_type_mismatch", &msg);
         }
 
-        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
 
         // JDK 路径：查缓存，miss 引导 ensure_tool
         let Some(layout) = self.core.jdk_cache
@@ -384,7 +384,7 @@ mod tests {
         // 虚机环境 + pod 参数 → environment_type_mismatch（类型门禁）
         let (tmp, core, env_id) = setup().await;
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
             Arc::new(OkChannel),
         ).await;
         let handler =
@@ -402,7 +402,7 @@ mod tests {
         // Agent 把用户口中的服务名（含大写）直接当 pod 名 → 防呆拦截
         let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "SNMPAgentService", None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "SNMPAgentService", None, None),
             Arc::new(OkChannel),
         ).await;
         let handler =
@@ -422,17 +422,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_pod_target_uses_composite_cache_and_k8s_channel() {
-        // k8s 目标：注入 TargetKey::k8s(env,"pod-1",None) 通道 + 复合键 cache 条目
+        // k8s 目标：注入 TargetKey::k8s(env,"pod-1",ns=None) 通道 + 复合键 cache 条目
         let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
             Arc::new(OkChannel),
         ).await;
         let mut bins = HashMap::new();
         bins.insert("jstat".to_string(), "/opt/friday-tools/jdk/bin/jstat".to_string());
         core.jdk_cache
             .set(
-                &crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None)),
+                &crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None)),
                 JdkLayout { tool_home: "/opt/friday-tools/jdk".into(), bins },
             )
             .await;
@@ -456,7 +456,7 @@ mod tests {
         // 只有 VM cache 条目（env_id 裸键）时带 pod 调用 → jdk_not_provisioned（键隔离）
         let (tmp, core, env_id) = setup_as("container").await;
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
             Arc::new(OkChannel),
         ).await;
         // setup() 已写入 VM 裸键条目；不再写复合键

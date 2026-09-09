@@ -98,7 +98,7 @@ impl JfrRecordHandler {
             return error_output("environment_type_mismatch", &msg);
         }
 
-        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
 
         // JDK 路径：查缓存，miss 引导 ensure_tool
         let Some(layout) = self
@@ -728,7 +728,7 @@ mod tests {
     ) {
         let (tmp, core, transfer) = setup_as(channel.clone(), "container").await;
         let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
-        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None);
+        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None);
         core.exec_pool.lock().await.insert_channel(target.clone(), channel).await;
         let mut bins = HashMap::new();
         bins.insert("jcmd".to_string(), "/opt/log/dump/coredump/friday-tools/jdk/bin/jcmd".to_string());

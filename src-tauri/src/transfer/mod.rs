@@ -72,7 +72,8 @@ impl TransferManager {
         let env = crate::exec::pool::fetch_environment(&self.db, env_id)
             .await
             .map_err(|e| e.to_string())?;
-        let channel = crate::exec::pool::build_transport(env_id, &env, pod, container)
+        // namespace 先传 None：TransferState 尚无 namespace 字段（NS-T2 工具层接入）
+        let channel = crate::exec::pool::build_transport(env_id, &env, pod, None, container)
             .map_err(|e| e.to_string())?;
         channel.connect().await.map_err(|e| e.to_string())?;
         Ok(channel)

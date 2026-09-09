@@ -117,7 +117,7 @@ impl ToolHandler for FindPodsHandler {
         match result {
             Err(_) => {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "k8s_find_pods timed out, dropping connection");
-                let target = crate::exec::pool::TargetKey::from_parts(&env.id, None, None);
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, None, None, None);
                 crate::exec::pool::drop_target_and_kill(&self.core.exec_pool, &self.core.db, &target, KUBECTL_GET_PODS).await;
                 error_output("timeout_error", &format!("command timed out after {timeout_secs}s"))
             }
@@ -340,7 +340,7 @@ mod tests {
             // base 通道挂起（kubectl get pods 无响应）+ k8s 目标通道正常（并发容器诊断）
             let (tmp, core) = setup(Arc::new(HangingChannel)).await;
             let env = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap();
-            let k8s_key = crate::exec::pool::TargetKey::k8s(&env.id, "pod-a", None);
+            let k8s_key = crate::exec::pool::TargetKey::k8s(&env.id, "pod-a", None, None);
             core.exec_pool
                 .lock()
                 .await

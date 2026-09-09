@@ -266,7 +266,7 @@ impl ServerHandler for FridayMcpServer {
                         }
                     };
                 let mut exec_pool = self.exec_pool.lock().await;
-                match exec_pool.get_or_create(&env_row.id, None, None, &self.pool).await {
+                match exec_pool.get_or_create(&env_row.id, None, None, None, &self.pool).await {
                     Ok(ch) => Some(ch),
                     Err(e) => {
                         tracing::error!(session_id = %session_id, tool = %tool_name, error = %e, "failed to get exec channel");

@@ -71,7 +71,7 @@ impl ToolHandler for ListProcessesHandler {
         match result {
             Err(_) => {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "list_processes timed out, dropping connection");
-                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, None, container);
                 crate::exec::pool::drop_target_and_kill(&self.core.exec_pool, &self.core.db, &target, &command).await;
                 error_output("timeout_error", &format!("command timed out after {timeout_secs}s"))
             }
@@ -279,7 +279,7 @@ mod tests {
         let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
         // 预注入 k8s 目标通道：让 resolve 成功，证明拦截来自门禁而非连接层
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
             ch,
         ).await;
         let handler = ListProcessesHandler { core };
@@ -300,10 +300,11 @@ mod tests {
         let (tmp, core) = setup_as(ch.clone(), "container").await;
         let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
         core.exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None, None),
             Arc::new(crate::exec::k8s::K8sChannel {
                 base: ch.clone(),
                 pod: "pod-1".to_string(),
+                namespace: None,
                 container: None,
             }),
         ).await;

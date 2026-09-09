@@ -862,7 +862,8 @@ async fn get_target_channel_raw(
     container: Option<&str>,
 ) -> Result<Arc<dyn ExecChannel>, ManagerError> {
     let mut pool = exec_pool.lock().await;
-    pool.get_or_create(env_id, pod, container, db)
+    // namespace 先传 None（NS-T3 arthas 链接入真实值）
+    pool.get_or_create(env_id, pod, None, container, db)
         .await
         .map_err(|e| ManagerError::Attach(format!("SSH 连接失败: {e}")))
 }
@@ -909,6 +910,7 @@ async fn resolve_attach_java(
     let target = crate::exec::pool::TargetKey::from_parts(
         &req.env_id,
         req.pod.as_deref(),
+        None,
         req.container.as_deref(),
     );
     let cache_key = crate::tools::builtin::jvm::jdk_cache::cache_key(&target);
@@ -1677,6 +1679,7 @@ mod tests {
         let k8s: Arc<dyn ExecChannel> = Arc::new(K8sChannel {
             base: inner.clone(),
             pod: "svc-1".into(),
+            namespace: None,
             container: None,
         });
         (inner, k8s)
