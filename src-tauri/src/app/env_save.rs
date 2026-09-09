@@ -109,14 +109,20 @@ fn bound_key_path<'a>(auth_type: &str, path: Option<&'a str>) -> Option<&'a str>
 }
 
 /// 原子保存环境 + 全量凭证（新增 + 编辑统一入口）
-pub async fn save_environment(
+pub async fn save_environment_with_transport(
     pool: &SqlitePool,
     environment_id: Option<&str>,
     name: &str,
     host: &str,
     port: u16,
+    transport_type: &str,
     credentials: Vec<CredentialInput>,
 ) -> Result<SaveOutcome, SaveError> {
+    if !matches!(transport_type, "ssh" | "k8s") {
+        return Err(SaveError::Validation(format!(
+            "transport_type 必须是 ssh 或 k8s：{transport_type:?}"
+        )));
+    }
     // 环境级校验：名称/host 非空
     if name.trim().is_empty() || host.trim().is_empty() {
         return Err(SaveError::Validation("名称 / 主机不能为空".to_string()));
@@ -180,13 +186,14 @@ pub async fn save_environment(
         // 新增：环境行 + 默认凭证镜像
         sqlx::query(
             "INSERT INTO environments (id, name, host, port, user, transport_type, auth_type, private_key_path, created_at) \
-             VALUES (?, ?, ?, ?, ?, 'ssh', ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&env_id)
         .bind(name.trim())
         .bind(host.trim())
         .bind(port as i64)
         .bind(def.username.trim())
+        .bind(transport_type)
         .bind(&def.auth_type)
         .bind(bound_key_path(&def.auth_type, def.private_key_path.as_deref()))
         .bind(&now)
@@ -195,12 +202,13 @@ pub async fn save_environment(
     } else {
         // 编辑：环境行基本信息 + 默认凭证镜像
         let updated = sqlx::query(
-            "UPDATE environments SET name = ?, host = ?, port = ?, user = ?, auth_type = ?, private_key_path = ? WHERE id = ?",
+            "UPDATE environments SET name = ?, host = ?, port = ?, user = ?, transport_type = ?, auth_type = ?, private_key_path = ? WHERE id = ?",
         )
         .bind(name.trim())
         .bind(host.trim())
         .bind(port as i64)
         .bind(def.username.trim())
+        .bind(transport_type)
         .bind(&def.auth_type)
         .bind(bound_key_path(&def.auth_type, def.private_key_path.as_deref()))
         .bind(&env_id)
@@ -316,6 +324,20 @@ pub async fn save_environment(
     })
 }
 
+/// 兼容入口：transport_type 默认 ssh（既有调用方与测试不变）。
+/// 调用方全在 #[cfg(test)]，非测试构建下显式豁免 dead_code 警告。
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn save_environment(
+    pool: &SqlitePool,
+    environment_id: Option<&str>,
+    name: &str,
+    host: &str,
+    port: u16,
+    credentials: Vec<CredentialInput>,
+) -> Result<SaveOutcome, SaveError> {
+    save_environment_with_transport(pool, environment_id, name, host, port, "ssh", credentials).await
+}
+
 /// 事务提交后执行 keychain 操作；任一失败时补偿已写条目并回滚 DB。
 /// 顺序：先执行全部 Write，再执行全部 Delete——
 /// Write 是易失败操作（keychain 不可用/被锁），若先 Delete 后 Write，
@@ -421,6 +443,7 @@ pub struct SaveEnvironmentParams {
     pub name: String,
     pub host: String,
     pub port: Option<u16>,
+    pub transport_type: Option<String>,
     pub credentials: Vec<CredentialInput>,
 }
 
@@ -437,12 +460,13 @@ pub async fn save_environment_cmd(
     state: tauri::State<'_, crate::AppState>,
     params: SaveEnvironmentParams,
 ) -> Result<SaveEnvironmentResult, String> {
-    let outcome = save_environment(
+    let outcome = save_environment_with_transport(
         &state.db,
         params.environment_id.as_deref(),
         params.name.trim(),
         params.host.trim(),
         params.port.unwrap_or(22),
+        params.transport_type.as_deref().unwrap_or("ssh"),
         params.credentials,
     )
     .await
@@ -727,5 +751,42 @@ mod tests {
 
         let row = saved.credentials.iter().find(|c| c.id == opc.id).unwrap();
         assert_eq!(row.private_key_path.as_deref(), Some("~/.ssh/new"));
+    }
+
+    // ── transport_type 存取（ssh | k8s）──
+
+    #[tokio::test]
+    async fn test_save_with_transport_type_k8s_roundtrip() {
+        let (_tmp, pool) = setup().await;
+        let outcome = save_environment_with_transport(
+            &pool, None, "prod-k8s", "10.0.0.2", 22, "k8s",
+            vec![cred("opc", true)],
+        ).await.unwrap();
+        assert_eq!(outcome.environment.transport_type, "k8s");
+        // 默认路径（旧 wrapper）仍是 ssh
+        let vm = save_environment(&pool, None, "prod-vm", "10.0.0.3", 22, vec![cred("opc", true)]).await.unwrap();
+        assert_eq!(vm.environment.transport_type, "ssh");
+    }
+
+    #[tokio::test]
+    async fn test_save_rejects_invalid_transport_type() {
+        let (_tmp, pool) = setup().await;
+        let err = save_environment_with_transport(
+            &pool, None, "x", "10.0.0.1", 22, "docker",
+            vec![cred("opc", true)],
+        ).await.unwrap_err();
+        assert!(matches!(err, SaveError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_edit_updates_transport_type() {
+        let (_tmp, pool) = setup().await;
+        let first = save_environment(&pool, None, "prod", "10.0.0.1", 22, vec![cred("opc", true)]).await.unwrap();
+        let env_id = first.environment.id;
+        let second = save_environment_with_transport(
+            &pool, Some(&env_id), "prod", "10.0.0.1", 22, "k8s",
+            vec![cred("opc", true)],
+        ).await.unwrap();
+        assert_eq!(second.environment.transport_type, "k8s");
     }
 }

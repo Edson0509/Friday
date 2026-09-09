@@ -11,6 +11,7 @@ import {
   Terminal,
   ArrowsLeftRight,
   Gear,
+  Stack,
 } from "@phosphor-icons/react";
 import type { Icon } from "@phosphor-icons/react";
 import { listTools } from "@/lib/ipc";
@@ -22,10 +23,11 @@ const RISK_LABELS: Record<string, { label: string; className: string }> = {
   high: { label: "高", className: "bg-destructive/10 text-destructive border-destructive/20" },
 };
 
-// 分组展示顺序沿诊断流程：定位环境/进程 → JVM 基础诊断 → 堆分析 → JFR 飞行记录 → Arthas → 文件传输 → 通用
+// 分组展示顺序沿诊断流程：定位环境/进程 → K8s Pod 发现 → JVM 基础诊断 → 堆分析 → JFR 飞行记录 → Arthas → 文件传输 → 通用
 // 与后端 tools/category.rs 的 ToolCategory 声明序一致
 const CATEGORY_META: { key: ToolCategory; label: string; icon: Icon }[] = [
   { key: "environment", label: "环境与进程", icon: Desktop },
+  { key: "k8s", label: "K8s 发现", icon: Stack },
   { key: "jvm", label: "JVM 诊断", icon: Cpu },
   { key: "heap", label: "堆快照分析", icon: ChartPie },
   { key: "jfr", label: "JFR 飞行记录", icon: ChartLine },
@@ -40,6 +42,7 @@ export function ToolsPanel() {
   // 全部默认折叠；仅组件内 state，不持久化
   const [collapsed, setCollapsed] = useState<Record<ToolCategory, boolean>>({
     environment: true,
+    k8s: true,
     jvm: true,
     heap: true,
     jfr: true,

@@ -1,5 +1,5 @@
 use super::channel::ExecChannel;
-use super::pool::{build_transport, fetch_environment, PoolError};
+use super::pool::{build_ssh_transport, fetch_environment, PoolError};
 use super::ssh::SshTransport;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,7 +100,7 @@ impl TunnelManager {
             other => TunnelError::Db(other.to_string()),
         })?;
         let transport =
-            build_transport(env_id, &env).map_err(|e| TunnelError::Config(e.to_string()))?;
+            build_ssh_transport(env_id, &env).map_err(|e| TunnelError::Config(e.to_string()))?;
         transport
             .connect()
             .await
@@ -379,12 +379,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_unsupported_transport_maps_to_config_error() {
+    async fn test_open_invalid_auth_maps_to_config_error() {
         let (_tmp, pool) = setup().await;
-        // 非 ssh transport_type：build_transport 报 TransportNotImplemented → Config
+        // transport_type 不再参与分发（按 pod 参数分发）；
+        // 非法 auth_type 仍是 TransportNotImplemented → Config
         sqlx::query(
-            "INSERT INTO environments (id, name, host, port, user, transport_type, auth_type, created_at) \
-             VALUES ('env-d', 'd', '10.0.0.1', 22, 'root', 'local', 'password', '2026-01-01T00:00:00Z')",
+            "INSERT INTO environments (id, name, host, port, user, transport_type, auth_type, private_key_path, created_at) \
+             VALUES ('env-d', 'd', '10.0.0.1', 22, 'root', 'local', 'bogus_auth', NULL, '2026-01-01T00:00:00Z')",
         ).execute(&pool).await.unwrap();
         let mgr = TunnelManager::new(pool);
         let r = mgr.open("env-d", "127.0.0.1", 8563).await;

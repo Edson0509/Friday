@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { X, CircleNotch } from "@phosphor-icons/react";
-import type { EnvironmentRow, TestConnectionResult } from "@/lib/types";
+import type { EnvironmentRow, EnvironmentTransport, TestConnectionResult } from "@/lib/types";
 import { listEnvCredentials } from "@/lib/ipc";
 import { useEnvStore } from "@/store/envStore";
 import { CredentialList } from "./CredentialList";
@@ -13,7 +13,7 @@ interface EnvironmentDialogProps {
   editing: EnvironmentRow | null;
 }
 
-const EMPTY_FORM = { name: "", host: "", port: "22" };
+const EMPTY_FORM = { name: "", host: "", port: "22", transportType: "ssh" as EnvironmentTransport };
 
 export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogProps) {
   const save = useEnvStore((s) => s.save);
@@ -38,7 +38,11 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
     if (!dialog) return;
     let active = true;
     if (open) {
-      setForm(editing ? { name: editing.name, host: editing.host, port: String(editing.port) } : { ...EMPTY_FORM });
+      setForm(
+        editing
+          ? { name: editing.name, host: editing.host, port: String(editing.port), transportType: editing.transport_type }
+          : { ...EMPTY_FORM },
+      );
       setFormError(null);
       setStaged([]);
       setStagedLoaded(!editing);
@@ -124,6 +128,7 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
         name: form.name.trim(),
         host: form.host.trim(),
         port,
+        transportType: form.transportType,
         credentials: toInput(staged),
       });
       if (ok) onClose();
@@ -214,6 +219,24 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
                 />
               </Field>
             </div>
+
+            <Field label="环境类型" htmlFor="env-transport">
+              <select
+                id="env-transport"
+                value={form.transportType}
+                onChange={(e) => setForm({ ...form, transportType: e.target.value as EnvironmentTransport })}
+                className={inputCls}
+              >
+                <option value="ssh">宿主机 SSH</option>
+                <option value="k8s">Kubernetes 宿主机</option>
+              </select>
+            </Field>
+            {form.transportType === "k8s" && (
+              <p className="text-xs text-muted-foreground">
+                Kubernetes 宿主机：诊断时可先用 k8s_find_pods 发现 Pod（凭证仍是该宿主机的
+                SSH 登录信息）；不传 pod 的工具直接诊断宿主机进程。
+              </p>
+            )}
 
             <div className="pt-2 border-t border-border space-y-2">
               <p className="text-xs text-muted-foreground">

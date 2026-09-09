@@ -28,8 +28,11 @@ impl ToolHandler for ListProcessesHandler {
             .get("keyword")
             .and_then(|v| v.as_str())
             .filter(|kw| !kw.is_empty());
+        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
-        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment).await {
+        let (env, channel) =
+            match resolve_environment(&self.core.db, &self.core.exec_pool, environment, pod, container).await {
             Ok(Some(pair)) => pair,
             Ok(None) => {
                 return error_output(
@@ -60,11 +63,13 @@ impl ToolHandler for ListProcessesHandler {
 
         match result {
             Err(_) => {
-                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "list_processes timed out, dropping ssh connection");
+                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "list_processes timed out, dropping connection");
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
                 {
                     let mut pool = self.core.exec_pool.lock().await;
-                    pool.disconnect(&env.id).await;
+                    pool.disconnect_target(&target).await;
                 }
+                crate::exec::pool::spawn_timeout_kill(self.core.db.clone(), target, command.clone());
                 error_output("timeout_error", &format!("command timed out after {timeout_secs}s"))
             }
             Ok(Err(e)) => {
@@ -104,13 +109,15 @@ impl ToolHandler for ListProcessesHandler {
 pub fn list_processes_tool_def(core: Arc<JvmExecCore>) -> ToolDef {
     ToolDef {
         name: "list_processes".to_string(),
-        description: "列出目标环境上的进程（PID、用户、完整命令行），按 keyword（服务名/关键字，大小写不敏感）过滤；不传 keyword 返回全部进程。诊断第一步：用用户提到的服务名作 keyword 查 PID，再配合 jvm_* 等工具。不依赖 JDK 装备。".to_string(),
+        description: "列出目标环境上的进程（PID、用户、完整命令行），按 keyword（服务名/关键字，大小写不敏感）过滤；不传 keyword 返回全部进程。诊断第一步：用用户提到的服务名作 keyword 查 PID，再配合 jvm_* 等工具。不依赖 JDK 装备。传 pod 时列出的是容器内进程（PID 为容器内 PID，后续 jvm_* 工具需带相同 pod）。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
                 "keyword": { "type": "string", "description": "过滤关键字（服务名等，大小写不敏感；缺省返回全部进程）" },
-                "timeout_secs": { "type": "number", "description": "超时秒数，默认 30，上限 120" }
+                "timeout_secs": { "type": "number", "description": "超时秒数，默认 30，上限 120" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）" },
+                "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment"]
         }),
@@ -275,6 +282,33 @@ mod tests {
         assert!(!out.success);
         assert_eq!(out.data["error"], "environment_not_found");
         assert!(out.data["message"].as_str().unwrap().contains("list_environments"));
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_pod_param_routes_through_k8s_channel() {
+        // pod 参数贯通：注入 TargetKey::k8s 的 K8sChannel（包记录型 base），
+        // ps 命令必须经 kubectl exec 包装进容器（而非走宿主机 base key）
+        let ch = Arc::new(PsChannel { stdout: PS_OUTPUT, calls: tokio::sync::Mutex::new(Vec::new()) });
+        let (tmp, core) = setup(ch.clone()).await;
+        let env_id = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap().id;
+        core.exec_pool.lock().await.insert_channel(
+            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            Arc::new(crate::exec::k8s::K8sChannel {
+                base: ch.clone(),
+                pod: "pod-1".to_string(),
+                container: None,
+            }),
+        ).await;
+        let handler = ListProcessesHandler { core };
+        let ctx = ToolContext { session_id: "s1".into(), channel: None };
+        let out = handler
+            .execute(serde_json::json!({"environment": "prod", "pod": "pod-1"}), &ctx)
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let calls = ch.calls.lock().await;
+        assert!(calls[0].contains("kubectl exec"), "ps must be wrapped for k8s target: {}", calls[0]);
+        assert!(calls[0].contains("ps -eo pid=,user=,args="), "cmd: {}", calls[0]);
         drop(tmp);
     }
 

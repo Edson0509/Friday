@@ -54,6 +54,8 @@ impl ToolHandler for RunCommandHandler {
         let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
             return error_output("invalid_params", "missing required parameter: command");
         };
+        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let timeout_secs = clamp_timeout(args.get("timeout_secs").and_then(|v| v.as_i64()));
 
         // 按名称查环境
@@ -73,7 +75,7 @@ impl ToolHandler for RunCommandHandler {
         // 获取或建连
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, &self.db).await {
+            match pool.get_or_create(&env.id, pod, container, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "run_command: failed to get exec channel");
@@ -93,17 +95,20 @@ impl ToolHandler for RunCommandHandler {
 
         match result {
             Err(_) => {
-                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "run_command timed out, dropping ssh connection to terminate remote process");
+                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "run_command timed out, dropping connection to terminate remote process");
                 // 断开连接以终止远端进程（russh channel 无 Drop impl，仅取消 future 不会杀远端进程）
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
                 {
                     let mut pool = self.exec_pool.lock().await;
-                    pool.disconnect(&env.id).await;
+                    pool.disconnect_target(&target).await;
                 }
+                // k8s 目标：断 SSH 只杀 kubectl，容器内进程可能存活 → 独立连接补刀（VM no-op）
+                crate::exec::pool::spawn_timeout_kill(self.db.clone(), target, command.to_string());
                 ToolOutput {
                     success: false,
                     data: serde_json::json!({
                         "error": "timeout_error",
-                        "message": format!("command timed out after {timeout_secs}s; ssh connection was closed to terminate the remote process"),
+                        "message": format!("command timed out after {timeout_secs}s; connection was closed to terminate the remote process"),
                         "elapsed_ms": elapsed_ms,
                     }),
                     raw_stdout: None,
@@ -197,7 +202,7 @@ pub fn run_command_tool_def(
 ) -> ToolDef {
     ToolDef {
         name: "run_command".to_string(),
-        description: "在目标远程环境上执行一条 shell 命令（登录 shell，PATH 完整）。这是兜底工具：优先使用结构化诊断工具，只有没有专用工具时才用本工具。每次执行都需要用户确认。".to_string(),
+        description: "在目标远程环境上执行一条 shell 命令（登录 shell，PATH 完整）。这是兜底工具：优先使用结构化诊断工具，只有没有专用工具时才用本工具。每次执行都需要用户确认。传 pod 时命令在 Pod 容器内执行（sh -c）。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -212,6 +217,14 @@ pub fn run_command_tool_def(
                 "timeout_secs": {
                     "type": "number",
                     "description": "超时秒数，默认 120，上限 600"
+                },
+                "pod": {
+                    "type": "string",
+                    "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）"
+                },
+                "container": {
+                    "type": "string",
+                    "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）"
                 }
             },
             "required": ["environment", "command"]

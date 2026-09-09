@@ -16,6 +16,22 @@ pub struct JdkCache {
     layouts: Mutex<HashMap<String, JdkLayout>>,
 }
 
+/// 复合缓存键：VM 目标 = env_id；k8s 目标 = env|pod=..|ctr=..
+/// （JdkCache 的 HashMap<String, JdkLayout> 不变，只换 key 构造）
+/// 归一化单一权威：TargetKey::from_parts 已归一空串/无 pod 的 container，
+/// 此处不再过滤。
+pub fn cache_key(target: &crate::exec::pool::TargetKey) -> String {
+    match &target.pod {
+        None => target.env_id.clone(),
+        Some(pod) => format!(
+            "{}|pod={}|ctr={}",
+            target.env_id,
+            pod,
+            target.container.as_deref().unwrap_or("-")
+        ),
+    }
+}
+
 impl JdkCache {
     pub fn new() -> Self {
         Self::default()
@@ -75,6 +91,17 @@ mod tests {
     async fn test_clear_missing_is_noop() {
         let cache = JdkCache::new();
         cache.clear("nope").await; // must not panic
+    }
+
+    #[test]
+    fn test_cache_key_composite_for_k8s() {
+        use crate::exec::pool::TargetKey;
+        assert_eq!(cache_key(&TargetKey::base("e1")), "e1");
+        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None)), "e1|pod=p1|ctr=-");
+        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", Some("c1"))), "e1|pod=p1|ctr=c1");
+        // from_parts 归一：空串视为未传；container without pod 归一到 base key
+        assert_eq!(cache_key(&TargetKey::from_parts("e1", Some(""), None)), "e1");
+        assert_eq!(cache_key(&TargetKey::from_parts("e1", None, Some("c1"))), "e1");
     }
 
     #[tokio::test]

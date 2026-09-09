@@ -4,11 +4,14 @@ use crate::tools::registry::ToolOutput;
 use std::sync::Arc;
 
 /// 环境名 → env 记录 + channel（run_command / ensure_tool 同款语义，提取共享）。
+/// pod/container：k8s 目标定位（None = 宿主机 VM 模式）。
 /// Ok(None) = 环境不存在（调用方引导 list_environments）。
 pub async fn resolve_environment(
     db: &sqlx::SqlitePool,
     exec_pool: &Arc<tokio::sync::Mutex<crate::exec::pool::ExecChannelPool>>,
     environment: &str,
+    pod: Option<&str>,
+    container: Option<&str>,
 ) -> Result<Option<(crate::app::environments::EnvironmentRow, Arc<dyn ExecChannel>)>, String> {
     let env = match crate::app::environments::find_by_name(db, environment).await {
         Ok(Some(env)) => env,
@@ -17,7 +20,7 @@ pub async fn resolve_environment(
     };
     let channel = {
         let mut pool = exec_pool.lock().await;
-        pool.get_or_create(&env.id, db).await.map_err(|e| e.to_string())?
+        pool.get_or_create(&env.id, pod, container, db).await.map_err(|e| e.to_string())?
     };
     Ok(Some((env, channel)))
 }
@@ -80,7 +83,7 @@ impl JvmExecCore {
     pub async fn exec_jdk_command(
         &self,
         session_id: &str,
-        env_id: &str,
+        target: &crate::exec::pool::TargetKey,
         channel: &Arc<dyn ExecChannel>,
         bin_path: &str,
         command: &str,
@@ -97,25 +100,32 @@ impl JvmExecCore {
 
         match result {
             Err(_) => {
-                tracing::warn!(session_id, env_id, timeout_secs, "jvm tool timed out, dropping ssh connection to terminate remote process");
+                tracing::warn!(session_id, env_id = %target.env_id, timeout_secs, "jvm tool timed out, dropping connection to terminate remote process");
                 {
                     let mut pool = self.exec_pool.lock().await;
-                    pool.disconnect(env_id).await;
+                    pool.disconnect_target(target).await;
                 }
+                // k8s 目标：断 SSH 只杀 kubectl，容器内进程可能存活 → 独立连接补刀
+                // （VM 目标 no-op）
+                crate::exec::pool::spawn_timeout_kill(
+                    self.db.clone(),
+                    target.clone(),
+                    command.to_string(),
+                );
                 error_output(
                     "timeout_error",
-                    &format!("command timed out after {timeout_secs}s; ssh connection was closed to terminate the remote process"),
+                    &format!("command timed out after {timeout_secs}s; connection closed, remote process kill is best-effort for containers"),
                 )
             }
             Ok(Err(e)) => {
-                tracing::error!(session_id, env_id, error = %e, "jvm tool exec failed");
+                tracing::error!(session_id, env_id = %target.env_id, error = %e, "jvm tool exec failed");
                 error_output("connection_error", &e.to_string())
             }
             Ok(Ok(output)) => {
                 // 缓存失效：清缓存并引导重新装备
                 if is_jdk_missing(output.exit_code, &output.stderr) {
-                    tracing::warn!(session_id, env_id, bin_path, "jdk missing on remote, clearing cache");
-                    self.jdk_cache.clear(env_id).await;
+                    tracing::warn!(session_id, env_id = %target.env_id, bin_path, "jdk missing on remote, clearing cache");
+                    self.jdk_cache.clear(&super::jdk_cache::cache_key(target)).await;
                     return error_output(
                         "jdk_missing_on_remote",
                         "远端 JDK 已不存在（可能 /tmp 被清理）。请重新调用 ensure_tool 装备后重试。",
@@ -154,7 +164,7 @@ impl JvmExecCore {
                     }
                 } else { stderr };
 
-                tracing::info!(session_id, env_id, exit_code = output.exit_code, elapsed_ms, command, "jvm tool executed");
+                tracing::info!(session_id, env_id = %target.env_id, exit_code = output.exit_code, elapsed_ms, command, "jvm tool executed");
 
                 ToolOutput {
                     success: output.exit_code == 0,
@@ -245,7 +255,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (c, _db, _pool, _cache) = core(tmp.path());
         let ch: Arc<dyn ExecChannel> = Arc::new(EchoChannel { exit_code: 0, stderr: String::new() });
-        let out = c.exec_jdk_command("s1", "env-1", &ch, "/jdk/bin/jcmd", "/jdk/bin/jcmd 1 GC.heap_info", 30, "log").await;
+        let target = crate::exec::pool::TargetKey::base("env-1");
+        let out = c.exec_jdk_command("s1", &target, &ch, "/jdk/bin/jcmd", "/jdk/bin/jcmd 1 GC.heap_info", 30, "log").await;
         assert!(out.success);
         assert_eq!(out.data["stdout"], "ok");
         assert_eq!(out.data["exit_code"], 0);
@@ -258,7 +269,8 @@ mod tests {
         let (c, _db, _pool, cache) = core(tmp.path());
         cache.set("env-1", JdkLayout { tool_home: "/tmp/jdk".into(), bins: HashMap::new() }).await;
         let ch: Arc<dyn ExecChannel> = Arc::new(EchoChannel { exit_code: 127, stderr: String::new() });
-        let out = c.exec_jdk_command("s1", "env-1", &ch, "/tmp/jdk/bin/jcmd", "/tmp/jdk/bin/jcmd 1 GC.heap_info", 30, "log").await;
+        let target = crate::exec::pool::TargetKey::base("env-1");
+        let out = c.exec_jdk_command("s1", &target, &ch, "/tmp/jdk/bin/jcmd", "/tmp/jdk/bin/jcmd 1 GC.heap_info", 30, "log").await;
         assert!(!out.success);
         assert_eq!(out.data["error"], "jdk_missing_on_remote");
         assert!(cache.get("env-1").await.is_none(), "cache must be cleared");
@@ -269,7 +281,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (c, _db, _pool, _cache) = core(tmp.path());
         let ch: Arc<dyn ExecChannel> = Arc::new(EchoChannel { exit_code: 1, stderr: "1:\nCould not attach to process".into() });
-        let out = c.exec_jdk_command("s1", "env-1", &ch, "/jdk/bin/jcmd", "/jdk/bin/jcmd 99 Thread.print", 30, "log").await;
+        let target = crate::exec::pool::TargetKey::base("env-1");
+        let out = c.exec_jdk_command("s1", &target, &ch, "/jdk/bin/jcmd", "/jdk/bin/jcmd 99 Thread.print", 30, "log").await;
         assert!(!out.success);
         assert_eq!(out.data["error"], serde_json::Value::Null); // 无 error code：业务错误透传
         assert_eq!(out.data["exit_code"], 1);
@@ -293,9 +306,10 @@ mod tests {
     async fn test_exec_timeout_drops_connection() {
         let tmp = tempfile::tempdir().unwrap();
         let (c, _db, pool, _cache) = core(tmp.path());
-        pool.lock().await.insert_channel("env-1".to_string(), Arc::new(SlowChannel) as Arc<dyn ExecChannel>).await;
-        let ch = pool.lock().await.get_or_create_unchecked_for_test("env-1").await;
-        let out = c.exec_jdk_command("s1", "env-1", &ch, "/jdk/bin/jcmd", "/jdk/bin/jcmd 1 GC.heap_info", 1, "log").await;
+        pool.lock().await.insert_channel(crate::exec::pool::TargetKey::base("env-1"), Arc::new(SlowChannel) as Arc<dyn ExecChannel>).await;
+        let ch = pool.lock().await.get_or_create_unchecked_for_test(&crate::exec::pool::TargetKey::base("env-1")).await;
+        let target = crate::exec::pool::TargetKey::base("env-1");
+        let out = c.exec_jdk_command("s1", &target, &ch, "/jdk/bin/jcmd", "/jdk/bin/jcmd 1 GC.heap_info", 1, "log").await;
         assert!(!out.success);
         assert_eq!(out.data["error"], "timeout_error");
         assert_eq!(pool.lock().await.connection_count(), 0, "timeout must drop pooled connection");

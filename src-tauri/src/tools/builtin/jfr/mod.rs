@@ -69,6 +69,8 @@ impl JfrRecordHandler {
         let Some(pid) = args.get("pid").and_then(|v| parse_pid(v)) else {
             return error_output("invalid_args", "pid 必须是正整数字符串");
         };
+        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let (duration_secs, settings) = match mapping::validate_record_params(args) {
             Ok(v) => v,
             Err(e) => return error_output("invalid_args", &e),
@@ -78,7 +80,7 @@ impl JfrRecordHandler {
             duration_secs,
         );
 
-        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment).await {
+        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment, pod, container).await {
             Ok(Some(pair)) => pair,
             Ok(None) => {
                 return error_output(
@@ -91,12 +93,19 @@ impl JfrRecordHandler {
             Err(e) => return error_output("connection_error", &e),
         };
 
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+
         // JDK 路径：查缓存，miss 引导 ensure_tool
-        let Some(layout) = self.core.jdk_cache.get(&env.id).await else {
+        let Some(layout) = self
+            .core
+            .jdk_cache
+            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target))
+            .await
+        else {
             tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk not provisioned (cache miss)");
             return error_output(
                 "jdk_not_provisioned",
-                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\") 装备，然后重试本工具。",
+                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/container) 装备，然后重试本工具。",
             );
         };
         let bins = match require_bins(&layout, &["jcmd"]) {
@@ -133,8 +142,10 @@ impl JfrRecordHandler {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs = start_timeout, "JFR.start timed out, dropping connection");
                 {
                     let mut pool = self.core.exec_pool.lock().await;
-                    pool.disconnect(&env.id).await;
+                    pool.disconnect_target(&target).await;
                 }
+                // k8s 目标：断 SSH 只杀 kubectl，容器内进程可能存活 → 独立连接补刀（VM no-op）
+                crate::exec::pool::spawn_timeout_kill(self.core.db.clone(), target, start_cmd.clone());
                 return error_output(
                     "timeout_error",
                     &format!("JFR.start 超时（{start_timeout}s）；ssh 连接已断开"),
@@ -147,7 +158,10 @@ impl JfrRecordHandler {
             Ok(Ok(output)) => {
                 if is_jdk_missing(output.exit_code, &output.stderr) {
                     tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk missing on remote, clearing cache");
-                    self.core.jdk_cache.clear(&env.id).await;
+                    self.core
+                        .jdk_cache
+                        .clear(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target))
+                        .await;
                     return error_output(
                         "jdk_missing_on_remote",
                         "远端 JDK 已不存在（可能 /tmp 被清理）。请重新调用 ensure_tool 装备后重试。",
@@ -460,7 +474,9 @@ fn record_tool_def(
                 "pid": { "type": "string", "description": "目标 Java 进程 PID（list_processes 返回）" },
                 "duration_secs": { "type": "number", "description": "录制时长秒数，10~600，默认 60" },
                 "settings": { "type": "string", "enum": ["profile", "default"], "description": "事件档位：profile 全维度（开销 1~3%），default 低开销（<1%），默认 profile" },
-                "timeout_secs": { "type": "number", "description": "总超时秒数（含录制等待与落盘轮询），默认 600，上限 1800；实际下限为 duration_secs+120" }
+                "timeout_secs": { "type": "number", "description": "总超时秒数（含录制等待与落盘轮询），默认 600，上限 1800；实际下限为 duration_secs+120" },
+                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器内服务诊断时必传；VM/宿主机进程诊断不传）" },
+                "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
             },
             "required": ["environment", "pid"]
         }),

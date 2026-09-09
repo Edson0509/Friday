@@ -212,6 +212,7 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/unused-cache"),
             artifactory_base_url: "https://artifactory.example.com/artifactory/release".into(),
             arthas_zip,
+            remote_tools_dir: "/tmp/friday-tools".into(),
             timeouts: StageTimeouts::default(),
             bus: crate::app::events::EventBus::disabled(),
         }
