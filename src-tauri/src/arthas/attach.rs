@@ -79,11 +79,14 @@ pub fn port_probe_command(port: u16) -> String {
     )
 }
 
-/// 宿主机侧查询 Pod IP（k8s 探活用）。kubectl 不带 -n——依赖 kubeconfig context 的
-/// 当前 namespace（见 attach_arthas_in_pod 的已知假设注释）。
-pub fn pod_ip_command(pod: &str) -> String {
+/// 宿主机侧查询 Pod IP（k8s 探活用）。kubectl 显式 -n namespace（None 时省略——
+/// 过渡兼容，依赖 kubeconfig context 当前 ns）。
+pub fn pod_ip_command(pod: &str, namespace: Option<&str>) -> String {
+    let ns = namespace
+        .map(|n| format!("-n {} ", shell_quote_single(n)))
+        .unwrap_or_default();
     format!(
-        "kubectl get pod {} -o jsonpath='{{.status.podIP}}'",
+        "kubectl get pod {} {ns}-o jsonpath='{{.status.podIP}}'",
         shell_quote_single(pod)
     )
 }
@@ -345,6 +348,7 @@ async fn attach_arthas_on_vm(
         exec_pool: deps.exec_pool.clone(),
         env_id: req.env_id.clone(),
         pod: None,
+        namespace: None,
         container: None,
         remote_port: port,
         token,
@@ -377,14 +381,17 @@ async fn attach_arthas_in_pod(
         );
     };
 
-    // 已知假设（记录，暂不修）：kubectl exec / kubectl get pod 均不带 -n，依赖
-    // kubeconfig context 的当前 namespace（与 Phase 1 kubectl exec 行为一致；
-    // k8s_find_pods 用 -A 全局发现）。若未来跨 namespace 环境出问题，需把
-    // namespace 从 find_pods 贯通到工具参数。
-
-    // 0. 容器执行通道（kubectl exec 包装；池内独立键，不复用 base 连接）
+    // 0. 容器执行通道（kubectl exec 包装；池内独立键，不复用 base 连接）。
+    //    namespace 从 AttachRequest 贯通（池键 + kubectl 显式 -n）
     progress("channel", format!("建立容器执行通道（pod {pod}）"));
-    let k8s_ch = get_target_channel(&deps, &req.env_id, Some(pod), req.container.as_deref()).await?;
+    let k8s_ch = get_target_channel(
+        &deps,
+        &req.env_id,
+        Some(pod),
+        req.namespace.as_deref(),
+        req.container.as_deref(),
+    )
+    .await?;
 
     // 1~6 前半程：装备 → java 解析 → 残留清理 → 端口/properties → attach → 探活
     let (port, token) = pod_attach_prepare(
@@ -415,6 +422,7 @@ async fn attach_arthas_in_pod(
         &connector,
         &req.env_id,
         pod,
+        req.namespace.as_deref(),
         req.container.as_deref(),
         port,
         &token,
@@ -433,6 +441,7 @@ async fn attach_arthas_in_pod(
         exec_pool: deps.exec_pool.clone(),
         env_id: req.env_id.clone(),
         pod: Some(pod.to_string()),
+        namespace: req.namespace.clone(),
         container: req.container.clone(),
         remote_port: port,
         token,
@@ -492,6 +501,7 @@ async fn establish_pod_mcp(
     connector: &dyn PodMcpConnector,
     env_id: &str,
     pod: &str,
+    namespace: Option<&str>,
     container: Option<&str>,
     mcp_port: u16,
     token: &str,
@@ -499,7 +509,7 @@ async fn establish_pod_mcp(
     progress: &(dyn Fn(&str, String) + Sync),
 ) -> Result<(Arc<dyn ArthasClient>, Option<PfLease>), ManagerError> {
     progress("tunnel", format!("建立 MCP 通路（port-forward 隧道，pod {pod}）"));
-    match establish_pf_tunnel(base.as_ref(), tunnels, env_id, pod, container, mcp_port, pf_params).await {
+    match establish_pf_tunnel(base.as_ref(), tunnels, env_id, pod, namespace, container, mcp_port, pf_params).await {
         Ok(lease) => {
             let url = format!("http://127.0.0.1:{}/mcp", lease.local_port);
             progress("handshake", format!("MCP 握手（原生 HTTP 隧道 {url}）"));
@@ -575,6 +585,7 @@ async fn pod_attach_prepare(
         .ensure_k8s(
             base,
             pod,
+            req.namespace.as_deref(),
             req.container.as_deref(),
             deps.arthas_zip.as_deref(),
             &req.session_id,
@@ -597,7 +608,7 @@ async fn pod_attach_prepare(
     //     探活前幂等重取一次）。容器 sh（busybox）无 bash /dev/tcp，容器内探测
     //     恒 free——端口分配失明会让同 Pod 并发会话恒选 18563 撞 already-bind，
     //     故 pod 模式端口探测一律走宿主机侧打 podIP。
-    let pod_ip = match get_pod_ip(base.as_ref(), pod).await {
+    let pod_ip = match get_pod_ip(base.as_ref(), pod, req.namespace.as_deref()).await {
         Ok(ip) => Some(ip),
         Err(e) => {
             tracing::warn!(session_id = %req.session_id, env_id = %req.env_id, pod, error = %e,
@@ -652,7 +663,7 @@ async fn pod_attach_prepare(
     progress("probe", "等待 arthas HTTP 服务就绪（宿主机侧探 podIP）".to_string());
     let pod_ip = match pod_ip {
         Some(ip) => Ok(ip),
-        None => get_pod_ip(base.as_ref(), pod).await,
+        None => get_pod_ip(base.as_ref(), pod, req.namespace.as_deref()).await,
     };
     match pod_ip {
         Ok(pod_ip) => {
@@ -687,6 +698,7 @@ struct ProductionStopHandle {
     exec_pool: Arc<Mutex<ExecChannelPool>>,
     env_id: String,
     pod: Option<String>,
+    namespace: Option<String>,
     container: Option<String>,
     remote_port: u16,
     token: String,
@@ -721,15 +733,17 @@ impl ArthasStopHandle for ProductionStopHandle {
             let exec_pool = self.exec_pool.clone();
             let env_id = self.env_id.clone();
             let pod = self.pod.clone();
+            let namespace = self.namespace.clone();
             let container = self.container.clone();
             move || {
                 let db = db.clone();
                 let exec_pool = exec_pool.clone();
                 let env_id = env_id.clone();
                 let pod = pod.clone();
+                let namespace = namespace.clone();
                 let container = container.clone();
                 Box::pin(async move {
-                    get_target_channel_raw(&db, &exec_pool, &env_id, pod.as_deref(), container.as_deref())
+                    get_target_channel_raw(&db, &exec_pool, &env_id, pod.as_deref(), namespace.as_deref(), container.as_deref())
                         .await
                         .map_err(|e| e.to_string())
                 }) as Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>>
@@ -749,6 +763,7 @@ impl ArthasStopHandle for ProductionStopHandle {
             self.pf.as_ref(),
             &self.env_id,
             self.pod.as_deref(),
+            self.namespace.as_deref(),
             self.remote_port,
             &self.token,
             &tunnel_stop,
@@ -774,6 +789,7 @@ async fn run_production_stop(
     pf: Option<&PfLease>,
     env_id: &str,
     pod: Option<&str>,
+    namespace: Option<&str>,
     remote_port: u16,
     token: &str,
     tunnel_stop: &(dyn Fn(u16) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Sync),
@@ -810,7 +826,7 @@ async fn run_production_stop(
             }
             Err(e) => {
                 tracing::warn!(
-                    env_id, pod = ?pod, error = %e,
+                    env_id, pod = ?pod, namespace = ?namespace, error = %e,
                     "拿不到宿主机通道，kill pf 失败（宿主机残留 pf 由下次 attach 的 pkill 清理兜底）；隧道条目仍关闭"
                 );
                 tunnels.close(env_id, super::tunnel::TUNNEL_REMOTE_HOST, pf.host_port).await;
@@ -822,10 +838,10 @@ async fn run_production_stop(
     if !agent_stopped {
         match get_target_channel().await {
             Ok(channel) => match run_with_timeout(channel.as_ref(), &stop_command(remote_port, token), 15).await {
-                Ok(_) => tracing::info!(env_id, pod = ?pod, port = remote_port, "arthas stopped via http api (exec channel)"),
-                Err(e) => tracing::warn!(env_id, pod = ?pod, port = remote_port, error = %e, "arthas http stop failed (best-effort)"),
+                Ok(_) => tracing::info!(env_id, pod = ?pod, namespace = ?namespace, port = remote_port, "arthas stopped via http api (exec channel)"),
+                Err(e) => tracing::warn!(env_id, pod = ?pod, namespace = ?namespace, port = remote_port, error = %e, "arthas http stop failed (best-effort)"),
             },
-            Err(e) => tracing::warn!(env_id, pod = ?pod, port = remote_port, error = %e, "failed to get exec channel for arthas http stop (best-effort skip)"),
+            Err(e) => tracing::warn!(env_id, pod = ?pod, namespace = ?namespace, port = remote_port, error = %e, "failed to get exec channel for arthas http stop (best-effort skip)"),
         }
     }
 }
@@ -841,9 +857,10 @@ async fn get_target_channel(
     deps: &AttachDeps,
     env_id: &str,
     pod: Option<&str>,
+    namespace: Option<&str>,
     container: Option<&str>,
 ) -> Result<Arc<dyn ExecChannel>, ManagerError> {
-    get_target_channel_raw(&deps.db, &deps.exec_pool, env_id, pod, container).await
+    get_target_channel_raw(&deps.db, &deps.exec_pool, env_id, pod, namespace, container).await
 }
 
 async fn get_default_channel_raw(
@@ -851,7 +868,7 @@ async fn get_default_channel_raw(
     exec_pool: &Arc<Mutex<ExecChannelPool>>,
     env_id: &str,
 ) -> Result<Arc<dyn ExecChannel>, ManagerError> {
-    get_target_channel_raw(db, exec_pool, env_id, None, None).await
+    get_target_channel_raw(db, exec_pool, env_id, None, None, None).await
 }
 
 async fn get_target_channel_raw(
@@ -859,11 +876,11 @@ async fn get_target_channel_raw(
     exec_pool: &Arc<Mutex<ExecChannelPool>>,
     env_id: &str,
     pod: Option<&str>,
+    namespace: Option<&str>,
     container: Option<&str>,
 ) -> Result<Arc<dyn ExecChannel>, ManagerError> {
     let mut pool = exec_pool.lock().await;
-    // namespace 先传 None（NS-T3 arthas 链接入真实值）
-    pool.get_or_create(env_id, pod, None, container, db)
+    pool.get_or_create(env_id, pod, namespace, container, db)
         .await
         .map_err(|e| ManagerError::Attach(format!("SSH 连接失败: {e}")))
 }
@@ -910,7 +927,7 @@ async fn resolve_attach_java(
     let target = crate::exec::pool::TargetKey::from_parts(
         &req.env_id,
         req.pod.as_deref(),
-        None,
+        req.namespace.as_deref(),
         req.container.as_deref(),
     );
     let cache_key = crate::tools::builtin::jvm::jdk_cache::cache_key(&target);
@@ -1058,8 +1075,12 @@ async fn wait_http_ready(
 const ARTHAS_LOG_HINT: &str = "/tmp/arthas-friday-<pid>.log";
 
 /// 查询 Pod IP（宿主机侧 kubectl，输出经 IpAddr 校验防注入）
-async fn get_pod_ip(base: &dyn ExecChannel, pod: &str) -> Result<String, ManagerError> {
-    let out = run_with_timeout(base, &pod_ip_command(pod), 20).await?;
+async fn get_pod_ip(
+    base: &dyn ExecChannel,
+    pod: &str,
+    namespace: Option<&str>,
+) -> Result<String, ManagerError> {
+    let out = run_with_timeout(base, &pod_ip_command(pod, namespace), 20).await?;
     let ip = out.stdout.trim().to_string();
     if out.exit_code != 0 || ip.is_empty() {
         return Err(ManagerError::Attach(format!(
@@ -1607,6 +1628,7 @@ mod tests {
             pid: 1234,
             java_bin: "java".into(),
             pod: Some("svc-1".into()),
+            namespace: Some("ns1".into()),
             container: None,
         }
     }
@@ -1679,7 +1701,7 @@ mod tests {
         let k8s: Arc<dyn ExecChannel> = Arc::new(K8sChannel {
             base: inner.clone(),
             pod: "svc-1".into(),
-            namespace: None,
+            namespace: Some("ns1".into()),
             container: None,
         });
         (inner, k8s)
@@ -1710,15 +1732,17 @@ mod tests {
 
         let base_calls = base.calls().await;
         assert_eq!(base_calls.len(), 14, "base_calls: {base_calls:?}");
-        // ① 装备走 ensure_k8s：宿主机侧 kubectl exec 缓存检查（POD_TOOLS_DIR/arthas-dist）
-        assert!(base_calls[0].contains("kubectl exec"), "ensure_k8s check: {}", base_calls[0]);
+        // ① 装备走 ensure_k8s：宿主机侧 kubectl exec 缓存检查（POD_TOOLS_DIR/arthas-dist），
+        //    ns 从 AttachRequest 贯通（kubectl 显式 -n）
+        assert!(base_calls[0].contains("kubectl exec -n 'ns1'"), "ensure_k8s check: {}", base_calls[0]);
         assert!(
             base_calls[0].contains("arthas-dist/arthas-boot.jar"),
             "ensure_k8s check: {}",
             base_calls[0]
         );
-        // ② podIP 查询（早取，端口探测/探活共用——只查一次）
+        // ② podIP 查询（早取，端口探测/探活共用——只查一次），kubectl get pod 带 -n
         assert!(base_calls[1].contains("kubectl get pod"), "podIP cmd: {}", base_calls[1]);
+        assert!(base_calls[1].contains("-n 'ns1'"), "podIP ns flag: {}", base_calls[1]);
         assert!(
             base_calls.iter().filter(|c| c.contains("kubectl get pod")).count() == 1,
             "podIP must be fetched once and reused: {base_calls:?}"
@@ -1743,9 +1767,9 @@ mod tests {
 
         let pod_calls = pod_ch.calls().await;
         assert_eq!(pod_calls.len(), 3, "pod_calls: {pod_calls:?}");
-        // 容器内命令全部经 kubectl exec 包装（真实 K8sChannel 语义）
+        // 容器内命令全部经 kubectl exec 包装（真实 K8sChannel 语义，-n 显式 ns）
         for c in &pod_calls {
-            assert!(c.contains("kubectl exec 'svc-1' -- sh -c"), "must be kubectl-wrapped: {c}");
+            assert!(c.contains("kubectl exec -n 'ns1' 'svc-1' -- sh -c"), "must be kubectl-wrapped: {c}");
         }
         // java 解析在容器内（第一个容器命令）
         assert!(pod_calls[0].contains("command -v java"), "java resolve: {}", pod_calls[0]);
@@ -1916,11 +1940,16 @@ mod tests {
 
     #[test]
     fn test_pod_ip_command_shape() {
-        let cmd = pod_ip_command("svc-abc");
+        let cmd = pod_ip_command("svc-abc", Some("ns1"));
         assert!(cmd.contains("kubectl get pod 'svc-abc'"), "cmd: {cmd}");
+        assert!(cmd.contains("-n 'ns1'"), "cmd: {cmd}");
         assert!(cmd.contains("jsonpath='{.status.podIP}'"), "cmd: {cmd}");
+        // ns=None：省略 -n（过渡兼容，依赖 kubeconfig context ns）
+        let no_ns = pod_ip_command("svc-abc", None);
+        assert!(!no_ns.contains("-n "), "cmd: {no_ns}");
+        assert!(no_ns.contains("kubectl get pod 'svc-abc'"), "cmd: {no_ns}");
         // pod 名注入防护：单引号转义
-        let evil = pod_ip_command("x'; rm -rf /; '");
+        let evil = pod_ip_command("x'; rm -rf /; '", Some("ns1"));
         assert!(evil.contains(r"'\''"), "must escape quotes: {evil}");
     }
 
@@ -2130,6 +2159,7 @@ mod tests {
             &connector,
             "env-1",
             "svc-1",
+            Some("ns1"),
             None,
             18563,
             "tok123",
@@ -2150,6 +2180,9 @@ mod tests {
         let idx = |needle: &str| ev.iter().position(|e| e.contains(needle)).expect(needle);
         assert!(idx("pkill -f") < idx("nohup kubectl port-forward"), "ev: {ev:?}");
         assert!(idx("nohup kubectl port-forward") < idx("tunnels-open:"), "ev: {ev:?}");
+        // pf 命令显式 -n（ns 贯通到 port-forward）
+        let pf_start = ev.iter().find(|e| e.contains("nohup kubectl port-forward")).expect("pf start");
+        assert!(pf_start.contains("-n 'ns1'"), "pf must carry namespace: {pf_start}");
         assert!(
             ev.iter().any(|e| e == &format!("tunnels-open:env-1/127.0.0.1/54321")),
             "ev: {ev:?}"
@@ -2187,6 +2220,7 @@ mod tests {
             &connector,
             "env-1",
             "svc-1",
+            Some("ns1"),
             None,
             18563,
             "tok123",
@@ -2235,6 +2269,7 @@ mod tests {
             &connector,
             "env-1",
             "svc-1",
+            Some("ns1"),
             None,
             18563,
             "tok123",
@@ -2281,6 +2316,7 @@ mod tests {
             &connector,
             "env-1",
             "svc-1",
+            Some("ns1"),
             None,
             18563,
             "tok123",
@@ -2360,6 +2396,7 @@ mod tests {
             Some(&pf_lease()),
             "env-1",
             Some("svc-1"),
+            Some("ns1"),
             18563,
             "tok123",
             &tunnel_stop,
@@ -2396,6 +2433,7 @@ mod tests {
             Some(&pf_lease()),
             "env-1",
             Some("svc-1"),
+            Some("ns1"),
             18563,
             "tok123",
             &tunnel_stop,
@@ -2435,6 +2473,7 @@ mod tests {
             None,
             "env-1",
             None,
+            None,
             18563,
             "tok123",
             &tunnel_stop,
@@ -2473,6 +2512,7 @@ mod tests {
             Some(&pf_lease()),
             "env-1",
             Some("svc-1"),
+            Some("ns1"),
             18563,
             "tok123",
             &tunnel_stop,
@@ -2515,6 +2555,7 @@ mod tests {
             Some(&pf_lease()),
             "env-1",
             Some("svc-1"),
+            Some("ns1"),
             18563,
             "tok123",
             &tunnel_stop,

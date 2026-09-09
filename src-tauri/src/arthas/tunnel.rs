@@ -6,8 +6,9 @@
 //! （client::connect_arthas_client_native），不再依赖容器内 curl；任一步失败
 //! 降级 exec HTTP 桥（bridge.rs，容器需 curl）。
 //!
-//! 已知假设：kubectl port-forward 不带 -n，依赖 kubeconfig context 的当前
-//! namespace（与 kubectl exec / kubectl get pod 行为一致，见 attach_arthas_in_pod）。
+//! kubectl port-forward 显式 -n namespace（None 时省略——过渡兼容，依赖
+//! kubeconfig context 的当前 namespace；ns 参与 pkill pattern，跨 ns 同名
+//! Pod 的 pf 互不误杀）。
 
 use std::time::Duration;
 
@@ -90,9 +91,16 @@ impl Default for PfTunnelParams {
 /// ERE 元字符 + 首字符 bracket 化自排除。Friday 崩溃后宿主机残留的 pf 由
 /// 下次 attach 的本命令清理。container 参与构造时用 argv 形式（无 shell 引号
 /// ——pkill -f 匹配的是 /proc/{pid}/cmdline）。
-pub fn pf_cleanup_command(pod: &str, container: Option<&str>, mcp_port: u16) -> String {
+/// 清残留 pf（best-effort）：pattern 按 (pod, namespace, container, mcp_port) 唯一
+/// 定位本会话的 pf（同 Pod 多会话的 mcp_port 不同、跨 ns 同名 Pod 的 ns 不同，
+/// 均不会误杀）；pkill_pattern 转义 ERE 元字符 + 首字符 bracket 化自排除。
+/// Friday 崩溃后宿主机残留的 pf 由下次 attach 的本命令清理。namespace/container
+/// 参与构造时用 argv 形式（无 shell 引号——pkill -f 匹配的是 /proc/{pid}/cmdline，
+/// 引号在 shell 解析后已剥掉）。
+pub fn pf_cleanup_command(pod: &str, namespace: Option<&str>, container: Option<&str>, mcp_port: u16) -> String {
+    let ns = namespace.map(|n| format!("-n {n} ")).unwrap_or_default();
     let ctr = container.map(|c| format!("-c {c} ")).unwrap_or_default();
-    let cmdline = format!("kubectl port-forward pod/{pod} {ctr}--address 127.0.0.1 0:{mcp_port}");
+    let cmdline = format!("kubectl port-forward pod/{pod} {ns}{ctr}--address 127.0.0.1 0:{mcp_port}");
     format!(
         "pkill -f {} || true",
         shell_quote_single(&crate::exec::k8s::pkill_pattern(&cmdline))
@@ -111,12 +119,21 @@ pub fn pf_log_path(pod: &str, mcp_port: u16) -> String {
 /// 让 kubectl 自选宿主机随机端口（从日志解析）。stdin 接 /dev/null 防 SSH 会话
 /// 关闭后交互等待（对齐 attach_command 的 nohup 模式）；mkdir -p 兜底日志目录
 /// （k8s 装备流程通常已建，幂等）。
-pub fn pf_start_command(pod: &str, container: Option<&str>, mcp_port: u16) -> String {
+/// 启动 pf：nohup 后台驻留 + echo $! 拿 PID。--address 127.0.0.1 只绑宿主机
+/// 回环（TunnelManager 的 direct-tcpip 从宿主机 127.0.0.1:P 进入）；0:{mcp_port}
+/// 让 kubectl 自选宿主机随机端口（从日志解析）；-n 显式 namespace（None 时省略，
+/// 依赖 kubeconfig context 当前 ns）。stdin 接 /dev/null 防 SSH 会话关闭后交互
+/// 等待（对齐 attach_command 的 nohup 模式）；mkdir -p 兜底日志目录
+/// （k8s 装备流程通常已建，幂等）。
+pub fn pf_start_command(pod: &str, namespace: Option<&str>, container: Option<&str>, mcp_port: u16) -> String {
+    let ns_flag = namespace
+        .map(|n| format!("-n {} ", shell_quote_single(n)))
+        .unwrap_or_default();
     let ctr_flag = container
         .map(|c| format!("-c {} ", shell_quote_single(c)))
         .unwrap_or_default();
     format!(
-        "mkdir -p /tmp/friday-tools && nohup kubectl port-forward pod/{} {ctr_flag}--address 127.0.0.1 0:{mcp_port} < /dev/null > {} 2>&1 & echo $!",
+        "mkdir -p /tmp/friday-tools && nohup kubectl port-forward pod/{} {ns_flag}{ctr_flag}--address 127.0.0.1 0:{mcp_port} < /dev/null > {} 2>&1 & echo $!",
         shell_quote_single(pod),
         shell_quote_single(&pf_log_path(pod, mcp_port)),
     )
@@ -180,17 +197,18 @@ pub async fn establish_pf_tunnel(
     tunnels: &dyn ArthasTunnels,
     env_id: &str,
     pod: &str,
+    namespace: Option<&str>,
     container: Option<&str>,
     mcp_port: u16,
     params: &PfTunnelParams,
 ) -> Result<PfLease, String> {
     // ① 清残留（best-effort：上次 Friday 崩溃遗留的同目标 pf）
-    if let Err(e) = run_timed(base, &pf_cleanup_command(pod, container, mcp_port), 15).await {
+    if let Err(e) = run_timed(base, &pf_cleanup_command(pod, namespace, container, mcp_port), 15).await {
         tracing::warn!(pod, mcp_port, error = %e, "清残留 kubectl port-forward 失败（best-effort 继续）");
     }
 
     // ② 起 pf + 解析 PID
-    let out = run_timed(base, &pf_start_command(pod, container, mcp_port), 15).await?;
+    let out = run_timed(base, &pf_start_command(pod, namespace, container, mcp_port), 15).await?;
     if out.exit_code != 0 {
         return Err(format!(
             "kubectl port-forward 启动失败（exit {}）: {}",
@@ -439,22 +457,33 @@ mod tests {
 
     #[test]
     fn test_pf_cleanup_command_shape_and_session_scoped_pattern() {
-        let cmd = pf_cleanup_command("svc-1", None, 18563);
-        // bracket 化首字符（自排除）+ 精确到 (pod, mcp_port)，不误杀同 Pod 其他会话
-        assert!(cmd.contains("pkill -f '[k]ubectl port-forward pod/svc-1 --address 127\\.0\\.0\\.1 0:18563'"), "cmd: {cmd}");
+        let cmd = pf_cleanup_command("svc-1", Some("ns1"), None, 18563);
+        // bracket 化首字符（自排除）+ 精确到 (pod, ns, mcp_port)，不误杀同 Pod 其他会话
+        assert!(
+            cmd.contains("pkill -f '[k]ubectl port-forward pod/svc-1 -n ns1 --address 127\\.0\\.0\\.1 0:18563'"),
+            "cmd: {cmd}"
+        );
         assert!(cmd.ends_with("' || true"), "cmd: {cmd}");
-        // container 参与 pattern（argv 形式，无 shell 引号）
-        let cmd_c = pf_cleanup_command("svc-1", Some("main"), 18563);
-        assert!(cmd_c.contains("port-forward pod/svc-1 -c main --address"), "cmd: {cmd_c}");
+        // container 参与 pattern（argv 形式，无 shell 引号；-n 在 -c 前）
+        let cmd_c = pf_cleanup_command("svc-1", Some("ns1"), Some("main"), 18563);
+        assert!(cmd_c.contains("port-forward pod/svc-1 -n ns1 -c main --address"), "cmd: {cmd_c}");
         // 不同 mcp_port 的 pattern 不同（同 Pod 多会话互不干扰）
-        let cmd_other = pf_cleanup_command("svc-1", None, 18564);
+        let cmd_other = pf_cleanup_command("svc-1", Some("ns1"), None, 18564);
         assert_ne!(cmd, cmd_other);
+        // 不同 ns 的 pattern 不同（跨 ns 同名 Pod 的 pf 互不误杀）
+        let cmd_ns2 = pf_cleanup_command("svc-1", Some("ns2"), None, 18563);
+        assert_ne!(cmd, cmd_ns2);
+        // ns=None：省略 -n（过渡兼容，依赖 kubeconfig context ns）
+        let cmd_no_ns = pf_cleanup_command("svc-1", None, None, 18563);
+        assert!(!cmd_no_ns.contains("-n "), "cmd: {cmd_no_ns}");
+        assert!(cmd_no_ns.contains("port-forward pod/svc-1 --address"), "cmd: {cmd_no_ns}");
     }
 
     #[test]
     fn test_pf_start_command_shape() {
-        let cmd = pf_start_command("svc-1", None, 18563);
+        let cmd = pf_start_command("svc-1", Some("ns1"), None, 18563);
         assert!(cmd.contains("nohup kubectl port-forward pod/'svc-1'"), "cmd: {cmd}");
+        assert!(cmd.contains("-n 'ns1' "), "cmd: {cmd}");
         assert!(cmd.contains("--address 127.0.0.1"), "cmd: {cmd}");
         assert!(cmd.contains(" 0:18563"), "cmd: {cmd}");
         assert!(cmd.contains("< /dev/null"), "cmd: {cmd}");
@@ -462,10 +491,13 @@ mod tests {
         assert!(cmd.ends_with("& echo $!"), "cmd: {cmd}");
         assert!(cmd.starts_with("mkdir -p /tmp/friday-tools &&"), "cmd: {cmd}");
         // container 旗标
-        let cmd_c = pf_start_command("svc-1", Some("main"), 18563);
+        let cmd_c = pf_start_command("svc-1", Some("ns1"), Some("main"), 18563);
         assert!(cmd_c.contains("-c 'main' "), "cmd: {cmd_c}");
+        // ns=None：省略 -n（过渡兼容）
+        let cmd_no_ns = pf_start_command("svc-1", None, None, 18563);
+        assert!(!cmd_no_ns.contains("-n "), "cmd: {cmd_no_ns}");
         // pod 名注入防护：单引号转义
-        let evil = pf_start_command("x'; rm -rf /; '", None, 18563);
+        let evil = pf_start_command("x'; rm -rf /; '", Some("ns1"), None, 18563);
         assert!(evil.contains(r"'\''"), "must escape quotes: {evil}");
     }
 
@@ -507,7 +539,7 @@ mod tests {
         let (live_port, _guard) = live_local_port().await;
         let tunnels = MockTunnels::new(events.clone(), vec![Ok(live_port)]);
 
-        let lease = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", None, 18563, &fast_params())
+        let lease = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", Some("ns1"), None, 18563, &fast_params())
             .await
             .unwrap();
         assert_eq!(lease.pf_pid, 4242);
@@ -519,6 +551,9 @@ mod tests {
         let idx = |needle: &str| ev.iter().position(|e| e.contains(needle)).expect(needle);
         assert!(idx("pkill -f") < idx("nohup kubectl port-forward"), "ev: {ev:?}");
         assert!(idx("nohup kubectl port-forward") < idx("cat '/tmp/friday-tools/pf-svc-1-18563.log'"), "ev: {ev:?}");
+        // pf 命令显式 -n（ns 贯通）
+        let pf_start = ev.iter().find(|e| e.contains("nohup kubectl port-forward")).expect("pf start");
+        assert!(pf_start.contains("-n 'ns1'"), "pf start must carry namespace: {pf_start}");
         assert!(ev.iter().any(|e| e == "tunnels-open:env-1/127.0.0.1/54321"), "ev: {ev:?}");
         assert!(!ev.iter().any(|e| e.starts_with("tunnels-close:")), "tunnel must stay open: {ev:?}");
         assert!(!ev.iter().any(|e| e.starts_with("base:kill")), "pf must stay alive: {ev:?}");
@@ -531,7 +566,7 @@ mod tests {
         let base = ScriptedEventChannel::new(events.clone(), "base", vec![("", 0), ("", 1)]);
         let tunnels = MockTunnels::new(events.clone(), vec![]);
 
-        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", None, 18563, &fast_params())
+        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", Some("ns1"), None, 18563, &fast_params())
             .await
             .unwrap_err();
         assert!(err.contains("kubectl port-forward 启动失败"), "err: {err}");
@@ -552,7 +587,7 @@ mod tests {
         let base = ScriptedEventChannel::new(events.clone(), "base", script);
         let tunnels = MockTunnels::new(events.clone(), vec![]);
 
-        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", None, 18563, &fast_params())
+        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", Some("ns1"), None, 18563, &fast_params())
             .await
             .unwrap_err();
         assert!(err.contains("未就绪"), "err: {err}");
@@ -567,7 +602,7 @@ mod tests {
         let base = ScriptedEventChannel::new(events.clone(), "base", pf_base_script());
         let tunnels = MockTunnels::new(events.clone(), vec![Err("ssh refused".to_string())]);
 
-        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", None, 18563, &fast_params())
+        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", Some("ns1"), None, 18563, &fast_params())
             .await
             .unwrap_err();
         assert!(err.contains("TunnelManager"), "err: {err}");
@@ -583,7 +618,7 @@ mod tests {
         let dead = dead_local_port().await;
         let tunnels = MockTunnels::new(events.clone(), vec![Ok(dead)]);
 
-        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", None, 18563, &fast_params())
+        let err = establish_pf_tunnel(base.as_ref(), tunnels.as_ref(), "env-1", "svc-1", Some("ns1"), None, 18563, &fast_params())
             .await
             .unwrap_err();
         assert!(err.contains("健康检查失败"), "err: {err}");
