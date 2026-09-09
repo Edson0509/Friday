@@ -10,20 +10,23 @@ const BACKOFF_SECS: [u64; 5] = [5, 15, 45, 120, 360];
 
 enum StatRemote {
     Size(u64),
-    Missing,      // exit_code != 0 → 远端文件不存在（终态）
-    Unavailable,  // run() 出错 → 连接问题（可重试）
+    /// exit_code != 0。远端文件不存在是最常见原因，但 k8s 通道下 kubectl 级失败
+    /// （API server 抖动/Unauthorized）也会走到这里——stderr 随附，调用方文案不得断言"文件不存在"。
+    Missing(String),
+    Unavailable, // run() 出错 → 连接问题（可重试）
 }
 
-/// stat 远端文件大小。Missing = 文件不存在（终态）；Unavailable = 通道错误（可重试）。
+/// stat 远端文件大小。Missing = 非 0 退出（文件缺失或 kubectl 级失败，含 stderr）；
+/// Unavailable = 通道错误（可重试）。
 async fn stat_remote(channel: &Arc<dyn ExecChannel>, remote_path: &str) -> StatRemote {
     let cmd = format!("stat -c %s {}", crate::exec::ssh::shell_quote_single(remote_path));
     match channel.run(&cmd).await {
         Err(_) => StatRemote::Unavailable,
         Ok(o) if o.exit_code == 0 => match o.stdout.trim().parse::<u64>() {
             Ok(n) => StatRemote::Size(n),
-            Err(_) => StatRemote::Missing,
+            Err(_) => StatRemote::Missing(format!("unexpected stat output: {:?}", o.stdout)),
         },
-        Ok(_) => StatRemote::Missing,
+        Ok(o) => StatRemote::Missing(format!("exit {}: {}", o.exit_code, o.stderr.trim())),
     }
 }
 
@@ -96,12 +99,12 @@ pub async fn run_download(mgr: Arc<TransferManager>, state: TransferState, cance
 
         let total = match stat_remote(&channel, &remote_path).await {
             StatRemote::Size(total) => total,
-            StatRemote::Missing => {
+            StatRemote::Missing(detail) => {
                 channel.disconnect().await;
                 mgr.finish(
                     &id,
                     Status::Failed,
-                    Some(format!("远端文件不存在或无法读取: {remote_path}")),
+                    Some(format!("远端文件不存在或无法读取: {remote_path}（{detail}；k8s 目标下也可能是 kubectl/API server 级失败，重试前请先核实）")),
                     0, 0,
                 ).await;
                 return; // 终态不重试
@@ -357,9 +360,9 @@ pub async fn run_upload(mgr: Arc<TransferManager>, state: TransferState, cancel:
                         tracing::warn!(transfer_id = %id, remote_size, total, "transfer: remote size mismatch after upload, retrying");
                         continue;
                     }
-                    Ok(StatRemote::Missing) => {
+                    Ok(StatRemote::Missing(detail)) => {
                         // 上传刚完成，文件理应存在；不存在视作异常，重试
-                        tracing::warn!(transfer_id = %id, "transfer: remote file missing after upload, retrying");
+                        tracing::warn!(transfer_id = %id, detail, "transfer: remote file missing after upload, retrying");
                         continue;
                     }
                     Ok(StatRemote::Unavailable) => {
@@ -436,7 +439,7 @@ mod tests {
             async fn is_alive(&self) -> bool { true }
         }
         let ch: Arc<dyn ExecChannel> = Arc::new(NoFileChan);
-        assert!(matches!(stat_remote(&ch, "/tmp/gone").await, StatRemote::Missing));
+        assert!(matches!(stat_remote(&ch, "/tmp/gone").await, StatRemote::Missing(_)));
     }
 
     #[tokio::test]

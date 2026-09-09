@@ -242,6 +242,9 @@ impl ExecChannel for K8sChannel {
         // ③ leg2：宿主机 staging → Friday 本地（现有 SFTP，offset 续传 + progress）
         if let Err(e) = self.base.download(&staging, local, offset, progress).await {
             tracing::warn!(pod = %self.pod, remote_path, staging = %staging, error = %e, "k8s download: leg 2 sftp failed");
+            // 半截 staging 即时清理（失败路径唯一防线：用户已否决周期扫描）；
+            // 连接级失败时 rm 也会失败——best-effort，与 upload 同语义
+            let _ = self.base.run(&format!("rm -f {staging_q}")).await;
             return Err(format!(
                 "k8s download: leg 2 (sftp from host staging {staging}) failed: {e}"
             )
