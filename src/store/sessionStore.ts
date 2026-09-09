@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { sendMessage as ipcSendMessage, stopAgent, listSessions, onAppEvent, getSessionMessages, archiveSession as ipcArchiveSession, unarchiveSession as ipcUnarchiveSession, deleteSession as ipcDeleteSession, confirmTool } from "@/lib/ipc";
+import { sendMessage as ipcSendMessage, stopAgent, listSessions, onAppEvent, getSessionMessages, archiveSession as ipcArchiveSession, unarchiveSession as ipcUnarchiveSession, deleteSession as ipcDeleteSession, renameSession as ipcRenameSession, confirmTool } from "@/lib/ipc";
 import type { SessionRow, ChatMessage, ChatPart, AppEvent, MessageRow, TransferInfo } from "@/lib/types";
 
 interface SessionStore {
@@ -25,6 +25,7 @@ interface SessionStore {
   archiveSession: (id: string) => Promise<void>;
   unarchiveSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  renameSession: (id: string, title: string) => Promise<void>;
   confirmToolAction: (confirmId: string, approved: boolean) => Promise<void>;
 }
 
@@ -237,6 +238,20 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       }));
     } catch (e) {
       console.error("Failed to delete session:", errMsg(e));
+    }
+  },
+
+  renameSession: async (id, title) => {
+    try {
+      await ipcRenameSession(id, title);
+      set((state) => ({
+        sessions: state.sessions.map((s) => (s.id === id ? { ...s, title } : s)),
+        archivedSessions: state.archivedSessions.map((s) =>
+          s.id === id ? { ...s, title } : s,
+        ),
+      }));
+    } catch (e) {
+      console.error("Failed to rename session:", errMsg(e));
     }
   },
 

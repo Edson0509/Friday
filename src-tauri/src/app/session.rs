@@ -60,6 +60,15 @@ fn truncate_title(message: &str) -> String {
     chars.into_iter().collect()
 }
 
+/// 校验重命名标题：去首尾空白、拒绝空值、超长截断（与自动标题 40 字符上限一致）。
+pub fn normalize_rename_title(title: &str) -> Result<String, String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("标题不能为空".to_string());
+    }
+    Ok(truncate_title(trimmed))
+}
+
 pub async fn create_session(
     pool: &SqlitePool,
     message: &str,
@@ -350,6 +359,20 @@ pub async fn unarchive_session(pool: &SqlitePool, id: &str) -> Result<(), sqlx::
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// 重命名会话。返回 false 表示目标会话不存在（0 行命中）。
+pub async fn rename_session(
+    pool: &SqlitePool,
+    id: &str,
+    title: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE sessions SET title = ? WHERE id = ?")
+        .bind(title)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn delete_session(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
@@ -653,6 +676,64 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "closed");
         assert!(archived_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rename_session_updates_title() {
+        let pool = setup().await;
+        let session = create_session(&pool, "original title").await.unwrap();
+
+        let updated = rename_session(&pool, &session.id.0, "renamed title").await.unwrap();
+        assert!(updated);
+
+        let title: String = sqlx::query_scalar("SELECT title FROM sessions WHERE id = ?")
+            .bind(&session.id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "renamed title");
+    }
+
+    #[tokio::test]
+    async fn test_rename_session_returns_false_for_nonexistent() {
+        let pool = setup().await;
+        let updated = rename_session(&pool, "nonexistent", "renamed").await.unwrap();
+        assert!(!updated);
+    }
+
+    #[tokio::test]
+    async fn test_rename_session_works_on_archived_session() {
+        let pool = setup().await;
+        let session = create_session(&pool, "will be archived").await.unwrap();
+        archive_session(&pool, &session.id.0).await.unwrap();
+
+        let updated = rename_session(&pool, &session.id.0, "renamed archived").await.unwrap();
+        assert!(updated);
+
+        let title: String = sqlx::query_scalar("SELECT title FROM sessions WHERE id = ?")
+            .bind(&session.id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "renamed archived");
+    }
+
+    #[test]
+    fn test_normalize_rename_title_trims_whitespace() {
+        assert_eq!(normalize_rename_title("  新标题  ").unwrap(), "新标题");
+    }
+
+    #[test]
+    fn test_normalize_rename_title_rejects_blank() {
+        assert!(normalize_rename_title("   ").is_err());
+        assert!(normalize_rename_title("").is_err());
+    }
+
+    #[test]
+    fn test_normalize_rename_title_truncates_to_40_chars() {
+        let long = "这是一条非常非常非常非常非常非常非常非常非常非常非常非常非常非常长的重命名标题要超过四十个字符";
+        let normalized = normalize_rename_title(long).unwrap();
+        assert_eq!(normalized.chars().count(), 40);
     }
 
     #[tokio::test]

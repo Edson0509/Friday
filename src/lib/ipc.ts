@@ -34,6 +34,10 @@ export async function deleteSession(sessionId: string): Promise<void> {
   return invoke<void>("delete_session_cmd", { sessionId });
 }
 
+export async function renameSession(sessionId: string, title: string): Promise<void> {
+  return invoke<void>("rename_session_cmd", { sessionId, title });
+}
+
 export async function exportSessionLogs(sessionId: string): Promise<SessionLogsExport> {
   return invoke<SessionLogsExport>("export_session_logs_cmd", { sessionId });
 }
