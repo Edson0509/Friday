@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, ChildStdout, ChildStderr};
+use tokio::process::{Child, ChildStdout, ChildStderr, Command};
+use tokio::time::{timeout, Duration};
 
 use crate::agent::prompt;
 
@@ -95,6 +96,87 @@ fn command_config_for(provider: &str) -> CommandConfig {
     }
 }
 
+/// Pick the first session-resume flag from `--help` output that the CLI
+/// actually advertises, in candidate (preference) order.
+/// `--sessions` and `--session-id` are not substrings of each other, so a
+/// plain `contains()` check is sufficient and unambiguous.
+fn pick_session_flag_from_help(help_text: &str, candidates: &[&'static str]) -> Option<&'static str> {
+    candidates
+        .iter()
+        .copied()
+        .find(|flag| help_text.contains(flag))
+}
+
+/// Probe the agent CLI's `--help` output to determine which session-resume
+/// flag it actually supports.
+///
+/// Different CodeAgentCLI versions use different flag names for resuming a
+/// conversation: newer versions advertise `--sessions <id>`, while older ones
+/// only know `--session-id`. Friday passes the session flag only when
+/// resuming (`agent_session_id` is `Some`). If we hardcode `--sessions` and
+/// the installed CLI is an older version, the CLI exits immediately with
+/// `error: unknown option '--sessions'` and the user sees an error in the UI.
+///
+/// This runs `<exe> --help` (5s timeout), checks which candidate flag the
+/// output advertises, and returns the first match. On probe failure (timeout,
+/// IO error) or when no candidate is advertised, it falls back to the
+/// preferred flag so behavior is no worse than before the probe existed.
+async fn resolve_session_flag(exe_path: &Path, provider: &str, preferred: &'static str) -> &'static str {
+    // Only codeagentcli has version-dependent flag names; opencode's
+    // `--session` has been stable.
+    if provider != "codeagentcli" {
+        return preferred;
+    }
+
+    // Ordered fallback list. The preferred flag is tried first; if the CLI's
+    // help output doesn't mention it, we fall through to the next candidate.
+    let candidates: &[&'static str] = match preferred {
+        "--sessions" => &["--sessions", "--session-id"],
+        "--session-id" => &["--session-id", "--sessions"],
+        _ => &[preferred],
+    };
+
+    let result = timeout(
+        Duration::from_secs(5),
+        Command::new(exe_path)
+            .arg("--help")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await;
+
+    let output = match result {
+        Ok(Ok(output)) => output,
+        _ => {
+            tracing::warn!(provider, "session-flag probe failed, using preferred flag");
+            return preferred;
+        }
+    };
+    let help_text = String::from_utf8_lossy(&output.stdout);
+
+    match pick_session_flag_from_help(&help_text, candidates) {
+        Some(flag) => {
+            if flag != preferred {
+                tracing::warn!(
+                    provider,
+                    preferred,
+                    resolved = flag,
+                    "session flag fallback: preferred flag not supported by installed CLI"
+                );
+            }
+            flag
+        }
+        None => {
+            tracing::warn!(
+                provider,
+                "session-flag probe found no supported candidate, using preferred flag"
+            );
+            preferred
+        }
+    }
+}
+
 #[tracing::instrument(skip(pool))]
 pub async fn spawn_active(
     pool: &sqlx::SqlitePool,
@@ -136,7 +218,8 @@ pub async fn spawn_active(
         .arg("--dangerously-skip-permissions");
 
     if let Some(ref id) = agent_session_id {
-        cmd.arg(config.session_flag).arg(id);
+        let flag = resolve_session_flag(&exe_path, &provider, config.session_flag).await;
+        cmd.arg(flag).arg(id);
     }
 
     let prompt_text = if let Some(exps) = experiences {
@@ -439,5 +522,67 @@ mod tests {
         assert_eq!(config.format_args, &["--format", "json"]);
         assert_eq!(config.session_flag, "--session");
         assert!(config.needs_exe_resolution);
+    }
+
+    #[test]
+    fn test_pick_session_flag_matches_old_cli_session_id() {
+        // Older CodeAgentCLI only advertises --session-id for resuming.
+        let help = "usage: codeagentcli [options]\n  --session-id <uuid>  session to resume";
+        let candidates = ["--sessions", "--session-id"];
+        assert_eq!(
+            pick_session_flag_from_help(help, &candidates),
+            Some("--session-id")
+        );
+    }
+
+    #[test]
+    fn test_pick_session_flag_prefers_preferred_when_both_supported() {
+        let help = "  --sessions <id>   resume session\n  --session-id <uuid>  set id for new conversation";
+        let candidates = ["--sessions", "--session-id"];
+        assert_eq!(
+            pick_session_flag_from_help(help, &candidates),
+            Some("--sessions")
+        );
+    }
+
+    #[test]
+    fn test_pick_session_flag_returns_none_when_no_candidate_supported() {
+        let help = "usage: codeagentcli [options]\n  --version  print version";
+        let candidates = ["--sessions", "--session-id"];
+        assert_eq!(pick_session_flag_from_help(help, &candidates), None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_flag_returns_preferred_for_opencode() {
+        // opencode's `--session` has been stable — no probing, so a
+        // nonexistent path must not matter and no subprocess is launched.
+        let path = PathBuf::from("/nonexistent/opencode");
+        let flag = resolve_session_flag(&path, "opencode", "--session").await;
+        assert_eq!(flag, "--session");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_session_flag_falls_back_when_probe_fails() {
+        // Nonexistent binary -> --help probe fails -> preferred flag returned.
+        let path = PathBuf::from("/nonexistent/codeagentcli");
+        let flag = resolve_session_flag(&path, "codeagentcli", "--sessions").await;
+        assert_eq!(flag, "--sessions");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_resolve_session_flag_picks_old_cli_flag_from_help() {
+        // A fake CLI whose --help only advertises --session-id (old
+        // CodeAgentCLI). The probe must pick --session-id over the preferred
+        // --sessions so resume works against old CLI versions.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-codeagentcli.cmd");
+        std::fs::write(
+            &fake,
+            "@echo usage: fake-codeagentcli [options]\r\n@echo   --session-id ^<uuid^>  session to resume\r\n",
+        )
+        .unwrap();
+        let flag = resolve_session_flag(&fake, "codeagentcli", "--sessions").await;
+        assert_eq!(flag, "--session-id");
     }
 }
