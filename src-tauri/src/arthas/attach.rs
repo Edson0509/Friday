@@ -105,6 +105,8 @@ pub fn validate_pod_ip(ip: &str) -> Result<(), String> {
 }
 
 /// 从 start 起找两个空闲端口（http + telnet 预检用）：探测候选 count 个，输出两行。
+/// VM 分支用（目标机本地 bash /dev/tcp 探 127.0.0.1）；pod 分支用
+/// find_free_port_pod_command（宿主机侧探 podIP——容器 sh 无 /dev/tcp）。
 /// 遍历全部候选输出空闲端口再 `head -2`（管道下循环 SIGPIPE 提前退出，行为正确）；
 /// 末尾 `; true` 保证整体 exit 0（探活命令的退出码不被 head 影响）。
 pub fn find_free_port_command(start: u16, count: u16) -> String {
@@ -112,6 +114,22 @@ pub fn find_free_port_command(start: u16, count: u16) -> String {
     format!(
         "for p in $(seq {start} {end}); do \
          if (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then exec 3>&- 3<&-; else echo $p; fi; \
+         done | head -2; true"
+    )
+}
+
+/// 宿主机侧 Pod 端口段分配（pod 模式）：bash /dev/tcp 打 podIP 逐候选探测，
+/// 连不上（含 timeout 1 网络黑洞兜底）= 空闲 → 输出端口。容器 sh（busybox）
+/// 无 /dev/tcp，容器内探测恒 free（同 Pod 并发会话恒选 18563 撞 already-bind），
+/// 故 pod 模式探测必须经 base 通道在宿主机执行。遍历全部候选输出空闲端口再
+/// `head -2`（管道下循环 SIGPIPE 提前退出）；末尾 `; true` 保证整体 exit 0。
+/// `$p` 用双引号由宿主机 shell 展开后传入内层 bash——单引号内变量不透传，
+/// 空展开会让所有端口恒报空闲。pod_ip 必须先过 validate_pod_ip（防注入）。
+pub fn find_free_port_pod_command(pod_ip: &str, start: u16, count: u16) -> String {
+    let end = start + count - 1;
+    format!(
+        "for p in $(seq {start} {end}); do \
+         timeout 1 bash -c \"exec 3<>/dev/tcp/{pod_ip}/$p\" 2>/dev/null || echo $p; \
          done | head -2; true"
     )
 }
@@ -208,7 +226,7 @@ enum AttachExecKind {
 
 async fn attach_arthas(deps: AttachDeps, req: AttachRequest) -> Result<AttachedSession, ManagerError> {
     // 0. 宿主机默认连接（连接池）：VM 分支的命令执行主通道；k8s 分支的
-    //    装备中转（staging unzip/tar）与探活（podIP 查询 + /dev/tcp）通道
+    //    装备中转（staging unzip/tar）、podIP 查询与宿主机侧端口探测/探活通道
     let base = get_default_channel(&deps, &req.env_id).await?;
     match req.pod.clone() {
         Some(pod) => attach_arthas_in_pod(deps, req, base, &pod).await,
@@ -337,8 +355,9 @@ async fn attach_arthas_on_vm(
     Ok(AttachedSession { client, stop_handle, remote_port: port })
 }
 
-/// 容器分支（k8s）：双通道编排——base = 宿主机（装备中转、podIP 查询与探活），
-/// k8s_ch = 容器内执行（properties/attach/残留清理/MCP curl 桥）。
+/// 容器分支（k8s）：双通道编排——base = 宿主机（装备中转、podIP 查询、残留
+/// 清理/端口分配的 podIP 探测、探活），k8s_ch = 容器内执行（java 解析/
+/// properties/attach/残留清理 stop/MCP curl 桥）。
 async fn attach_arthas_in_pod(
     deps: AttachDeps,
     req: AttachRequest,
@@ -533,11 +552,12 @@ async fn pod_bridge_fallback(
     }
 }
 
-/// 容器 attach 前半程编排（装备 → java 解析 → 残留清理 → 端口/properties →
-/// attach → 探活），返回 (http_port, token) 供 MCP 建桥握手。
-/// base = 宿主机通道（ensure_k8s 中转 + podIP 查询/探活）；k8s_ch = 容器内通道
-/// （java 解析/properties/attach/残留清理）。探活失败不硬失败（宿主→Pod 网络
-/// 可能被 NetworkPolicy 拦截），最终可达性由 MCP 握手判定。
+/// 容器 attach 前半程编排（装备 → java 解析 → podIP 查询 → 残留清理 → 端口/
+/// properties → attach → 探活），返回 (http_port, token) 供 MCP 建桥握手。
+/// base = 宿主机通道（ensure_k8s 中转 + podIP 查询/残留清理与端口分配的 podIP
+/// 探测/探活）；k8s_ch = 容器内通道（java 解析/properties/attach/残留清理 stop）。
+/// podIP 查询失败不硬失败：残留清理/端口分配降级容器内探测（busybox sh 无
+/// /dev/tcp 时失明，同旧路径），探活跳过，最终可达性由 MCP 握手判定。
 async fn pod_attach_prepare(
     deps: &AttachDeps,
     req: &AttachRequest,
@@ -572,15 +592,51 @@ async fn pod_attach_prepare(
     // 3. 用户对齐：跳过——容器 exec 用户 = ossadm = JVM 用户（设计决策），
     //    VM 分支的跨用户临时连接流程不适用。
 
-    // 3.5 残留实例清理（经 k8s_ch = 容器内语义；容器 sh 无 bash /dev/tcp 时探测
-    //     恒 free，清理退化为 no-op——already-bind 由探活/握手超时兜底报错）
-    progress("cleanup", "清理容器内残留 arthas 实例".to_string());
-    let active_ports = (deps.active_ports_fn)(&req.env_id).await;
-    cleanup_stale_instances(k8s_ch.as_ref(), &active_ports).await?;
+    // 3.4 查询 Pod IP（宿主机侧 kubectl，输出经 IpAddr 校验防注入）：残留清理/
+    //     端口分配的宿主机侧探测与探活共用（只查一次，探活复用；早取失败时
+    //     探活前幂等重取一次）。容器 sh（busybox）无 bash /dev/tcp，容器内探测
+    //     恒 free——端口分配失明会让同 Pod 并发会话恒选 18563 撞 already-bind，
+    //     故 pod 模式端口探测一律走宿主机侧打 podIP。
+    let pod_ip = match get_pod_ip(base.as_ref(), pod).await {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            tracing::warn!(session_id = %req.session_id, env_id = %req.env_id, pod, error = %e,
+                "podIP 查询失败：残留清理/端口分配降级容器内探测（busybox 下失明），探活跳过，MCP 握手兜底");
+            None
+        }
+    };
 
-    // 4. 端口分配 + properties 写入（容器内 dist 目录；绑 0.0.0.0 供宿主侧探活/T6 隧道接入）
+    // 3.5 残留实例清理：探测走宿主机侧打 podIP（容器 sh 无 /dev/tcp，容器内探测
+    //     恒 free 失明），stop 走容器内 curl（容器内 127.0.0.1 回环可达）。podIP
+    //     拿不到时降级容器内探测（busybox 下恒 free，清理退化为 no-op——
+    //     already-bind 由探活/握手超时兜底报错）
+    progress("cleanup", "清理残留 arthas 实例".to_string());
+    let active_ports = (deps.active_ports_fn)(&req.env_id).await;
+    match &pod_ip {
+        Some(ip) => {
+            cleanup_stale_instances_with(
+                base.as_ref(),
+                k8s_ch.as_ref(),
+                &|port| pod_ip_probe_command(ip, port),
+                &active_ports,
+                std::time::Duration::from_secs(15),
+                std::time::Duration::from_millis(500),
+            )
+            .await?;
+        }
+        None => {
+            cleanup_stale_instances(k8s_ch.as_ref(), &active_ports).await?;
+        }
+    }
+
+    // 4. 端口分配 + properties 写入（容器内 dist 目录；绑 0.0.0.0 供宿主侧探测/T6 隧道接入）。
+    //    pod 模式端口探测走宿主机侧 podIP:port（容器内探测失明）；podIP 拿不到时
+    //    降级容器内探测（旧路径，busybox 下失明，MCP 握手兜底）
     progress("allocate_port", "分配 arthas 端口".to_string());
-    let (port, telnet_det_port) = find_free_remote_port(k8s_ch.as_ref()).await?;
+    let (port, telnet_det_port) = match &pod_ip {
+        Some(ip) => find_free_remote_port_pod(base.as_ref(), ip).await?,
+        None => find_free_remote_port(k8s_ch.as_ref()).await?,
+    };
     let token = generate_token();
     progress("write_config", format!("写入 arthas.properties（httpPort={port}，绑定 0.0.0.0）"));
     write_properties(k8s_ch.as_ref(), &arthas_home, &arthas_properties_content_pod(port, &token)).await?;
@@ -590,10 +646,15 @@ async fn pod_attach_prepare(
     run_attach_command(k8s_ch.as_ref(), &java, &arthas_home, port, telnet_det_port, req.pid).await?;
 
     // 6. 探活：宿主机侧 /dev/tcp 打 podIP（容器 sh 无 /dev/tcp，容器内探测不可行）。
+    //    podIP 复用 3.4 的查询结果（早取失败的幂等重取一次——容忍瞬时 kubectl 故障）。
     //    失败兜底：不硬失败——宿主→Pod 网络可能被拦截，交由 MCP 握手（容器内
     //    curl 127.0.0.1）+ 重试做最终判定。
     progress("probe", "等待 arthas HTTP 服务就绪（宿主机侧探 podIP）".to_string());
-    match get_pod_ip(base.as_ref(), pod).await {
+    let pod_ip = match pod_ip {
+        Some(ip) => Ok(ip),
+        None => get_pod_ip(base.as_ref(), pod).await,
+    };
+    match pod_ip {
         Ok(pod_ip) => {
             if let Err(e) = wait_pod_port_ready(
                 base.as_ref(),
@@ -615,9 +676,11 @@ async fn pod_attach_prepare(
 }
 
 /// best-effort stop：HTTP stop arthas（卸载 agent）+ 关 MCP client。
-/// pf=Some（T6 隧道模式）时 stop 编排见 run_production_stop：经隧道原生 HTTP
-/// 停 arthas → kill 宿主机 pf → 关 TunnelManager 隧道；隧道不可用回落
-/// exec 通道 curl（k8s = kubectl exec 容器内；VM = 宿主机本地）。
+/// pf=Some（T6 隧道模式）时 stop 编排见 run_production_stop：先经隧道原生 HTTP
+/// 停 arthas（TunnelManager 专属连接，不依赖宿主机 exec 通道——base 拿不到也
+/// 先试）→ kill 宿主机 pf → 关 TunnelManager 隧道（base 拿不到仍关隧道，kill pf
+/// 交由下次 attach 的 pkill 兜底）；隧道 stop 失败回落 exec 通道 curl
+/// （k8s = kubectl exec 容器内；VM = 宿主机本地）。
 /// pf=None（VM / 桥降级模式）：exec 通道 curl stop（原 T5 行为）。
 struct ProductionStopHandle {
     db: sqlx::SqlitePool,
@@ -699,10 +762,11 @@ impl ArthasStopHandle for ProductionStopHandle {
 /// stop 编排核心（参数全注入，测试 seam）。固定顺序：
 /// ① client.shutdown()（DELETE MCP 会话——隧道模式经原生 transport 走隧道，
 ///    此时 arthas 与隧道都还活着，语义与 T5 一致：先清会话再停 arthas）
-/// ② pf 存在（隧道模式）：经隧道原生 HTTP stop arthas → kill pf → 关隧道
-///    （teardown_pod_tunnel_session；kill pf 固定先于 tunnels.close——反序时
-///    close 失败会泄漏宿主机 pf 进程）。宿主机通道拿不到：仍关隧道，kill pf
-///    交由下次 attach 的 pkill 清残留兜底
+/// ② pf 存在（隧道模式）：先经隧道原生 HTTP stop arthas（tunnel_stop 走
+///    TunnelManager 专属连接，**不依赖宿主机 exec 通道**——拿不到 base 时也
+///    必须先试）→ kill pf + 关隧道（teardown_pf；kill pf 固定先于 tunnels.close
+///    ——反序时 close 失败会泄漏宿主机 pf 进程）。宿主机通道拿不到：仍关隧道，
+///    kill pf 交由下次 attach 的 pkill 清残留兜底
 /// ③ arthas 尚未停掉（无 pf / 隧道 stop 失败）：exec 通道 curl stop 兜底
 async fn run_production_stop(
     client: &dyn ArthasClient,
@@ -722,16 +786,27 @@ async fn run_production_stop(
     // ② 隧道段
     let mut agent_stopped = false;
     if let Some(pf) = pf {
+        // ②a 隧道原生 stop：TunnelManager 专属连接（本地端口 L），不依赖宿主机
+        //     exec 通道——base 拿不到也先试（旧序在 base 失败时整段跳过，
+        //     白白放弃不依赖 base 的停 arthas 通路）
+        agent_stopped = match tunnel_stop(pf.local_port).await {
+            Ok(()) => {
+                tracing::info!(env_id, local_port = pf.local_port, "arthas stopped via tunnel-native http");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    env_id, local_port = pf.local_port, error = %e,
+                    "tunnel-native arthas stop 失败（将回落 exec 通道 stop）"
+                );
+                false
+            }
+        };
+        // ②b kill pf + 关隧道（需宿主机通道；拿不到 → 仍关隧道条目，kill pf
+        //     交由下次 attach 的 pkill 清残留兜底）
         match get_base_channel().await {
             Ok(base) => {
-                agent_stopped = super::tunnel::teardown_pod_tunnel_session(
-                    base.as_ref(),
-                    tunnels,
-                    tunnel_stop,
-                    env_id,
-                    pf,
-                )
-                .await;
+                super::tunnel::teardown_pf(base.as_ref(), tunnels, env_id, pf.pf_pid, Some(pf.host_port)).await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -893,11 +968,24 @@ async fn check_users(
     parse_user_check(&out.stdout).map_err(|e| ManagerError::Attach(format!("用户对齐检查失败: {e}; stderr: {}", out.stderr)))
 }
 
-/// 分配远端空闲端口（18563 起顺序探测，取两个：http + telnet 预检）
+/// 分配远端空闲端口（VM 分支：18563 起顺序探测目标机本地回环，取两个：
+/// http + telnet 预检）
 async fn find_free_remote_port(channel: &dyn ExecChannel) -> Result<(u16, u16), ManagerError> {
     let cmd = find_free_port_command(ARTHAS_PORT_START, ARTHAS_PORT_CANDIDATES);
     let out = run_with_timeout(channel, &cmd, 20).await?;
-    parse_free_port(&out.stdout).map_err(|e| ManagerError::Attach(e))
+    parse_free_port(&out.stdout).map_err(ManagerError::Attach)
+}
+
+/// 分配 Pod 内空闲端口（pod 分支：宿主机侧 /dev/tcp 打 podIP 逐候选探测——
+/// 容器 sh 无 /dev/tcp，容器内探测恒 free 失明。timeout 1 兜底网络黑洞，
+/// 10 候选最坏 10s，整体预算 30s）
+async fn find_free_remote_port_pod(
+    base: &dyn ExecChannel,
+    pod_ip: &str,
+) -> Result<(u16, u16), ManagerError> {
+    let cmd = find_free_port_pod_command(pod_ip, ARTHAS_PORT_START, ARTHAS_PORT_CANDIDATES);
+    let out = run_with_timeout(base, &cmd, 30).await?;
+    parse_free_port(&out.stdout).map_err(ManagerError::Attach)
 }
 
 /// 写 arthas.properties（经默认连接执行；chmod 644 保证 jvm_user 可读）
@@ -1038,7 +1126,7 @@ async fn connect_with_retry(
     }
 }
 
-/// 残留 arthas 实例清理：探测段内端口，被占且非活跃 → HTTP stop + 等释放。
+/// 残留 arthas 实例清理（VM 模式：探测与 stop 都在目标机本地 127.0.0.1）。
 /// v0.11.2+ 实例（localConnectionNonAuth）本地 stop 免密；更早残留会 401 → 报错指路重启目标服务。
 async fn cleanup_stale_instances(
     channel: &dyn ExecChannel,
@@ -1046,6 +1134,8 @@ async fn cleanup_stale_instances(
 ) -> Result<(), ManagerError> {
     cleanup_stale_instances_with(
         channel,
+        channel,
+        &port_probe_command,
         active_ports,
         std::time::Duration::from_secs(15),
         std::time::Duration::from_millis(500),
@@ -1053,9 +1143,15 @@ async fn cleanup_stale_instances(
     .await
 }
 
-/// cleanup_stale_instances 的参数化内核（等待预算/轮询间隔可调，测试用快参数）
+/// cleanup_stale_instances 的参数化内核：探测通道 / stop 通道 / 探测命令注入。
+/// VM = 宿主机本地 port_probe_command（探 127.0.0.1）；pod = 宿主机侧
+/// pod_ip_probe_command 打 podIP + 容器内 stop（容器 sh 无 /dev/tcp，容器内
+/// 探测恒 free 失明）。stop 恒为执行侧本地 curl（127.0.0.1 回环：VM = 宿主机 /
+/// pod = 容器内）。等待预算/轮询间隔可调（测试用快参数）。
 async fn cleanup_stale_instances_with(
-    channel: &dyn ExecChannel,
+    probe_channel: &dyn ExecChannel,
+    stop_channel: &dyn ExecChannel,
+    probe_command: &(dyn Fn(u16) -> String + Sync),
     active_ports: &[u16],
     wait_budget: std::time::Duration,
     poll_interval: std::time::Duration,
@@ -1064,18 +1160,18 @@ async fn cleanup_stale_instances_with(
         if active_ports.contains(&port) {
             continue;
         }
-        let probe = run_with_timeout(channel, &port_probe_command(port), 15)
+        let probe = run_with_timeout(probe_channel, &probe_command(port), 15)
             .await
             .map_err(|e| ManagerError::Attach(format!("残留端口探测失败: {e}")))?;
         if probe.stdout.trim() != "busy" {
             continue;
         }
         tracing::info!(port, "stale arthas instance detected, stopping");
-        run_with_timeout(channel, &stop_command(port, ""), 15).await?;
+        run_with_timeout(stop_channel, &stop_command(port, ""), 15).await?;
         let deadline = tokio::time::Instant::now() + wait_budget;
         loop {
             tokio::time::sleep(poll_interval).await;
-            let check = run_with_timeout(channel, &port_probe_command(port), 15).await?;
+            let check = run_with_timeout(probe_channel, &probe_command(port), 15).await?;
             if check.stdout.trim() != "busy" {
                 tracing::info!(port, "stale arthas instance stopped");
                 break;
@@ -1229,6 +1325,23 @@ mod tests {
     }
 
     #[test]
+    fn test_find_free_port_pod_command_shape() {
+        let cmd = find_free_port_pod_command("10.244.1.5", 18563, 10);
+        assert!(cmd.contains("seq 18563 18572"), "cmd: {cmd}");
+        // $p 经双引号由宿主机 shell 展开后传入内层 bash——单引号内变量不透传，
+        // 空展开会让所有端口恒报空闲（重蹈 busybox /dev/tcp 失明）
+        assert!(cmd.contains("bash -c \"exec 3<>/dev/tcp/10.244.1.5/$p\""), "cmd: {cmd}");
+        // timeout 1 兜底网络黑洞（与 pod_ip_probe_command 同构）
+        assert!(cmd.contains("timeout 1"), "cmd: {cmd}");
+        // 连不上 = 空闲 → 输出端口（与 VM 版语义一致，取前两个）
+        assert!(cmd.contains("|| echo $p"), "cmd: {cmd}");
+        assert!(cmd.contains("head -2"), "cmd: {cmd}");
+        assert!(cmd.ends_with("; true"), "cmd: {cmd}");
+        // 解析复用 parse_free_port（宿主机侧探测结果与 VM 形同）
+        assert_eq!(parse_free_port("18564\n18565").unwrap(), (18564, 18565));
+    }
+
+    #[test]
     fn test_port_probe_command() {
         assert!(port_probe_command(8563).contains("/dev/tcp/127.0.0.1/8563"));
     }
@@ -1358,9 +1471,16 @@ mod tests {
             ("free", 0), ("free", 0), ("free", 0), ("free", 0), ("free", 0),
             ("free", 0), ("free", 0), ("free", 0), ("free", 0), // 18564~18572
         ]);
-        cleanup_stale_instances_with(channel.as_ref(), &[], FAST_BUDGET, FAST_INTERVAL)
-            .await
-            .unwrap();
+        cleanup_stale_instances_with(
+            channel.as_ref(),
+            channel.as_ref(),
+            &port_probe_command,
+            &[],
+            FAST_BUDGET,
+            FAST_INTERVAL,
+        )
+        .await
+        .unwrap();
         let calls = channel.calls().await;
         assert_eq!(calls.len(), 12, "calls: {calls:?}");
         assert!(calls[0].contains("/dev/tcp/127.0.0.1/18563"), "calls[0]: {}", calls[0]);
@@ -1377,9 +1497,16 @@ mod tests {
             ("free", 0), ("free", 0), ("free", 0), ("free", 0), ("free", 0),
             ("free", 0), ("free", 0), ("free", 0), ("free", 0), // 18564~18572
         ]);
-        cleanup_stale_instances_with(channel.as_ref(), &[18563], FAST_BUDGET, FAST_INTERVAL)
-            .await
-            .unwrap();
+        cleanup_stale_instances_with(
+            channel.as_ref(),
+            channel.as_ref(),
+            &port_probe_command,
+            &[18563],
+            FAST_BUDGET,
+            FAST_INTERVAL,
+        )
+        .await
+        .unwrap();
         let calls = channel.calls().await;
         assert_eq!(calls.len(), 9, "active port must be skipped entirely, calls: {calls:?}");
         assert!(calls.iter().all(|c| !c.contains("18563")), "calls: {calls:?}");
@@ -1397,11 +1524,53 @@ mod tests {
             responses.push(("busy", 0)); // 复查始终 busy，直到预算耗尽
         }
         let channel = RecordingChannel::new(responses);
-        let err = cleanup_stale_instances_with(channel.as_ref(), &[], FAST_BUDGET, FAST_INTERVAL)
-            .await
-            .unwrap_err();
+        let err = cleanup_stale_instances_with(
+            channel.as_ref(),
+            channel.as_ref(),
+            &port_probe_command,
+            &[],
+            FAST_BUDGET,
+            FAST_INTERVAL,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("重启目标服务"), "err: {err}");
         assert!(err.to_string().contains("18563"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_instances_pod_probes_podip_on_base_stops_in_container() {
+        // pod 模式：探测走宿主机侧 podIP（busybox 容器内 /dev/tcp 恒 free 失明），
+        // stop 走容器内 curl（127.0.0.1 回环在容器内可达）
+        let mut probe_script = vec![
+            ("busy", 0), // 18563 探测（base 打 podIP）：占用
+            ("free", 0), // 18563 复查：已释放
+        ];
+        for _ in 0..(ARTHAS_PORT_CANDIDATES - 1) {
+            probe_script.push(("free", 0)); // 18564~18572
+        }
+        let base = RecordingChannel::new(probe_script);
+        let k8s = RecordingChannel::new(vec![("", 0)]); // 18563 HTTP stop（容器内）
+        cleanup_stale_instances_with(
+            base.as_ref(),
+            k8s.as_ref(),
+            &|port| pod_ip_probe_command("10.244.1.5", port),
+            &[],
+            FAST_BUDGET,
+            FAST_INTERVAL,
+        )
+        .await
+        .unwrap();
+        let base_calls = base.calls().await;
+        assert_eq!(base_calls.len(), 11, "base_calls: {base_calls:?}");
+        assert!(base_calls[0].contains("/dev/tcp/10.244.1.5/18563"), "probe: {}", base_calls[0]);
+        assert!(base_calls[1].contains("/dev/tcp/10.244.1.5/18563"), "recheck: {}", base_calls[1]);
+        // stop 只出现在容器通道（宿主机侧无 /api 请求）
+        assert!(!base_calls.iter().any(|c| c.contains("/api")), "no stop on base: {base_calls:?}");
+        let k8s_calls = k8s.calls().await;
+        assert_eq!(k8s_calls.len(), 1, "k8s_calls: {k8s_calls:?}");
+        assert!(k8s_calls[0].contains("http://127.0.0.1:18563/api"), "stop: {}", k8s_calls[0]);
+        assert!(k8s_calls[0].contains("\"command\":\"stop\""), "stop: {}", k8s_calls[0]);
     }
 
     #[tokio::test]
@@ -1441,8 +1610,14 @@ mod tests {
     }
 
     fn pod_deps() -> AttachDeps {
-        let active_ports_fn: ActivePortsFn = Arc::new(|_env_id: &str| {
-            Box::pin(async { Vec::new() }) as Pin<Box<dyn Future<Output = Vec<u16>> + Send>>
+        pod_deps_with_active_ports(Vec::new())
+    }
+
+    /// 指定活跃会话端口的 deps（busybox 失明回归测试用：同 Pod 并发会话场景）
+    fn pod_deps_with_active_ports(active: Vec<u16>) -> AttachDeps {
+        let active_ports_fn: ActivePortsFn = Arc::new(move |_env_id: &str| {
+            let active = active.clone();
+            Box::pin(async move { active }) as Pin<Box<dyn Future<Output = Vec<u16>> + Send>>
         });
         AttachDeps {
             db: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
@@ -1471,15 +1646,28 @@ mod tests {
         async fn close(&self, _env_id: &str, _remote_host: &str, _remote_port: u16) {}
     }
 
-    /// 容器内命令脚本：java 解析 + 残留清理 ×10（全 free）+ 端口分配 + 写 properties + attach
+    /// 容器内命令脚本：java 解析 + 写 properties + attach（残留清理/端口分配的
+    /// 探测已移宿主机侧——容器 sh 无 /dev/tcp）
     fn pod_channel_script() -> Vec<(&'static str, i32)> {
-        let mut script = vec![("/usr/lib/jvm/java-21/bin/java", 0)];
+        vec![
+            ("/usr/lib/jvm/java-21/bin/java", 0),
+            ("", 0), // 写 properties
+            ("attach-started", 0),
+        ]
+    }
+
+    /// 宿主机侧脚本：ensure_k8s 缓存命中 + podIP 查询（只查一次）+ 残留清理探测
+    /// ×10（宿主机侧打 podIP，全 free）+ 端口分配探测（18563/18564 空闲）+ 探活 busy
+    fn pod_base_script() -> Vec<(&'static str, i32)> {
+        let mut script = vec![
+            ("", 0),           // kubectl exec test -f arthas-boot.jar（缓存命中）
+            ("10.244.1.5", 0), // kubectl get pod jsonpath（端口探测/探活共用）
+        ];
         for _ in 0..ARTHAS_PORT_CANDIDATES {
-            script.push(("free", 0));
+            script.push(("free", 0)); // 残留清理探测：宿主机侧打 podIP，全 free
         }
-        script.push(("18563\n18564", 0));
-        script.push(("", 0));
-        script.push(("attach-started", 0));
+        script.push(("18563\n18564", 0)); // 端口分配：宿主机侧探测结果
+        script.push(("busy", 0));         // 探活：就绪
         script
     }
 
@@ -1496,12 +1684,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pod_attach_prepare_orchestration() {
-        // base（宿主机）：ensure_k8s 缓存命中 + podIP 查询 + /dev/tcp 探活成功
-        let base = RecordingChannel::new(vec![
-            ("", 0),           // kubectl exec test -f arthas-boot.jar（缓存命中）
-            ("10.244.1.5", 0), // kubectl get pod jsonpath
-            ("busy", 0),       // /dev/tcp podIP 探活：就绪
-        ]);
+        // base（宿主机）：ensure_k8s 缓存命中 + podIP 查询（早取一次）+ 残留清理
+        // 探测 ×10 + 端口分配探测 + /dev/tcp 探活成功
+        let base = RecordingChannel::new(pod_base_script());
         let base_ch: Arc<dyn ExecChannel> = base.clone();
         let (pod_ch, k8s_ch) = k8s_recording_channel(pod_channel_script());
         let deps = pod_deps();
@@ -1521,7 +1706,7 @@ mod tests {
         assert_eq!(token.len(), 32);
 
         let base_calls = base.calls().await;
-        assert_eq!(base_calls.len(), 3, "base_calls: {base_calls:?}");
+        assert_eq!(base_calls.len(), 14, "base_calls: {base_calls:?}");
         // ① 装备走 ensure_k8s：宿主机侧 kubectl exec 缓存检查（POD_TOOLS_DIR/arthas-dist）
         assert!(base_calls[0].contains("kubectl exec"), "ensure_k8s check: {}", base_calls[0]);
         assert!(
@@ -1529,20 +1714,44 @@ mod tests {
             "ensure_k8s check: {}",
             base_calls[0]
         );
-        // ② 探活走 base 通道探 podIP：kubectl get pod jsonpath + /dev/tcp 打 podIP
+        // ② podIP 查询（早取，端口探测/探活共用——只查一次）
         assert!(base_calls[1].contains("kubectl get pod"), "podIP cmd: {}", base_calls[1]);
-        assert!(base_calls[1].contains(".status.podIP"), "podIP cmd: {}", base_calls[1]);
-        assert!(base_calls[2].contains("/dev/tcp/10.244.1.5/18563"), "probe cmd: {}", base_calls[2]);
+        assert!(
+            base_calls.iter().filter(|c| c.contains("kubectl get pod")).count() == 1,
+            "podIP must be fetched once and reused: {base_calls:?}"
+        );
+        // ③ 残留清理探测走宿主机侧打 podIP（容器 sh 无 /dev/tcp，容器内探测恒 free）
+        for (i, probe_port) in (18563..18563 + ARTHAS_PORT_CANDIDATES).enumerate() {
+            assert!(
+                base_calls[2 + i].contains(&format!("/dev/tcp/10.244.1.5/{probe_port}")),
+                "cleanup probe[{i}]: {}",
+                base_calls[2 + i]
+            );
+        }
+        // ④ 端口分配走宿主机侧：循环探测 podIP:$p（$p 双引号展开传入内层 bash）
+        let find_free = &base_calls[12];
+        assert!(find_free.contains("seq 18563 18572"), "find-free: {find_free}");
+        assert!(
+            find_free.contains("bash -c \"exec 3<>/dev/tcp/10.244.1.5/$p\""),
+            "find-free: {find_free}"
+        );
+        // ⑤ 探活复用早取的 podIP（不重复 kubectl get pod）
+        assert!(base_calls[13].contains("/dev/tcp/10.244.1.5/18563"), "probe: {}", base_calls[13]);
 
         let pod_calls = pod_ch.calls().await;
-        assert_eq!(pod_calls.len(), 14, "pod_calls: {pod_calls:?}");
+        assert_eq!(pod_calls.len(), 3, "pod_calls: {pod_calls:?}");
         // 容器内命令全部经 kubectl exec 包装（真实 K8sChannel 语义）
         for c in &pod_calls {
             assert!(c.contains("kubectl exec 'svc-1' -- sh -c"), "must be kubectl-wrapped: {c}");
         }
         // java 解析在容器内（第一个容器命令）
         assert!(pod_calls[0].contains("command -v java"), "java resolve: {}", pod_calls[0]);
-        // ③ properties 写到容器内 dist 目录，内容绑 0.0.0.0（宿主侧探活/T6 隧道可达）
+        // 端口探测全部在宿主机侧：容器内无 /dev/tcp（busybox 失明修复）
+        assert!(
+            pod_calls.iter().all(|c| !c.contains("/dev/tcp")),
+            "no port probing inside container: {pod_calls:?}"
+        );
+        // ⑥ properties 写到容器内 dist 目录，内容绑 0.0.0.0（宿主侧探测/T6 隧道可达）
         let write = pod_calls.iter().find(|c| c.contains("arthas.properties")).expect("write props cmd");
         assert!(
             write.contains("/opt/log/dump/coredump/friday-tools/arthas-dist/arthas.properties"),
@@ -1570,9 +1779,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pod_attach_prepare_concurrent_session_skips_occupied_port() {
+        // busybox /dev/tcp 失明回归：同 Pod 第二个并发会话——18563 已被活跃会话
+        // 占用，宿主机侧端口分配必须探到占用并跳到下一候选（容器内探测恒 free
+        // 会恒选 18563，第二个会话 attach 撞 already-bind）
+        let mut base_script = vec![
+            ("", 0),           // ensure_k8s 缓存命中
+            ("10.244.1.5", 0), // podIP 查询
+        ];
+        for _ in 0..(ARTHAS_PORT_CANDIDATES - 1) {
+            base_script.push(("free", 0)); // 残留清理：18564~18572（18563 活跃跳过）
+        }
+        base_script.push(("18564\n18565", 0)); // 端口分配：18563 被占 → 18564/18565
+        base_script.push(("busy", 0));          // 探活（18564）：就绪
+        let base = RecordingChannel::new(base_script);
+        let base_ch: Arc<dyn ExecChannel> = base.clone();
+        let (pod_ch, k8s_ch) = k8s_recording_channel(pod_channel_script());
+        let deps = pod_deps_with_active_ports(vec![18563]); // 第一会话占用 18563
+        let req = pod_req();
+        let (port, _token) = pod_attach_prepare(
+            &deps,
+            &req,
+            &base_ch,
+            &k8s_ch,
+            "svc-1",
+            FAST_PROBE_BUDGET,
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(port, 18564, "must skip the port held by the concurrent session");
+
+        // attach 命令带新分配的端口对（http 18564 / telnet 预检 18565）
+        let pod_calls = pod_ch.calls().await;
+        let attach = pod_calls.iter().find(|c| c.contains("arthas-boot.jar")).expect("attach cmd");
+        assert!(attach.contains("--http-port 18564"), "attach: {attach}");
+        assert!(attach.contains("--telnet-port 18565"), "attach: {attach}");
+
+        let base_calls = base.calls().await;
+        assert_eq!(base_calls.len(), 13, "base_calls: {base_calls:?}");
+        // 端口分配在宿主机侧打 podIP（$p 循环探测）
+        let find_free = &base_calls[11];
+        assert!(find_free.contains("seq 18563 18572"), "find-free: {find_free}");
+        assert!(find_free.contains("/dev/tcp/10.244.1.5/$p"), "find-free: {find_free}");
+        // 活跃端口 18563 未被残留清理探测（避免误杀在用会话）
+        assert!(
+            !base_calls.iter().any(|c| c.contains("/dev/tcp/10.244.1.5/18563")),
+            "active port must not be probed: {base_calls:?}"
+        );
+        // 探活打新分配的端口 18564
+        assert!(base_calls[12].contains("/dev/tcp/10.244.1.5/18564"), "probe: {}", base_calls[12]);
+    }
+
+    #[tokio::test]
     async fn test_pod_attach_prepare_probe_unreachable_falls_back() {
         // 探活恒 free（宿主→Pod 网络不通）+ 短预算：prepare 仍成功（交由 MCP 握手兜底）
-        let mut base_script = vec![("", 0), ("10.244.1.5", 0)]; // ensure_k8s 命中 + podIP
+        let mut base_script = pod_base_script();
+        base_script.pop(); // 去掉探活 busy
         for _ in 0..8 {
             base_script.push(("free", 0)); // 探活循环：始终不可达
         }
@@ -1594,19 +1857,38 @@ mod tests {
         .expect("probe failure must fall through to mcp handshake, not hard-fail");
         assert_eq!(port, 18563);
         let base_calls = base.calls().await;
-        assert!(base_calls.len() >= 3, "probe loop must have run: {base_calls:?}");
-        assert!(base_calls[2].contains("/dev/tcp/10.244.1.5/18563"), "probe: {}", base_calls[2]);
+        // 探活（打已分配端口 18563）必须发生在端口分配之后
+        let find_free_idx = base_calls
+            .iter()
+            .position(|c| c.contains("seq 18563 18572"))
+            .expect("find-free cmd");
+        let last_probe_idx = base_calls
+            .iter()
+            .rposition(|c| c.contains("/dev/tcp/10.244.1.5/18563"))
+            .expect("probe cmd");
+        assert!(find_free_idx < last_probe_idx, "probe must follow allocation: {base_calls:?}");
+        assert!(pod_ch.calls().await.len() == 3, "no probing inside container");
     }
 
     #[tokio::test]
     async fn test_pod_attach_prepare_bad_pod_ip_falls_back() {
-        // kubectl 返回非 IP（垃圾输出）：跳过探活，prepare 仍成功
+        // kubectl 返回非 IP（垃圾输出）：残留清理/端口分配降级容器内探测（busybox
+        // 下失明，与修复前行为一致），探活重取一次后跳过；prepare 仍成功
         let base = RecordingChannel::new(vec![
             ("", 0),        // ensure_k8s 缓存命中
-            ("garbage", 0), // kubectl get pod 输出非 IP
+            ("garbage", 0), // podIP 早取：非 IP
+            ("garbage", 0), // 探活前幂等重取：仍非 IP
         ]);
         let base_ch: Arc<dyn ExecChannel> = base.clone();
-        let (_pod_ch, k8s_ch) = k8s_recording_channel(pod_channel_script());
+        // 容器内降级脚本：java + 残留清理探测 ×10 + 端口分配 + 写 properties + attach
+        let mut pod_script = vec![("/usr/lib/jvm/java-21/bin/java", 0)];
+        for _ in 0..ARTHAS_PORT_CANDIDATES {
+            pod_script.push(("free", 0));
+        }
+        pod_script.push(("18563\n18564", 0));
+        pod_script.push(("", 0));
+        pod_script.push(("attach-started", 0));
+        let (pod_ch, k8s_ch) = k8s_recording_channel(pod_script);
         let deps = pod_deps();
         let req = pod_req();
         let result = pod_attach_prepare(
@@ -1620,8 +1902,13 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "bad podIP must fall through to mcp handshake: {result:?}");
-        let calls = base.calls().await;
-        assert_eq!(calls.len(), 2, "no probe must run after bad podIP: {calls:?}");
+        let base_calls = base.calls().await;
+        assert_eq!(base_calls.len(), 3, "ensure + podIP ×2（早取 + 探活重取）: {base_calls:?}");
+        let pod_calls = pod_ch.calls().await;
+        assert_eq!(pod_calls.len(), 14, "degraded cleanup + find-free in container: {pod_calls:?}");
+        // 降级路径：容器内探测 127.0.0.1（busybox 恒 free——失明但可用，行为与修复前一致）
+        assert!(pod_calls[1].contains("/dev/tcp/127.0.0.1/18563"), "degraded probe: {}", pod_calls[1]);
+        assert!(pod_calls[11].contains("seq 18563 18572"), "degraded find-free: {}", pod_calls[11]);
     }
 
     #[test]
@@ -2163,9 +2450,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_stop_base_channel_unavailable_still_closes_tunnel() {
-        // 宿主机通道拿不到（SSH 断）：仍关隧道条目 + exec 兜底；kill pf 失败
-        // 由下次 attach 的 pkill 清残留兜底
+    async fn test_run_stop_base_channel_unavailable_still_stops_via_tunnel() {
+        // 宿主机通道拿不到（SSH 断）：隧道 stop 走 TunnelManager 专属连接、不依赖
+        // base——必须仍先试；成功 → arthas 已停，无需 exec 兜底。仍关隧道条目；
+        // kill pf 失败由下次 attach 的 pkill 清残留兜底
         let events: EventLog = Arc::new(Mutex::new(Vec::new()));
         let client = MockArthasClient { events: events.clone() };
         let tunnels = MockTunnels::new(events.clone(), vec![]);
@@ -2191,11 +2479,57 @@ mod tests {
         .await;
 
         let ev = events.lock().await.clone();
-        assert!(
-            ev.iter().any(|e| e == "tunnels-close:env-1/127.0.0.1/54321"),
-            "tunnel must still be closed: {ev:?}"
-        );
-        assert!(ev.iter().any(|e| e.starts_with("target:curl")), "exec fallback: {ev:?}");
+        // 隧道 stop 仍被尝试（不依赖 base 通道）且成功 → 不走 exec 兜底
+        let p = [
+            ev.iter().position(|e| e == "client-shutdown").expect("shutdown"),
+            ev.iter().position(|e| e == "tunnel-stop:18080").expect("tunnel stop"),
+            ev.iter().position(|e| e == "tunnels-close:env-1/127.0.0.1/54321").expect("close tunnel"),
+        ];
+        assert!(p.windows(2).all(|w| w[0] < w[1]), "order: {ev:?}");
         assert!(!ev.iter().any(|e| e.starts_with("base:kill")), "no kill without base channel: {ev:?}");
+        assert!(
+            !ev.iter().any(|e| e.starts_with("target:")),
+            "tunnel stop succeeded, no exec fallback: {ev:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_stop_base_unavailable_tunnel_stop_fails_falls_back_to_exec() {
+        // 宿主机通道拿不到 + 隧道 stop 也失败 → exec 通道 curl stop 兜底仍要跑
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let client = MockArthasClient { events: events.clone() };
+        let tunnels = MockTunnels::new(events.clone(), vec![]);
+        let get_base = || {
+            Box::pin(async { Err("ssh down".to_string()) })
+                as Pin<Box<dyn Future<Output = Result<Arc<dyn ExecChannel>, String>> + Send>>
+        };
+        let get_target = channel_getter(events.clone(), "target");
+        let tunnel_stop = tunnel_stop_fn(events.clone(), false);
+
+        run_production_stop(
+            &client,
+            tunnels.as_ref(),
+            Some(&pf_lease()),
+            "env-1",
+            Some("svc-1"),
+            18563,
+            "tok123",
+            &tunnel_stop,
+            &get_base,
+            &get_target,
+        )
+        .await;
+
+        let ev = events.lock().await.clone();
+        let p = [
+            ev.iter().position(|e| e == "client-shutdown").expect("shutdown"),
+            ev.iter().position(|e| e == "tunnel-stop:18080").expect("tunnel stop"),
+            ev.iter().position(|e| e == "tunnels-close:env-1/127.0.0.1/54321").expect("close tunnel"),
+            ev.iter().position(|e| e.starts_with("target:curl")).expect("exec fallback stop"),
+        ];
+        assert!(p.windows(2).all(|w| w[0] < w[1]), "order: {ev:?}");
+        assert!(!ev.iter().any(|e| e.starts_with("base:kill")), "no kill without base channel: {ev:?}");
+        let stop_cmd = ev.iter().find(|e| e.starts_with("target:curl")).expect("stop cmd");
+        assert!(stop_cmd.contains("http://127.0.0.1:18563/api"), "cmd: {stop_cmd}");
     }
 }

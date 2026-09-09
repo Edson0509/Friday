@@ -205,7 +205,7 @@ pub fn register_all(
     // (name, description, risk, timeouts, kind)
     let defs: Vec<(&str, &str, RiskLevel, Timeouts, ArthasToolKind)> = vec![
         ("arthas_open",
-         "attach arthas 到目标 JVM 并建立诊断通道（幂等，已 attach 秒回）。首次自动下发 arthas 工具包（需 Artifactory 已配置）；SSH 用户与 JVM 用户不一致时需要已录入对应用户凭证。加载 agent 侵入目标 JVM，需确认。容器环境：先 k8s_find_pods 定位 Pod，再带 pod 参数调用（首次自动装备 arthas 到 Pod）。",
+         "attach arthas 到目标 JVM 并建立诊断通道（幂等，已 attach 秒回）。首次自动下发 arthas 工具包（内置随应用分发，无需 Artifactory；仅目标机无 java 需补装 JDK 时才依赖 Artifactory）；SSH 用户与 JVM 用户不一致时需要已录入对应用户凭证。加载 agent 侵入目标 JVM，需确认。容器环境：先 k8s_find_pods 定位 Pod，再带 pod 参数调用（首次自动装备 arthas 到 Pod）。",
          RiskLevel::Low, OPEN, ArthasToolKind::Open),
         ("arthas_close",
          "停止目标 JVM 上的 arthas agent 并释放通道（卸载字节码增强与 agent，幂等）。诊断完成后调用，或留给空闲自动回收。",

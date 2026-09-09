@@ -9,8 +9,6 @@
 //! 已知假设：kubectl port-forward 不带 -n，依赖 kubeconfig context 的当前
 //! namespace（与 kubectl exec / kubectl get pod 行为一致，见 attach_arthas_in_pod）。
 
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -306,6 +304,8 @@ pub async fn teardown_pf(
 
 /// 经隧道原生 HTTP 打 arthas stop 端点（POST /api，Bearer token）——替换容器内
 /// curl 依赖（隧道模式下容器无需 curl）。任意 2xx 即成功。
+/// 调用方（attach.rs run_production_stop）：先经本函数停 arthas（不依赖宿主机
+/// exec 通道），再 teardown_pf（kill pf + 关隧道）。
 pub async fn http_stop_via_tunnel(local_port: u16, token: &str) -> Result<(), String> {
     let url = format!("http://{TUNNEL_LOCAL_HOST}:{local_port}/api");
     let client = reqwest::Client::builder()
@@ -326,34 +326,6 @@ pub async fn http_stop_via_tunnel(local_port: u16, token: &str) -> Result<(), St
         let body = resp.text().await.unwrap_or_default();
         Err(format!("隧道 stop 返回 HTTP {status}: {body}"))
     }
-}
-
-/// 隧道会话停止编排（ProductionStopHandle::stop 的隧道段）：
-/// ① 经隧道原生 HTTP stop arthas（tunnel_stop 注入：生产 = http_stop_via_tunnel，
-///    测试 = mock）② kill pf ③ tunnels.close。返回 ① 是否成功（false → 调用方
-/// 回落 exec 通道 curl stop）。kill pf 固定先于 tunnels.close（见 teardown_pf）。
-pub async fn teardown_pod_tunnel_session(
-    base: &dyn ExecChannel,
-    tunnels: &dyn ArthasTunnels,
-    tunnel_stop: &(dyn Fn(u16) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Sync),
-    env_id: &str,
-    pf: &PfLease,
-) -> bool {
-    let stopped = match tunnel_stop(pf.local_port).await {
-        Ok(()) => {
-            tracing::info!(env_id, local_port = pf.local_port, "arthas stopped via tunnel-native http");
-            true
-        }
-        Err(e) => {
-            tracing::warn!(
-                env_id, local_port = pf.local_port, error = %e,
-                "tunnel-native arthas stop 失败（将回落 exec 通道 stop）"
-            );
-            false
-        }
-    };
-    teardown_pf(base, tunnels, env_id, pf.pf_pid, Some(pf.host_port)).await;
-    stopped
 }
 
 #[cfg(test)]
@@ -625,7 +597,10 @@ mod tests {
         assert!(kill_idx < close_idx, "kill must precede close: {ev:?}");
     }
 
-    // ── teardown_pf / teardown_pod_tunnel_session ──
+    // ── teardown_pf ──
+    // （隧道会话级 stop 编排 teardown_pod_tunnel_session 已并入 attach.rs
+    // run_production_stop——隧道 stop 必须先于 base 通道分支执行，顺序断言
+    // 由 attach.rs 的 run_production_stop 测试覆盖）
 
     #[tokio::test]
     async fn test_teardown_pf_kills_then_closes_with_params() {
@@ -652,59 +627,5 @@ mod tests {
         let ev2 = events2.lock().await.clone();
         assert!(ev2.iter().any(|e| e.starts_with("base:kill 4242")), "ev: {ev2:?}");
         assert!(!ev2.iter().any(|e| e.starts_with("tunnels-close:")), "ev: {ev2:?}");
-    }
-
-    #[tokio::test]
-    async fn test_teardown_pod_tunnel_session_order_success() {
-        let events: EventLog = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let base = ScriptedEventChannel::new(events.clone(), "base", vec![]);
-        let tunnels = MockTunnels::new(events.clone(), vec![]);
-        let tunnel_stop = {
-            let events = events.clone();
-            move |port: u16| {
-                let events = events.clone();
-                Box::pin(async move {
-                    events.lock().await.push(format!("tunnel-stop:{port}"));
-                    Ok(())
-                }) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
-            }
-        };
-        let pf = PfLease { pf_pid: 4242, host_port: 54321, local_port: 18080 };
-
-        let stopped = teardown_pod_tunnel_session(base.as_ref(), tunnels.as_ref(), &tunnel_stop, "env-1", &pf).await;
-        assert!(stopped, "tunnel stop must be reported as success");
-        let ev = events.lock().await.clone();
-        // 固定顺序：tunnel stop → kill pf → close tunnel
-        let p1 = ev.iter().position(|e| e == "tunnel-stop:18080").expect("stop");
-        let p2 = ev.iter().position(|e| e.starts_with("base:kill 4242")).expect("kill");
-        let p3 = ev.iter().position(|e| e == "tunnels-close:env-1/127.0.0.1/54321").expect("close");
-        assert!(p1 < p2 && p2 < p3, "order: {ev:?}");
-    }
-
-    #[tokio::test]
-    async fn test_teardown_pod_tunnel_session_stop_fail_still_tears_down() {
-        let events: EventLog = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let base = ScriptedEventChannel::new(events.clone(), "base", vec![]);
-        let tunnels = MockTunnels::new(events.clone(), vec![]);
-        let tunnel_stop = {
-            let events = events.clone();
-            move |port: u16| {
-                let events = events.clone();
-                Box::pin(async move {
-                    events.lock().await.push(format!("tunnel-stop:{port}"));
-                    Err("connection refused".to_string())
-                }) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
-            }
-        };
-        let pf = PfLease { pf_pid: 4242, host_port: 54321, local_port: 18080 };
-
-        let stopped = teardown_pod_tunnel_session(base.as_ref(), tunnels.as_ref(), &tunnel_stop, "env-1", &pf).await;
-        assert!(!stopped, "tunnel stop failure must be reported");
-        let ev = events.lock().await.clone();
-        // stop 失败仍要 kill pf + close（顺序不变）
-        let p1 = ev.iter().position(|e| e == "tunnel-stop:18080").expect("stop");
-        let p2 = ev.iter().position(|e| e.starts_with("base:kill 4242")).expect("kill");
-        let p3 = ev.iter().position(|e| e == "tunnels-close:env-1/127.0.0.1/54321").expect("close");
-        assert!(p1 < p2 && p2 < p3, "order: {ev:?}");
     }
 }
