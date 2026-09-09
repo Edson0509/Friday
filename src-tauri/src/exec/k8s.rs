@@ -104,11 +104,29 @@ impl ExecChannel for K8sChannel {
         let basename = remote_path.rsplit('/').next().unwrap_or("file");
         let staging = format!("{}/{}-{}", STAGING_DIR, uuid::Uuid::new_v4(), basename);
 
-        // ① 宿主机 staging 目录
-        self.base.run(&format!("mkdir -p {}", shell_quote_single(STAGING_DIR))).await?;
+        // ① 宿主机 staging 目录（显式检查退出码：mkdir 失败时后续两跳都会连环失败）
+        let mkdir_out = self.base.run(&format!("mkdir -p {}", shell_quote_single(STAGING_DIR))).await?;
+        if mkdir_out.exit_code != 0 {
+            tracing::warn!(pod = %self.pod, exit_code = mkdir_out.exit_code, stderr = %mkdir_out.stderr, "k8s upload: staging mkdir failed");
+            return Err(format!(
+                "k8s upload: staging mkdir {} failed (exit {}): {}",
+                STAGING_DIR, mkdir_out.exit_code, mkdir_out.stderr
+            )
+            .into());
+        }
 
         // ② leg A：SFTP → 宿主机 staging
-        self.base.upload(local, &staging).await?;
+        tracing::info!(
+            pod = %self.pod,
+            local = %local.display(),
+            staging = %staging,
+            bytes = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0),
+            "k8s upload: leg A sftp to host staging"
+        );
+        if let Err(e) = self.base.upload(local, &staging).await {
+            tracing::warn!(pod = %self.pod, staging = %staging, error = %e, "k8s upload: leg A sftp to staging failed");
+            return Err(format!("k8s upload: leg A sftp to staging {staging} failed: {e}").into());
+        }
 
         // ③ leg B：kubectl exec -i 注入容器。stdin 重定向发生在宿主机 bash 上，
         //    数据不流经 Friday 内存（dump 级大文件安全）；容器内依赖仅 sh + cat。
@@ -129,7 +147,9 @@ impl ExecChannel for K8sChannel {
             shell_quote_single(&inner),
             shell_quote_single(&staging)
         );
+        let leg_b_start = std::time::Instant::now();
         let out = self.base.run(&host_cmd).await?;
+        let leg_b_elapsed_ms = leg_b_start.elapsed().as_millis() as u64;
 
         // staging 清理（成败都清）
         let _ = self
@@ -138,15 +158,16 @@ impl ExecChannel for K8sChannel {
             .await;
 
         if out.exit_code != 0 {
-            tracing::warn!(pod = %self.pod, remote_path, exit_code = out.exit_code, stderr = %out.stderr, "k8s upload: kubectl exec -i failed");
+            tracing::warn!(pod = %self.pod, remote_path, staging = %staging, exit_code = out.exit_code, stderr = %out.stderr, elapsed_ms = leg_b_elapsed_ms, "k8s upload: leg B kubectl exec -i failed");
             // 半截文件兜底清理（经 kubectl exec，容器内）
             let _ = self.run(&format!("rm -f {}", shell_quote_single(remote_path))).await;
             return Err(format!(
-                "k8s upload: kubectl exec -i failed (exit {}): {}",
+                "k8s upload: leg B kubectl exec -i failed (exit {}): {}",
                 out.exit_code, out.stderr
             )
             .into());
         }
+        tracing::info!(pod = %self.pod, remote_path, elapsed_ms = leg_b_elapsed_ms, "k8s upload: leg B kubectl exec -i done, fixing group");
 
         // ④ 属组修正（spec：chgrp 失败 = 上传失败，清理目标文件）
         let q = shell_quote_single(remote_path);
