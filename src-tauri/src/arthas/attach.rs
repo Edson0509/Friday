@@ -183,7 +183,8 @@ async fn attach_arthas(deps: AttachDeps, req: AttachRequest) -> Result<AttachedS
 
     // 1. 确保 arthas 工具包（幂等，cached 快路径）
     progress("ensure_package", "确保 arthas 工具包".to_string());
-    let pctx = provision_context(&deps, &req, channel.clone()).await?;
+    let pctx = provision_context(&deps, &req, channel.clone(), crate::provision::jdk::REMOTE_TOOLS_DIR)
+        .await?;
     let arthas_pkg = crate::provision::arthas::ArthasPackage;
     let arthas_result = arthas_pkg
         .ensure(&pctx, "java")
@@ -322,10 +323,13 @@ async fn get_default_channel_raw(
         .map_err(|e| ManagerError::Attach(format!("SSH 连接失败: {e}")))
 }
 
+/// remote_tools_dir：目标机工具根目录（VM = REMOTE_TOOLS_DIR；k8s 场景由调用方传
+/// POD_TOOLS_DIR——T5 接入 k8s 分支）。
 async fn provision_context(
     deps: &AttachDeps,
     req: &AttachRequest,
     channel: Arc<dyn ExecChannel>,
+    remote_tools_dir: &str,
 ) -> Result<crate::provision::package::ProvisionContext, ManagerError> {
     let base = crate::app::settings::artifactory_base_url(&deps.db)
         .await
@@ -342,7 +346,7 @@ async fn provision_context(
         cache_dir: deps.cache_dir.clone(),
         artifactory_base_url: base,
         arthas_zip: deps.arthas_zip.clone(),
-        remote_tools_dir: crate::provision::jdk::REMOTE_TOOLS_DIR.to_string(),
+        remote_tools_dir: remote_tools_dir.to_string(),
         timeouts: crate::provision::package::StageTimeouts::default(),
         bus: deps.bus.clone(),
     })

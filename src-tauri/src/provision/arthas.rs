@@ -147,6 +147,248 @@ impl ToolPackage for ArthasPackage {
     }
 }
 
+impl ArthasPackage {
+    /// 容器环境装备：宿主机中转（SFTP zip → 宿主机 unzip+tar → kubectl exec -i 注入），
+    /// 容器内依赖仅 sh + tar（精简镜像无 unzip/python3，VM 模式的"upload zip → 容器内
+    /// 解压"链路不可用）。base = 宿主机通道；pod/container 定位目标容器。
+    /// 幂等：Pod 内已装备直接 cached 返回（Pod 重启容器层丢失后自动重装）。
+    ///
+    /// 不进 ToolPackage trait（那是 VM 语义——run/upload 都作用于目标机本身）：
+    /// 本流程的解包/打包是宿主机侧活动、注入的 stdin 重定向源是宿主机文件，
+    /// 整条流水线以 base 通道为主轴、kubectl exec 命令内联。
+    ///
+    /// 调用方（arthas attach 的 k8s 分支）在 T5 接入，非测试构建下暂时豁免 dead_code 警告。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn ensure_k8s(
+        &self,
+        base: &std::sync::Arc<dyn crate::exec::channel::ExecChannel>,
+        pod: &str,
+        container: Option<&str>,
+        zip: &std::path::Path,
+        session_id: &str,
+        env_id: &str,
+    ) -> Result<ProvisionResult, ProvisionError> {
+        let start = std::time::Instant::now();
+        let dist = format!("{}/arthas-dist", crate::exec::k8s::POD_TOOLS_DIR);
+        let dist_q = crate::exec::ssh::shell_quote_single(&dist);
+        let ctr = container
+            .map(|c| format!("-c {} ", crate::exec::ssh::shell_quote_single(c)))
+            .unwrap_or_default();
+        let pod_q = crate::exec::ssh::shell_quote_single(pod);
+        let boot = format!("{dist}/arthas-boot.jar");
+        let check_cmd = format!(
+            "kubectl exec {ctr}{pod_q} -- test -f {}",
+            crate::exec::ssh::shell_quote_single(&boot)
+        );
+
+        // ① Pod 内缓存检查（幂等；Pod 重启后自动重装）
+        let check = base.run(&check_cmd).await.map_err(|e| {
+            tracing::warn!(session_id, env_id, pod, error = %e, "k8s arthas cache check exec failed");
+            ProvisionError::new(
+                "provision_failed",
+                "check_cache",
+                format!("kubectl exec 缓存检查失败（pod {pod}）: {e}"),
+            )
+        })?;
+        if check.exit_code == 0 {
+            tracing::info!(session_id, env_id, pod, home = %dist, "k8s arthas package cached in pod");
+            return Ok(ProvisionResult {
+                tool: "arthas".to_string(),
+                cached: true,
+                java_version: String::new(),
+                bisheng_version: String::new(),
+                arch: String::new(),
+                tool_home: dist,
+                bins: HashMap::new(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        // vendored zip 完整性守卫（与 VM 模式同款）
+        if let Err(e) = crate::provision::transfer::validate_download(zip, 5 * 1024 * 1024) {
+            return Err(ProvisionError::new("vendored_package_corrupt", "vendored_package", e));
+        }
+
+        // ② SFTP zip → 宿主机 staging（一次性子目录，收尾整目录清理）
+        let staging_dir =
+            format!("{}/arthas-{}", crate::exec::k8s::STAGING_DIR, uuid::Uuid::new_v4());
+        let staging_q = crate::exec::ssh::shell_quote_single(&staging_dir);
+        let host_zip = format!("{staging_dir}/arthas.zip");
+        let mkdir = base.run(&format!("mkdir -p {staging_q}")).await.map_err(|e| {
+            tracing::warn!(session_id, env_id, pod, staging = %staging_dir, error = %e, "k8s arthas staging mkdir failed");
+            ProvisionError::new(
+                "provision_failed",
+                "staging",
+                format!("宿主机 staging 目录创建失败（pod {pod}，{staging_dir}）: {e}"),
+            )
+        })?;
+        if mkdir.exit_code != 0 {
+            tracing::warn!(session_id, env_id, pod, exit_code = mkdir.exit_code, stderr = %mkdir.stderr, "k8s arthas staging mkdir failed");
+            return Err(ProvisionError::new(
+                "provision_failed",
+                "staging",
+                format!(
+                    "宿主机 staging 目录创建失败（pod {pod}，exit {}）: {}",
+                    mkdir.exit_code, mkdir.stderr
+                ),
+            ));
+        }
+        if let Err(e) = base.upload(zip, &host_zip).await {
+            tracing::warn!(session_id, env_id, pod, staging = %staging_dir, error = %e, "k8s arthas zip sftp upload failed");
+            let _ = base.run(&format!("rm -rf {staging_q}")).await;
+            return Err(ProvisionError::new(
+                "provision_failed",
+                "upload",
+                format!("arthas zip SFTP 上传宿主机失败（pod {pod}，{host_zip}）: {e}"),
+            ));
+        }
+
+        // ③ 宿主机解 zip + 打 tar（容器内无 unzip，解包在宿主机完成）
+        let extract_cmd = format!(
+            "cd {staging_q} && unzip -oq arthas.zip -d unzipped && tar czf arthas.tar.gz -C unzipped ."
+        );
+        let extract = base.run(&extract_cmd).await.map_err(|e| {
+            tracing::warn!(session_id, env_id, pod, error = %e, "k8s arthas host extract failed");
+            ProvisionError::new(
+                "provision_failed",
+                "extract",
+                format!("宿主机解包/打包失败（pod {pod}）: {e}"),
+            )
+        })?;
+        if extract.exit_code != 0 {
+            tracing::warn!(session_id, env_id, pod, exit_code = extract.exit_code, stderr = %extract.stderr, "k8s arthas host extract failed");
+            let _ = base.run(&format!("rm -rf {staging_q}")).await;
+            return Err(ProvisionError::new(
+                "provision_failed",
+                "extract",
+                format!(
+                    "宿主机解包/打包失败（pod {pod}，exit {}）: {} —— 宿主机需要 unzip 与 tar（宿主机环境问题，非容器问题）",
+                    extract.exit_code, extract.stderr
+                ),
+            ));
+        }
+
+        // ④ 注入容器：kubectl exec -i + 宿主机侧 stdin 重定向（数据不流经 Friday 内存）
+        let inject_cmd = format!(
+            "kubectl exec -i {ctr}{pod_q} -- sh -c {} < {}",
+            crate::exec::ssh::shell_quote_single(&format!("mkdir -p {dist_q} && tar xz -C {dist_q}")),
+            crate::exec::ssh::shell_quote_single(&format!("{staging_dir}/arthas.tar.gz")),
+        );
+        let inject = base.run(&inject_cmd).await.map_err(|e| {
+            tracing::warn!(session_id, env_id, pod, error = %e, "k8s arthas tar inject exec failed");
+            ProvisionError::new(
+                "provision_failed",
+                "inject",
+                format!("tar 注入容器执行失败（pod {pod}）: {e}"),
+            )
+        })?;
+        if inject.exit_code != 0 {
+            tracing::warn!(session_id, env_id, pod, exit_code = inject.exit_code, stderr = %inject.stderr, "k8s arthas tar inject failed");
+            Self::rm_pod_dist(base, &ctr, &pod_q, &dist_q).await;
+            let _ = base.run(&format!("rm -rf {staging_q}")).await;
+            return Err(ProvisionError::new(
+                "provision_failed",
+                "inject",
+                format!(
+                    "tar 注入容器失败（pod {pod}，exit {}）: {}",
+                    inject.exit_code, inject.stderr
+                ),
+            ));
+        }
+
+        // ⑤ 属组修正（非 ossgroup 无法被目标 JVM 用户使用；容器内 sh -c，无 stdin）
+        let fix_cmd = format!(
+            "kubectl exec {ctr}{pod_q} -- sh -c {}",
+            crate::exec::ssh::shell_quote_single(&format!(
+                "chgrp -R {} {dist_q} && chmod -R g+rX {dist_q}",
+                crate::exec::k8s::OSS_GROUP
+            )),
+        );
+        let fix = base.run(&fix_cmd).await.map_err(|e| {
+            tracing::warn!(session_id, env_id, pod, error = %e, "k8s arthas chgrp exec failed");
+            ProvisionError::new(
+                "provision_failed",
+                "ownership",
+                format!("chgrp {} 执行失败（pod {pod}）: {e}", crate::exec::k8s::OSS_GROUP),
+            )
+        })?;
+        if fix.exit_code != 0 {
+            tracing::warn!(session_id, env_id, pod, exit_code = fix.exit_code, stderr = %fix.stderr, "k8s arthas chgrp failed");
+            Self::rm_pod_dist(base, &ctr, &pod_q, &dist_q).await;
+            let _ = base.run(&format!("rm -rf {staging_q}")).await;
+            return Err(ProvisionError::new(
+                "provision_failed",
+                "ownership",
+                format!(
+                    "chgrp {} 失败（pod {pod}，exit {}）: {} —— exec 用户可能不在 {} 组",
+                    crate::exec::k8s::OSS_GROUP,
+                    fix.exit_code,
+                    fix.stderr,
+                    crate::exec::k8s::OSS_GROUP
+                ),
+            ));
+        }
+
+        // ⑥ 验证（同①命令）
+        let verify = base.run(&check_cmd).await.map_err(|e| {
+            tracing::warn!(session_id, env_id, pod, error = %e, "k8s arthas verify exec failed");
+            ProvisionError::new(
+                "provision_failed",
+                "verify",
+                format!("验证命令执行失败（pod {pod}）: {e}"),
+            )
+        })?;
+        if verify.exit_code != 0 {
+            tracing::warn!(session_id, env_id, pod, exit_code = verify.exit_code, stderr = %verify.stderr, "k8s arthas verify failed");
+            Self::rm_pod_dist(base, &ctr, &pod_q, &dist_q).await;
+            let _ = base.run(&format!("rm -rf {staging_q}")).await;
+            return Err(ProvisionError::new(
+                "provision_failed",
+                "verify",
+                format!(
+                    "注入后 arthas-boot.jar 缺失（pod {pod}，exit {}）: {} —— 检查 vendored arthas zip 包布局",
+                    verify.exit_code, verify.stderr
+                ),
+            ));
+        }
+
+        // ⑦ 宿主机 staging 清理（best-effort，成败不阻塞）
+        match base.run(&format!("rm -rf {staging_q}")).await {
+            Ok(out) if out.exit_code != 0 => {
+                tracing::warn!(session_id, env_id, pod, staging = %staging_dir, exit_code = out.exit_code, stderr = %out.stderr, "k8s arthas staging cleanup failed (best-effort)");
+            }
+            Err(e) => {
+                tracing::warn!(session_id, env_id, pod, staging = %staging_dir, error = %e, "k8s arthas staging cleanup exec failed (best-effort)");
+            }
+            _ => {}
+        }
+
+        tracing::info!(session_id, env_id, pod, home = %dist, elapsed_ms = start.elapsed().as_millis() as u64, "k8s arthas package provisioned");
+        Ok(ProvisionResult {
+            tool: "arthas".to_string(),
+            cached: false,
+            java_version: String::new(),
+            bisheng_version: String::new(),
+            arch: String::new(),
+            tool_home: dist,
+            bins: HashMap::new(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// 失败路径容器内半截清理（best-effort）：kubectl exec rm -rf dist
+    /// （仅 ensure_k8s 使用，随其一起暂时豁免 dead_code）
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn rm_pod_dist(
+        base: &std::sync::Arc<dyn crate::exec::channel::ExecChannel>,
+        ctr: &str,
+        pod_q: &str,
+        dist_q: &str,
+    ) {
+        let _ = base.run(&format!("kubectl exec {ctr}{pod_q} -- rm -rf {dist_q}")).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +547,142 @@ mod tests {
         );
         let asset = v["arthas"]["asset"].as_str().expect("arthas.asset");
         assert_eq!(asset, format!("arthas-bin-{ARTHAS_VERSION}.zip"));
+    }
+
+    // ── ensure_k8s（容器装备：宿主机中转 unzip→tar→kubectl exec -i 注入）──
+
+    const K8S_DIST: &str = "/opt/log/dump/coredump/friday-tools/arthas-dist";
+    const K8S_BOOT_CHECK: &str =
+        "test -f '/opt/log/dump/coredump/friday-tools/arthas-dist/arthas-boot.jar'";
+
+    async fn ensure_k8s_with(
+        ch: &Arc<RecordingChannel>,
+        pod: &str,
+        container: Option<&str>,
+        zip: &std::path::Path,
+    ) -> Result<ProvisionResult, ProvisionError> {
+        let base: Arc<dyn ExecChannel> = ch.clone();
+        ArthasPackage.ensure_k8s(&base, pod, container, zip, "s1", "env-1").await
+    }
+
+    #[tokio::test]
+    async fn test_ensure_k8s_cache_hit() {
+        // kubectl exec test -f 命中（exit 0）→ cached，零上传
+        let ch = RecordingChannel::new(vec![("", 0)]);
+        let result =
+            ensure_k8s_with(&ch, "svc-1", None, std::path::Path::new("/local/arthas.zip"))
+                .await
+                .unwrap();
+        assert!(result.cached);
+        assert_eq!(result.tool_home, K8S_DIST);
+        assert!(ch.uploads.lock().await.is_empty(), "cache hit must not upload");
+        let calls = ch.calls.lock().await;
+        assert_eq!(calls.len(), 1, "only the cache check should run: {calls:?}");
+        assert!(calls[0].contains("kubectl exec"), "check: {}", calls[0]);
+        assert!(calls[0].contains(K8S_BOOT_CHECK), "check: {}", calls[0]);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_k8s_full_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = make_zip(tmp.path());
+        // ①cache miss ②mkdir staging ③host unzip+tar ④inject ⑤chgrp ⑥verify ⑦staging rm
+        let ch = RecordingChannel::new(vec![
+            ("", 1),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+        ]);
+        let result = ensure_k8s_with(&ch, "svc-1", None, &zip).await.unwrap();
+        assert!(!result.cached);
+        assert_eq!(result.tool_home, K8S_DIST);
+        assert_eq!(result.tool, "arthas");
+        // zip 本地路径透传，远端落宿主机 staging 子目录
+        let uploads = ch.uploads.lock().await;
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, zip.display().to_string());
+        assert!(
+            uploads[0].1.starts_with("/tmp/friday-tools/staging/arthas-")
+                && uploads[0].1.ends_with("/arthas.zip"),
+            "host zip: {}",
+            uploads[0].1
+        );
+        drop(uploads);
+        let calls = ch.calls.lock().await;
+        // 宿主机侧解 zip + 打 tar
+        let extract = calls.iter().find(|c| c.contains("unzip -oq arthas.zip")).expect("extract cmd");
+        assert!(extract.contains("tar czf arthas.tar.gz"), "extract: {extract}");
+        // 注入：kubectl exec -i + 宿主机 stdin 重定向 + 容器内 tar 解包到 dist
+        let inject = calls.iter().find(|c| c.contains("kubectl exec -i")).expect("inject cmd");
+        assert!(inject.contains("< '/tmp/friday-tools/staging/arthas-"), "inject: {inject}");
+        assert!(inject.contains("/arthas.tar.gz'"), "inject: {inject}");
+        assert!(inject.contains("mkdir -p"), "inject: {inject}");
+        assert!(inject.contains("tar xz -C"), "inject: {inject}");
+        // 属组：容器内 chgrp -R ossgroup + chmod -R g+rX（经 kubectl exec）
+        let chgrp = calls.iter().find(|c| c.contains("chgrp -R ossgroup")).expect("chgrp cmd");
+        assert!(chgrp.contains("kubectl exec"), "chgrp must run inside pod: {chgrp}");
+        assert!(chgrp.contains("chmod -R g+rX"), "chgrp: {chgrp}");
+        // 验证：boot.jar test 出现两次（cache check + verify）
+        assert_eq!(
+            calls.iter().filter(|c| c.contains(K8S_BOOT_CHECK)).count(),
+            2,
+            "calls: {calls:?}"
+        );
+        // 宿主机 staging 清理
+        assert!(
+            calls.iter().any(|c| c.contains("rm -rf '/tmp/friday-tools/staging/arthas-")),
+            "staging cleanup: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_k8s_inject_failure_cleans_pod_dist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = make_zip(tmp.path());
+        // ①cache miss ②mkdir ③extract ④inject exit 1
+        let ch = RecordingChannel::new(vec![("", 1), ("", 0), ("", 0), ("", 1)]);
+        let err = ensure_k8s_with(&ch, "svc-1", None, &zip).await.unwrap_err();
+        assert_eq!(err.code, "provision_failed");
+        assert_eq!(err.stage, "inject");
+        assert!(err.message.contains("svc-1"), "err must carry pod: {err:?}");
+        let calls = ch.calls.lock().await;
+        // 容器内半截清理（kubectl exec rm -rf dist）
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("kubectl exec") && c.contains(&format!("rm -rf '{K8S_DIST}'"))),
+            "pod dist cleanup must fire: {calls:?}"
+        );
+        // 宿主机 staging 也清理
+        assert!(
+            calls.iter().any(|c| c.contains("rm -rf '/tmp/friday-tools/staging/arthas-")),
+            "staging cleanup: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_k8s_container_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = make_zip(tmp.path());
+        let ch = RecordingChannel::new(vec![
+            ("", 1),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+            ("", 0),
+        ]);
+        let result = ensure_k8s_with(&ch, "svc-1", Some("main"), &zip).await.unwrap();
+        assert!(!result.cached);
+        let calls = ch.calls.lock().await;
+        let kubectl_cmds: Vec<&String> = calls.iter().filter(|c| c.contains("kubectl exec")).collect();
+        assert!(!kubectl_cmds.is_empty(), "calls: {calls:?}");
+        for c in &kubectl_cmds {
+            assert!(c.contains("-c 'main' "), "missing container flag: {c}");
+        }
     }
 }
