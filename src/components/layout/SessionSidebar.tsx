@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect } from "react";
-import { ChatCircle, Plus, Archive, Trash, ArrowUUpLeft } from "@phosphor-icons/react";
+import { ChatCircle, Plus, Archive, Trash, ArrowUUpLeft, CopySimple, Export, PencilSimple } from "@phosphor-icons/react";
 import { useSessionStore } from "@/store/sessionStore";
 import { DeleteConfirmDialog } from "@/components/chat/DeleteConfirmDialog";
+import { copyText } from "@/lib/clipboard";
+import { exportSessionLogs } from "@/lib/ipc";
 
 export function SessionSidebar() {
   const sessions = useSessionStore((s) => s.sessions);
@@ -15,9 +17,12 @@ export function SessionSidebar() {
   const archiveSession = useSessionStore((s) => s.archiveSession);
   const unarchiveSession = useSessionStore((s) => s.unarchiveSession);
   const deleteSession = useSessionStore((s) => s.deleteSession);
+  const renameSession = useSessionStore((s) => s.renameSession);
 
   const [contextMenu, setContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; kind: "info" | "error" } | null>(null);
+  const [renaming, setRenaming] = useState<{ id: string; text: string } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -30,15 +35,70 @@ export function SessionSidebar() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  // 操作反馈：短暂展示后自动消失
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), notice.kind === "error" ? 5000 : 3000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const showNotice = (text: string, kind: "info" | "error" = "info") => {
+    setNotice({ text, kind });
+  };
+
   const handleContextMenu = (e: React.MouseEvent, sessionId: string) => {
     e.preventDefault();
     setContextMenu({ sessionId, x: e.clientX, y: e.clientY });
+  };
+
+  const handleCopySessionId = async (sessionId: string) => {
+    setContextMenu(null);
+    const ok = await copyText(sessionId);
+    showNotice(ok ? "会话 ID 已复制" : "复制失败，请重试", ok ? "info" : "error");
+  };
+
+  const handleExportLogs = async (sessionId: string) => {
+    setContextMenu(null);
+    try {
+      const result = await exportSessionLogs(sessionId);
+      if (result.line_count === 0) {
+        showNotice("未找到该会话的日志（日志按日轮转仅保留 7 天，可能已被清理）", "error");
+        return;
+      }
+      const copied = await copyText(result.path);
+      showNotice(
+        copied
+          ? `已导出 ${result.line_count} 行日志，文件路径已复制`
+          : `已导出 ${result.line_count} 行日志`,
+        "info"
+      );
+    } catch (e) {
+      showNotice(`导出会话日志失败: ${e}`, "error");
+    }
   };
 
   const handleDeleteConfirm = async () => {
     if (!deleteTarget) return;
     await deleteSession(deleteTarget);
     setDeleteTarget(null);
+  };
+
+  const findSession = (id: string) =>
+    [...sessions, ...archivedSessions].find((s) => s.id === id);
+
+  const startRename = (id: string) => {
+    const target = findSession(id);
+    if (target) setRenaming({ id, text: target.title ?? "" });
+  };
+
+  const commitRename = () => {
+    if (!renaming) return;
+    const trimmed = renaming.text.trim();
+    const current = findSession(renaming.id)?.title ?? null;
+    if (trimmed && trimmed !== current) {
+      renameSession(renaming.id, trimmed);
+    }
+    setRenaming(null);
   };
 
   const isArchiveView = sidebarView === "archived";
@@ -61,21 +121,42 @@ export function SessionSidebar() {
             : "hover:bg-surface-2"
         } ${dimmed ? "opacity-60" : ""}`}
       >
-        <button
-          type="button"
-          onClick={() => selectSession(s.id)}
-          className="flex items-center gap-1.5 mb-0.5 w-full text-left"
-        >
-          <span
-            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-              isRunning ? "bg-success animate-pulse" : "bg-muted-foreground"
-            }`}
-            aria-hidden="true"
+        {renaming?.id === s.id ? (
+          <input
+            autoFocus
+            value={renaming.text}
+            onChange={(e) => setRenaming({ id: s.id, text: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitRename();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                setRenaming(null);
+              }
+            }}
+            onBlur={() => commitRename()}
+            onContextMenu={(e) => e.stopPropagation()}
+            aria-label="会话标题"
+            className="w-full bg-muted border border-border rounded px-1.5 py-0.5 mb-0.5 text-sm text-foreground outline-none"
           />
-          <span className="text-sm font-medium text-foreground truncate flex-1">
-            {s.title || "无标题会话"}
-          </span>
-        </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => selectSession(s.id)}
+            className="flex items-center gap-1.5 mb-0.5 w-full text-left"
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                isRunning ? "bg-success animate-pulse" : "bg-muted-foreground"
+              }`}
+              aria-hidden="true"
+            />
+            <span className="text-sm font-medium text-foreground truncate flex-1">
+              {s.title || "无标题会话"}
+            </span>
+          </button>
+        )}
 
         <div className="flex items-center justify-between">
           <span
@@ -88,6 +169,14 @@ export function SessionSidebar() {
           </span>
 
           <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); startRename(s.id); }}
+              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-surface-3 transition-colors"
+              aria-label="重命名会话"
+            >
+              <PencilSimple size={14} weight="regular" aria-hidden="true" />
+            </button>
             {isArchiveView ? (
               <button
                 type="button"
@@ -200,6 +289,27 @@ export function SessionSidebar() {
           className="fixed z-50 bg-surface-2 border border-border-strong rounded-lg py-1 shadow-xl"
           style={{ left: contextMenu.x, top: contextMenu.y, minWidth: 140 }}
         >
+          <button
+            onClick={() => { startRename(contextMenu.sessionId); setContextMenu(null); }}
+            className="flex items-center gap-2 w-full px-3 py-2 text-sm text-foreground hover:bg-surface-3 transition-colors text-left"
+          >
+            <PencilSimple size={14} weight="regular" aria-hidden="true" />
+            重命名会话
+          </button>
+          <button
+            onClick={() => handleCopySessionId(contextMenu.sessionId)}
+            className="flex items-center gap-2 w-full px-3 py-2 text-sm text-foreground hover:bg-surface-3 transition-colors text-left"
+          >
+            <CopySimple size={14} weight="regular" aria-hidden="true" />
+            复制会话 ID
+          </button>
+          <button
+            onClick={() => handleExportLogs(contextMenu.sessionId)}
+            className="flex items-center gap-2 w-full px-3 py-2 text-sm text-foreground hover:bg-surface-3 transition-colors text-left"
+          >
+            <Export size={14} weight="regular" aria-hidden="true" />
+            导出会话日志
+          </button>
           {isArchiveView ? (
             <button
               onClick={() => { unarchiveSession(contextMenu.sessionId); setContextMenu(null); }}
@@ -224,6 +334,20 @@ export function SessionSidebar() {
             <Trash size={14} weight="regular" aria-hidden="true" />
             删除会话
           </button>
+        </div>
+      )}
+
+      {/* Operation feedback toast */}
+      {notice && (
+        <div
+          role="status"
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg border shadow-xl text-sm max-w-[80vw] truncate ${
+            notice.kind === "error"
+              ? "bg-destructive/10 border-destructive/40 text-destructive"
+              : "bg-surface-2 border-border text-foreground"
+          }`}
+        >
+          {notice.text}
         </div>
       )}
 
