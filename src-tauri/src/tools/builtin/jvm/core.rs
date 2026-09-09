@@ -38,6 +38,7 @@ pub fn error_output(error: &str, message: &str) -> ToolOutput {
 /// - 虚机环境：拒绝 pod 参数
 /// 防呆背景：虚机服务名常含大写，k8s 命名全小写——Agent 误把服务名当 Pod 名时
 /// 尽早拦截，避免走到 kubectl 才报模糊的 "pod not found"。
+/// 门禁在 resolve_environment 之后执行（resolve 内部急切建连）：vm+pod 误路由且宿主机不可达时会先报 connection_error——可接受的权衡，避免 resolve 内嵌门禁需要的类型化错误改造。
 pub fn validate_target(
     env: &crate::app::environments::EnvironmentRow,
     pod: Option<&str>,

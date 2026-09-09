@@ -13,7 +13,7 @@ interface EnvironmentDialogProps {
   editing: EnvironmentRow | null;
 }
 
-const EMPTY_FORM = { name: "", host: "", port: "22", transportType: "ssh" as EnvironmentTransport };
+const EMPTY_FORM = { name: "", host: "", port: "22", transportType: "vm" as EnvironmentTransport };
 
 export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogProps) {
   const save = useEnvStore((s) => s.save);
@@ -227,14 +227,14 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
                 onChange={(e) => setForm({ ...form, transportType: e.target.value as EnvironmentTransport })}
                 className={inputCls}
               >
-                <option value="ssh">宿主机 SSH</option>
-                <option value="k8s">Kubernetes 宿主机</option>
+                <option value="vm">虚机</option>
+                <option value="container">容器</option>
               </select>
             </Field>
-            {form.transportType === "k8s" && (
+            {form.transportType === "container" && (
               <p className="text-xs text-muted-foreground">
-                Kubernetes 宿主机：诊断时可先用 k8s_find_pods 发现 Pod（凭证仍是该宿主机的
-                SSH 登录信息）；不传 pod 的工具直接诊断宿主机进程。
+                容器环境：服务跑在 Pod 里，诊断先用 k8s_find_pods 发现 Pod（凭证仍是宿主机的
+                SSH 登录信息）。
               </p>
             )}
 

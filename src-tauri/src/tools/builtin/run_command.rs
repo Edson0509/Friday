@@ -220,7 +220,7 @@ pub fn run_command_tool_def(
                 },
                 "pod": {
                     "type": "string",
-                    "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）"
+                    "description": "Kubernetes Pod 名（容器环境必填；虚机环境通常不传；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）"
                 },
                 "container": {
                     "type": "string",
