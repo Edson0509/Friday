@@ -166,9 +166,15 @@ impl SshTransport {
     }
 
     /// 建连 + 认证（不含重试）。每次调用新建一条连接。
+    ///
+    /// 单次建连预算 45s（issue #19 bug #3）：内网高延迟环境（跨区 VPN / 多跳堡垒机）
+    /// TCP 握手 + SSH 版本协商耗时可超过 20s；且此前无显式超时——Windows 上内核
+    /// TCP 层约 21-22s 即以 os error 10060 中断单次尝试，SSH 握手阶段更可能无限挂起。
+    /// 显式给 45s：覆盖慢握手，同时保证单次尝试有界。重试次数（3 次）不变。
     async fn connect_once(
         &self,
     ) -> Result<russh::client::Handle<SshHandler>, Box<dyn std::error::Error + Send + Sync>> {
+        const SSH_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
         let config = Arc::new(russh::client::Config {
             inactivity_timeout: Some(std::time::Duration::from_secs(600)),
             ..Default::default()
@@ -177,9 +183,23 @@ impl SshTransport {
             env_id: self.env_id.clone(),
             host: self.host.clone(),
         };
-        let mut handle = russh::client::connect(config, (self.host.as_str(), self.port), handler)
-            .await
-            .map_err(|e| format!("ssh connect to {}:{} failed: {e}", self.host, self.port))?;
+        let mut handle = match tokio::time::timeout(
+            SSH_CONNECT_TIMEOUT,
+            russh::client::connect(config, (self.host.as_str(), self.port), handler),
+        )
+        .await
+        {
+            Ok(res) => res.map_err(|e| format!("ssh connect to {}:{} failed: {e}", self.host, self.port))?,
+            Err(_) => {
+                return Err(format!(
+                    "ssh connect to {}:{} timed out after {}s (high-latency network?)",
+                    self.host,
+                    self.port,
+                    SSH_CONNECT_TIMEOUT.as_secs()
+                )
+                .into());
+            }
+        };
 
         let authed = match &self.auth {
             SshAuth::PrivateKey { key_path } => {

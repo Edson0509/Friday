@@ -31,6 +31,22 @@ pub fn parse_probe_output(stdout: &str, stderr: &str) -> Result<JvmProbe, String
         ));
     }
 
+    // kubectl / API server 级错误（容器目标：exec 通道本身失败，java 根本没跑）。
+    // 特征串出现时不能混进 parse_failed（误导排查方向），单列 remote_exec_failed
+    // （issue #19 bug #5，防御性改进——namespace 修复后 NotFound 不应再出现）。
+    // 注意必须在 "command not found"（probe_failed）之后判定：
+    // `bash: java: command not found` 同样含 "not found" 子串，但那是 java 层错误。
+    let combined_lower = format!("{stdout}\n{stderr}").to_lowercase();
+    if combined_lower.contains("error from server")
+        || combined_lower.contains("not found")
+        || combined_lower.contains("unauthorized")
+    {
+        return Err(format!(
+            "remote_exec_failed: kubectl/API server error on probe (java 未执行). \
+             stdout: {stdout:?} stderr: {stderr:?}"
+        ));
+    }
+
     let combined = format!("{stdout}\n{stderr}");
     let openjdk_version = combined
         .lines()
@@ -61,7 +77,7 @@ pub fn parse_probe_output(stdout: &str, stderr: &str) -> Result<JvmProbe, String
         ));
     }
 
-    let bisheng_version = match extract_bisheng_version(&combined) {
+    let bisheng_version = match extract_bisheng_version(&combined, &openjdk_version) {
         Ok(Some(v)) => v,
         Ok(None) => {
             return Err(format!(
@@ -92,11 +108,13 @@ pub fn parse_probe_output(stdout: &str, stderr: &str) -> Result<JvmProbe, String
     })
 }
 
-/// BiSheng 版本串 → 三段目录名
+/// BiSheng 版本串 → 三段目录名。
+/// 匹配大小写不敏感（issue #19 bug #2：openEuler 社区版输出 `bisheng`/`Bisheng` 大小写不定），
+/// 但提取与拼接保留原串大小写（Artifactory 目录按原命名）。
 pub fn parse_bisheng_version(s: &str) -> Result<BishengVersion, String> {
     let s = s.trim();
     let re = regex::Regex::new(
-        r"^(?P<product>BiSheng(?:_[A-Za-z0-9]+)*?)_(?P<version>\d+\.\d+(?:\.\d+)*(?:\.?[AB]\d+)?)$",
+        r"(?i)^(?P<product>BiSheng(?:_[A-Za-z0-9]+)*?)_(?P<version>\d+\.\d+(?:\.\d+)*(?:\.?[AB]\d+)?)$",
     )
     .map_err(|e| format!("parse_failed: regex build error: {e}"))?;
     let caps = re
@@ -125,18 +143,23 @@ pub fn parse_bisheng_version(s: &str) -> Result<BishengVersion, String> {
 /// 两种布局都支持（issue #4 真实环境为第二种）：
 /// 1. 独立成行：`BiSheng_JDK_Enterprise_205.2.0.110.B001`
 /// 2. 行中间：`OpenJDK Runtime Environment BiSheng_JDK_Enterprise_205.2.0.110.B001 (build ...)`
+/// 大小写不敏感（issue #19 bug #2：openEuler 装的社区版输出裸 `Bisheng`，企业版
+/// 大小写亦不定，统一 (?i) 匹配、原串提取）。
 /// 完全没有 BiSheng 字样时返回 None（unsupported_vendor）；
-/// 有 BiSheng 字样但无任何可识别版本串时返回 None 但调用方错误消息需要区分——
-/// 因此本函数返回 Result<Option<String>, String>：Err = 有 BiSheng 字样但格式不认识。
-fn extract_bisheng_version(combined: &str) -> Result<Option<String>, String> {
+/// 有 BiSheng 字样但无任何可识别版本串时返回 Err（unsupported_bisheng_variant）——
+/// 典型为社区版裸 `Bisheng` 无产品版本号，无法定位 Artifactory 目录。
+fn extract_bisheng_version(
+    combined: &str,
+    openjdk_version: &str,
+) -> Result<Option<String>, String> {
     let mut saw_bisheng_word = false;
     for line in combined.lines() {
-        if !line.contains("BiSheng") {
+        if !line.to_lowercase().contains("bisheng") {
             continue;
         }
         saw_bisheng_word = true;
-        // 行内所有 BiSheng 开头的候选 token
-        let re = regex::Regex::new(r"BiSheng[A-Za-z0-9_.]*").unwrap();
+        // 行内所有 BiSheng 开头的候选 token（(?i) 匹配，原大小写提取）
+        let re = regex::Regex::new(r"(?i)BiSheng[A-Za-z0-9_.]*").unwrap();
         for m in re.find_iter(line) {
             if parse_bisheng_version(m.as_str()).is_ok() {
                 return Ok(Some(m.as_str().to_string()));
@@ -145,15 +168,20 @@ fn extract_bisheng_version(combined: &str) -> Result<Option<String>, String> {
     }
     if saw_bisheng_word {
         // 有 BiSheng 字样但格式全部不认识——这不是"非 BiSheng 环境"，
-        // 不能误报 unsupported_vendor（issue #4 的错误消息 bug）
+        // 不能误报 unsupported_vendor（issue #4 的错误消息 bug）；
+        // openEuler 社区版只输出裸 `Bisheng` 无产品版本号，无法确定
+        // Artifactory 下载路径，专属错误码（issue #19 bug #2）
         let sample = combined
             .lines()
-            .find(|l| l.contains("BiSheng"))
+            .find(|l| l.to_lowercase().contains("bisheng"))
             .unwrap_or_default()
             .trim();
         return Err(format!(
-            "parse_failed: found BiSheng line but no recognizable version string: {sample:?}. \
-             请把完整 java -version 输出报给 Friday 维护者以扩展解析规则"
+            "unsupported_bisheng_variant: 检测到 Bisheng JDK（社区版/无产品版本号，\
+             openjdk {openjdk_version}），无法确定 Artifactory 下载路径\
+             （需要 BiSheng 产品版本串如 BiSheng_JDK_Enterprise_xxx）。\
+             请确认该环境的 JDK 装备来源，或在 issue 中提供此 JDK 的 Artifactory 路径规则以扩展支持。\
+             BiSheng 行样本：{sample:?}"
         ));
     }
     Ok(None)
@@ -453,13 +481,95 @@ mod tests {
 
     #[test]
     fn test_parse_probe_output_unrecognized_bisheng_line_reports_parse_failed_not_vendor() {
-        // 输出里有 BiSheng 字样但格式不认识 → 报 parse_failed（带原始行），
-        // 而非误导性的 unsupported_vendor（issue #4 的错误消息问题）
+        // 输出里有 BiSheng 字样但格式不认识 → 报 unsupported_bisheng_variant（带原始行），
+        // 而非误导性的 unsupported_vendor（issue #4 的错误消息问题；
+        // issue #19 bug #2 起从 parse_failed 细化为专属错误码）
         let stdout = "---\nx86_64\n";
         let stderr = "openjdk version \"21.0.11\" 2025-04-15\nBiSheng_Some_Unknown_Format\n";
         let err = parse_probe_output(stdout, stderr).unwrap_err();
-        assert!(err.contains("parse_failed"), "unrecognized BiSheng line must be parse_failed, err: {err}");
+        assert!(
+            err.contains("unsupported_bisheng_variant"),
+            "unrecognized BiSheng line must be unsupported_bisheng_variant, err: {err}"
+        );
+        assert!(!err.contains("unsupported_vendor"), "err: {err}");
+        assert!(!err.contains("parse_failed"), "err: {err}");
         assert!(err.contains("BiSheng_Some_Unknown_Format"), "err should carry the raw line, err: {err}");
+        assert!(err.contains("21.0.11"), "err should carry the openjdk version, err: {err}");
+    }
+
+    /// issue #19 bug #2 实测输出：openEuler 装的 Bisheng 社区版只有裸 `Bisheng` 字样
+    /// （无产品版本号），大小写还不定。必须报 unsupported_bisheng_variant，
+    /// 不能误报 unsupported_vendor / parse_failed。
+    const ISSUE19_BARE_BISHENG_STDERR: &str = "openjdk version \"11.0.12\" 2021-09-14\nOpenJDK Runtime Environment Bisheng (build 11.0.12+13)\nOpenJDK 64-Bit Server VM Bisheng (build 11.0.12+13, mixed mode)\n";
+
+    #[test]
+    fn test_parse_probe_output_bare_community_bisheng_is_unsupported_variant() {
+        // java -version 2>&1 合并进 stdout 的真实场景
+        let stdout = &format!("{ISSUE19_BARE_BISHENG_STDERR}---\nx86_64\n");
+        let err = parse_probe_output(stdout, "").unwrap_err();
+        assert!(err.contains("unsupported_bisheng_variant"), "err: {err}");
+        assert!(!err.contains("unsupported_vendor"), "err: {err}");
+        assert!(!err.contains("parse_failed"), "err: {err}");
+        assert!(err.contains("11.0.12"), "err should carry the openjdk version, err: {err}");
+        assert!(err.contains("Bisheng"), "err should carry the raw line, err: {err}");
+    }
+
+    #[test]
+    fn test_parse_probe_output_bare_community_bisheng_on_stderr() {
+        // 分立输出场景：裸 Bisheng 在 stderr
+        let stdout = "---\nx86_64\n";
+        let err = parse_probe_output(stdout, ISSUE19_BARE_BISHENG_STDERR).unwrap_err();
+        assert!(err.contains("unsupported_bisheng_variant"), "err: {err}");
+        assert!(!err.contains("unsupported_vendor"), "err: {err}");
+        assert!(!err.contains("parse_failed"), "err: {err}");
+    }
+
+    /// issue #19 bug #2：全小写企业版串也能识别（(?i) 匹配 + 原串保留）
+    #[test]
+    fn test_parse_probe_output_lowercase_bisheng_enterprise_recognized() {
+        let stdout = "bisheng_jdk_enterprise_205.2.0.110.b001\n---\nx86_64\n";
+        let stderr = "openjdk version \"11.0.12\" 2021-09-14\n";
+        let probe = parse_probe_output(stdout, stderr).unwrap();
+        assert_eq!(probe.bisheng_version, "bisheng_jdk_enterprise_205.2.0.110.b001");
+        assert_eq!(probe.openjdk_version, "11.0.12");
+        let v = parse_bisheng_version(&probe.bisheng_version).unwrap();
+        assert_eq!(v.product_dir, "bisheng jdk enterprise");
+        assert_eq!(v.major_dir, "bisheng jdk enterprise 205");
+        assert_eq!(v.full_dir, "bisheng jdk enterprise 205.2.0.110.b001");
+    }
+
+    /// issue #19 bug #5：kubectl/API server 级错误（exec 通道失败，java 未跑）
+    /// 必须报 remote_exec_failed，而非混进 parse_failed
+    #[test]
+    fn test_parse_probe_output_kubectl_error_is_remote_exec_failed() {
+        let err = parse_probe_output("", "Error from server (NotFound): pods \"x\" not found\n")
+            .unwrap_err();
+        assert!(err.contains("remote_exec_failed"), "err: {err}");
+        assert!(!err.contains("parse_failed"), "err: {err}");
+        // message 保留原 stderr（{stderr:?} debug 格式，引号被转义——断言区分性子串）
+        assert!(
+            err.contains("Error from server (NotFound)"),
+            "err should carry original stderr, err: {err}"
+        );
+        assert!(err.contains("pods"), "err: {err}");
+    }
+
+    #[test]
+    fn test_parse_probe_output_kubectl_unauthorized_is_remote_exec_failed() {
+        let err =
+            parse_probe_output("", "error: You must be logged in to the server (Unauthorized)\n")
+                .unwrap_err();
+        assert!(err.contains("remote_exec_failed"), "err: {err}");
+        assert!(!err.contains("parse_failed"), "err: {err}");
+    }
+
+    /// issue #19 bug #5：纯解析失败（无 kubectl 特征）照旧 parse_failed
+    #[test]
+    fn test_parse_probe_output_plain_parse_failure_stays_parse_failed() {
+        let err = parse_probe_output("---\nx86_64\n", "some random noise without signatures\n")
+            .unwrap_err();
+        assert!(err.contains("parse_failed"), "err: {err}");
+        assert!(!err.contains("remote_exec_failed"), "err: {err}");
     }
 
     #[test]
