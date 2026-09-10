@@ -5,7 +5,14 @@ import { listEnvCredentials } from "@/lib/ipc";
 import { useEnvStore } from "@/store/envStore";
 import { CredentialList } from "./CredentialList";
 import { DiscardChangesDialog } from "./DiscardChangesDialog";
-import { fromStored, toInput, addStaged, type StagedCredential } from "./staged";
+import {
+  fromStored,
+  toInput,
+  addStaged,
+  emptyAddForm,
+  type AddCredentialFormState,
+  type StagedCredential,
+} from "./staged";
 
 interface EnvironmentDialogProps {
   open: boolean;
@@ -26,6 +33,7 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
   const [formError, setFormError] = useState<string | null>(null);
 
   const [staged, setStaged] = useState<StagedCredential[]>([]);
+  const [addForm, setAddForm] = useState<AddCredentialFormState>(emptyAddForm());
   const [stagedLoaded, setStagedLoaded] = useState(false);
   const [credLoadFailed, setCredLoadFailed] = useState(false);
   const [snapshot, setSnapshot] = useState<string>("");
@@ -45,6 +53,7 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
       );
       setFormError(null);
       setStaged([]);
+      setAddForm(emptyAddForm());
       setStagedLoaded(!editing);
       setCredLoadFailed(false);
       setTestResults({});
@@ -107,15 +116,34 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
       setFormError("端口必须是 1-65535 的数字");
       return;
     }
-    if (staged.length === 0) {
-      setFormError("至少需要一条登录凭证");
+    // 无已暂存凭证但添加表单已填 → 自动暂存（免强制先点「添加凭证」）
+    let effective = staged;
+    if (effective.length === 0 && addForm.username.trim()) {
+      if (addForm.authType === "private_key" && !addForm.privateKeyPath.trim()) {
+        setFormError("私钥认证需要填写私钥路径");
+        return;
+      }
+      // 首条凭证强制默认（后端要求恰好一个默认，避免保存再报一轮错）
+      effective = addStaged(
+        staged,
+        addForm.username.trim(),
+        addForm.authType,
+        addForm.privateKeyPath.trim(),
+        addForm.secret,
+        true,
+      );
+      setStaged(effective);
+      setAddForm(emptyAddForm());
+    }
+    if (effective.length === 0) {
+      setFormError("至少需要一条登录凭证：在下方填写用户名和密码后直接保存即可");
       return;
     }
-    if (staged.filter((c) => c.isDefault).length !== 1) {
+    if (effective.filter((c) => c.isDefault).length !== 1) {
       setFormError("必须恰好指定一个默认登录用户（点星标切换）");
       return;
     }
-    const dup = staged.find((c, i) => staged.findIndex((o) => o.username.trim() === c.username.trim()) !== i);
+    const dup = effective.find((c, i) => effective.findIndex((o) => o.username.trim() === c.username.trim()) !== i);
     if (dup) {
       setFormError(`凭证用户名重复：${dup.username.trim()}`);
       return;
@@ -129,7 +157,7 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
         host: form.host.trim(),
         port,
         transportType: form.transportType,
-        credentials: toInput(staged),
+        credentials: toInput(effective),
       });
       if (ok) onClose();
     } finally {
@@ -240,8 +268,9 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
 
             <div className="pt-2 border-t border-border space-y-2">
               <p className="text-xs text-muted-foreground">
-                登录凭证：★ 为默认登录用户（日常连接使用）。目标 JVM 以其他用户运行时（arthas attach
-                需要同用户），为该用户录入 SSH 凭证。
+                登录凭证：在下方填写用户名和密码后<b>直接点「保存」即可</b>（无需先点「添加凭证」）。★
+                为默认登录用户（日常连接使用）；目标 JVM 以其他用户运行时（arthas attach
+                需要同用户），再为该用户追加 SSH 凭证。
               </p>
               {credLoadFailed ? (
                 <p role="alert" className="text-xs text-destructive py-2">
@@ -270,6 +299,8 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
                     )
                   }
                   onTest={handleTestCred}
+                  addForm={addForm}
+                  onAddFormChange={setAddForm}
                   onAdd={(username, authType, privateKeyPath, secret, makeDefault) => {
                     if (!username) {
                       setFormError("凭证用户名不能为空");
@@ -284,7 +315,8 @@ export function EnvironmentDialog({ open, onClose, editing }: EnvironmentDialogP
                       return false;
                     }
                     setFormError(null);
-                    setStaged((prev) => addStaged(prev, username, authType, privateKeyPath, secret, makeDefault));
+                    // 首条凭证强制默认（后端要求恰好一个默认；勾选与否只在追加凭证时有意义）
+                    setStaged((prev) => addStaged(prev, username, authType, privateKeyPath, secret, makeDefault || prev.length === 0));
                     return true;
                   }}
                 />

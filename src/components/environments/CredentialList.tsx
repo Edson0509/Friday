@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { Star, PencilSimple, Trash, Plugs } from "@phosphor-icons/react";
 import type { EnvironmentAuthType, TestConnectionResult } from "@/lib/types";
-import type { StagedCredential } from "./staged";
+import type { AddCredentialFormState, StagedCredential } from "./staged";
+import { emptyAddForm } from "./staged";
 
 const inputCls =
   "w-full bg-muted border border-border rounded-md text-sm text-foreground px-3 py-1.5 placeholder:text-muted-foreground/50 outline-none";
@@ -30,16 +31,12 @@ interface CredentialListProps {
     secret: string,
     makeDefault: boolean,
   ) => boolean;
+  /** 添加表单由父组件持有（保存时可自动暂存为凭证） */
+  addForm: AddCredentialFormState;
+  onAddFormChange: (next: AddCredentialFormState) => void;
 }
 
 export function CredentialList(props: CredentialListProps) {
-  const [addForm, setAddForm] = useState({
-    username: "",
-    authType: "password" as EnvironmentAuthType,
-    privateKeyPath: "",
-    secret: "",
-    makeDefault: false,
-  });
   const [editing, setEditing] = useState<{
     key: string;
     username: string;
@@ -50,14 +47,14 @@ export function CredentialList(props: CredentialListProps) {
 
   const handleAdd = () => {
     const ok = props.onAdd(
-      addForm.username.trim(),
-      addForm.authType,
-      addForm.privateKeyPath.trim(),
-      addForm.secret,
-      addForm.makeDefault,
+      props.addForm.username.trim(),
+      props.addForm.authType,
+      props.addForm.privateKeyPath.trim(),
+      props.addForm.secret,
+      props.addForm.makeDefault,
     );
     if (ok) {
-      setAddForm({ username: "", authType: "password", privateKeyPath: "", secret: "", makeDefault: false });
+      props.onAddFormChange(emptyAddForm());
     }
   };
 
@@ -210,26 +207,28 @@ export function CredentialList(props: CredentialListProps) {
           <input
             className={`${inputCls} flex-1`}
             placeholder="用户名（如 svcapp）"
-            value={addForm.username}
-            onChange={(e) => setAddForm({ ...addForm, username: e.target.value })}
+            value={props.addForm.username}
+            onChange={(e) => props.onAddFormChange({ ...props.addForm, username: e.target.value })}
             aria-label="新凭证用户名"
           />
           <select
             className={selectCls}
-            value={addForm.authType}
-            onChange={(e) => setAddForm({ ...addForm, authType: e.target.value as EnvironmentAuthType })}
+            value={props.addForm.authType}
+            onChange={(e) =>
+              props.onAddFormChange({ ...props.addForm, authType: e.target.value as EnvironmentAuthType })
+            }
             aria-label="新凭证认证方式"
           >
             <option value="password">密码</option>
             <option value="private_key">私钥</option>
           </select>
         </div>
-        {addForm.authType === "private_key" && (
+        {props.addForm.authType === "private_key" && (
           <input
             className={inputCls}
             placeholder="私钥路径（~/.ssh/...）"
-            value={addForm.privateKeyPath}
-            onChange={(e) => setAddForm({ ...addForm, privateKeyPath: e.target.value })}
+            value={props.addForm.privateKeyPath}
+            onChange={(e) => props.onAddFormChange({ ...props.addForm, privateKeyPath: e.target.value })}
             aria-label="新凭证私钥路径"
             style={{ fontFamily: "var(--font-mono)" }}
           />
@@ -238,16 +237,16 @@ export function CredentialList(props: CredentialListProps) {
           <input
             type="password"
             className={`${inputCls} flex-1`}
-            placeholder={addForm.authType === "private_key" ? "私钥口令（可选）" : "密码"}
-            value={addForm.secret}
-            onChange={(e) => setAddForm({ ...addForm, secret: e.target.value })}
+            placeholder={props.addForm.authType === "private_key" ? "私钥口令（可选）" : "密码"}
+            value={props.addForm.secret}
+            onChange={(e) => props.onAddFormChange({ ...props.addForm, secret: e.target.value })}
             aria-label="新凭证密钥"
           />
           <label className="flex items-center gap-1 text-xs text-muted-foreground whitespace-nowrap">
             <input
               type="checkbox"
-              checked={addForm.makeDefault}
-              onChange={(e) => setAddForm({ ...addForm, makeDefault: e.target.checked })}
+              checked={props.addForm.makeDefault}
+              onChange={(e) => props.onAddFormChange({ ...props.addForm, makeDefault: e.target.checked })}
             />
             设为默认
           </label>

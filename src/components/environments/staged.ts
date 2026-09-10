@@ -62,3 +62,16 @@ export function addStaged(
   const next = [...staged, entry];
   return makeDefault ? next.map((c) => ({ ...c, isDefault: c.key === entry.key })) : next;
 }
+
+/** 凭证添加表单状态（由 EnvironmentDialog 持有——保存时可自动暂存为凭证） */
+export interface AddCredentialFormState {
+  username: string;
+  authType: EnvironmentAuthType;
+  privateKeyPath: string;
+  secret: string;
+  makeDefault: boolean;
+}
+
+export function emptyAddForm(): AddCredentialFormState {
+  return { username: "", authType: "password", privateKeyPath: "", secret: "", makeDefault: false };
+}
