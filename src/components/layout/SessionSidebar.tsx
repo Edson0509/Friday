@@ -114,8 +114,9 @@ export function SessionSidebar() {
     return (
       <div
         key={s.id}
+        onClick={() => selectSession(s.id)}
         onContextMenu={(e) => handleContextMenu(e, s.id)}
-        className={`group relative w-full text-left px-3 py-2 rounded-lg mb-0.5 transition-colors ${
+        className={`group relative w-full text-left px-3 py-2 rounded-lg mb-0.5 transition-colors cursor-pointer ${
           isActive
             ? "bg-surface-2 border-l-2 border-success pl-[10px]"
             : "hover:bg-surface-2"
@@ -136,6 +137,7 @@ export function SessionSidebar() {
               }
             }}
             onBlur={() => commitRename()}
+            onClick={(e) => e.stopPropagation()}
             onContextMenu={(e) => e.stopPropagation()}
             aria-label="会话标题"
             className="w-full bg-muted border border-border rounded px-1.5 py-0.5 mb-0.5 text-sm text-foreground outline-none"
@@ -143,8 +145,8 @@ export function SessionSidebar() {
         ) : (
           <button
             type="button"
-            onClick={() => selectSession(s.id)}
-            className="flex items-center gap-1.5 mb-0.5 w-full text-left"
+            onClick={(e) => { e.stopPropagation(); selectSession(s.id); }}
+            className="flex items-center gap-1.5 mb-0.5 w-full text-left cursor-pointer"
           >
             <span
               className={`w-1.5 h-1.5 rounded-full shrink-0 ${
