@@ -14,35 +14,40 @@ pub enum PoolError {
     TransportNotImplemented(String),
 }
 
-/// 连接池键：环境 + 可选 Pod/容器。pod=None 表示宿主机目标（VM 模式）。
+/// 连接池键：环境 + 可选 Pod/namespace/容器。pod=None 表示宿主机目标（VM 模式）。
+/// namespace 仅在 pod 存在时生效（pod=None 时归一丢弃）。
 /// 每个 key 一条独立 SSH 连接（spec：不按宿主机共享，语义可预测）。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TargetKey {
     pub env_id: String,
     pub pod: Option<String>,
+    pub namespace: Option<String>,
     pub container: Option<String>,
 }
 
 impl TargetKey {
     pub fn base(env_id: &str) -> Self {
-        Self { env_id: env_id.to_string(), pod: None, container: None }
+        Self { env_id: env_id.to_string(), pod: None, namespace: None, container: None }
     }
 
-    pub fn k8s(env_id: &str, pod: &str, container: Option<&str>) -> Self {
+    pub fn k8s(env_id: &str, pod: &str, namespace: Option<&str>, container: Option<&str>) -> Self {
         Self {
             env_id: env_id.to_string(),
             pod: Some(pod.to_string()),
+            namespace: namespace.filter(|n| !n.is_empty()).map(|s| s.to_string()),
             container: container.filter(|c| !c.is_empty()).map(|s| s.to_string()),
         }
     }
 
-    /// 工具参数 → key：空串视为未传；pod 缺失时 container 无意义，一并丢弃（归一到 base key）
-    pub fn from_parts(env_id: &str, pod: Option<&str>, container: Option<&str>) -> Self {
+    /// 工具参数 → key：空串视为未传；pod 缺失时 namespace/container 无意义，
+    /// 一并丢弃（归一到 base key）
+    pub fn from_parts(env_id: &str, pod: Option<&str>, namespace: Option<&str>, container: Option<&str>) -> Self {
         match pod.filter(|p| !p.is_empty()) {
-            None => Self { env_id: env_id.to_string(), pod: None, container: None },
+            None => Self { env_id: env_id.to_string(), pod: None, namespace: None, container: None },
             Some(pod) => Self {
                 env_id: env_id.to_string(),
                 pod: Some(pod.to_string()),
+                namespace: namespace.filter(|n| !n.is_empty()).map(|s| s.to_string()),
                 container: container.filter(|c| !c.is_empty()).map(|s| s.to_string()),
             },
         }
@@ -85,10 +90,11 @@ impl ExecChannelPool {
         &mut self,
         environment_id: &str,
         pod: Option<&str>,
+        namespace: Option<&str>,
         container: Option<&str>,
         pool: &sqlx::SqlitePool,
     ) -> Result<Arc<dyn ExecChannel>, PoolError> {
-        let key = TargetKey::from_parts(environment_id, pod, container);
+        let key = TargetKey::from_parts(environment_id, pod, namespace, container);
         if let Some(conn) = self.connections.get_mut(&key) {
             conn.last_used = Instant::now();
             return Ok(conn.channel.clone());
@@ -101,6 +107,7 @@ impl ExecChannelPool {
             environment_id,
             &env,
             key.pod.as_deref(),
+            key.namespace.as_deref(),
             key.container.as_deref(),
         )?;
 
@@ -240,11 +247,12 @@ pub fn build_ssh_transport(
 }
 
 /// 按 pod 参数分发通道构造：pod=None → 纯 SshTransport（宿主机 VM 模式）；
-/// pod=Some → SshTransport 外包 K8sChannel（命令透明转发进容器）。
+/// pod=Some → SshTransport 外包 K8sChannel（命令透明转发进容器，-n 显式 namespace）。
 pub fn build_transport(
     environment_id: &str,
     env: &EnvironmentInfo,
     pod: Option<&str>,
+    namespace: Option<&str>,
     container: Option<&str>,
 ) -> Result<Arc<dyn ExecChannel>, PoolError> {
     let transport = build_ssh_transport(environment_id, env)?;
@@ -254,6 +262,7 @@ pub fn build_transport(
         Some(pod) => Arc::new(K8sChannel {
             base: Arc::new(transport),
             pod: pod.to_string(),
+            namespace: namespace.map(|s| s.to_string()),
             container: container.map(|s| s.to_string()),
         }),
     })
@@ -323,7 +332,7 @@ pub fn spawn_timeout_kill(db: sqlx::SqlitePool, target: TargetKey, command: Stri
                 return;
             }
         };
-        let channel = match build_transport(&target.env_id, &env, Some(&pod), target.container.as_deref()) {
+        let channel = match build_transport(&target.env_id, &env, Some(&pod), target.namespace.as_deref(), target.container.as_deref()) {
             Ok(ch) => ch,
             Err(e) => {
                 tracing::warn!(env_id = %target.env_id, error = %e, "timeout kill: build transport failed");
@@ -429,10 +438,10 @@ mod tests {
         let mut pool = ExecChannelPool::new();
         // 第一次：缓存未命中 → 注入 channel 后复用
         pool.insert_channel("env-1".to_string(), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
-        let ch = pool.get_or_create("env-1", None, None, &db_pool).await.unwrap();
+        let ch = pool.get_or_create("env-1", None, None, None, &db_pool).await.unwrap();
         assert!(ch.run("echo").await.is_ok());
         // 第二次：命中同一缓存（同一 Arc）
-        let ch2 = pool.get_or_create("env-1", None, None, &db_pool).await.unwrap();
+        let ch2 = pool.get_or_create("env-1", None, None, None, &db_pool).await.unwrap();
         assert_eq!(pool.connection_count(), 1);
         assert!(std::sync::Arc::ptr_eq(&ch, &ch2));
     }
@@ -443,7 +452,7 @@ mod tests {
         let db_pool = crate::infra::db::init(tmp.path().join("friday.db")).await.unwrap();
 
         let mut pool = ExecChannelPool::new();
-        let result = pool.get_or_create("no-such-env", None, None, &db_pool).await;
+        let result = pool.get_or_create("no-such-env", None, None, None, &db_pool).await;
         assert!(matches!(result, Err(PoolError::EnvironmentNotFound { .. })));
     }
 
@@ -541,10 +550,19 @@ mod tests {
     async fn test_k8s_target_keyed_independently_from_base() {
         let mut pool = ExecChannelPool::new();
         pool.insert_channel(TargetKey::base("env-1"), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
-        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", None), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
+        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", None, None), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
         assert_eq!(pool.connection_count(), 2);
         // 命中各自缓存（不会互相顶掉）
-        let _ = pool.get_or_create("env-1", None, None, &db_noop()).await;
+        let _ = pool.get_or_create("env-1", None, None, None, &db_noop()).await;
+        assert_eq!(pool.connection_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_same_pod_different_namespace_keyed_independently() {
+        // 跨 namespace 环境：同 env 同 pod 不同 ns = 不同 key，池内各自独立连接
+        let mut pool = ExecChannelPool::new();
+        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", Some("ns1"), None), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
+        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", Some("ns2"), None), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
         assert_eq!(pool.connection_count(), 2);
     }
 
@@ -552,7 +570,7 @@ mod tests {
     async fn test_disconnect_env_removes_base_and_k8s_keys() {
         let mut pool = ExecChannelPool::new();
         pool.insert_channel(TargetKey::base("env-1"), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
-        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", Some("c1")), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
+        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", None, Some("c1")), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
         pool.insert_channel(TargetKey::base("env-2"), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
         pool.disconnect("env-1").await;
         assert_eq!(pool.connection_count(), 1, "only env-2 survives");
@@ -562,27 +580,55 @@ mod tests {
     async fn test_disconnect_target_removes_only_that_key() {
         let mut pool = ExecChannelPool::new();
         pool.insert_channel(TargetKey::base("env-1"), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
-        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", None), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
-        pool.disconnect_target(&TargetKey::k8s("env-1", "pod-a", None)).await;
+        pool.insert_channel(TargetKey::k8s("env-1", "pod-a", None, None), Arc::new(MockChannel) as Arc<dyn ExecChannel>).await;
+        pool.disconnect_target(&TargetKey::k8s("env-1", "pod-a", None, None)).await;
         assert_eq!(pool.connection_count(), 1, "base key survives");
     }
 
     #[test]
+    fn test_same_pod_different_namespace_keys_are_distinct() {
+        assert_ne!(
+            TargetKey::k8s("e", "p", Some("ns1"), None),
+            TargetKey::k8s("e", "p", Some("ns2"), None),
+            "same pod in different namespaces must be different pool keys"
+        );
+    }
+
+    #[test]
     fn test_from_parts_normalizes_empty_strings() {
-        let k = TargetKey::from_parts("e", Some(""), Some(""));
+        let k = TargetKey::from_parts("e", Some(""), None, Some(""));
         assert_eq!(k, TargetKey::base("e"));
     }
 
     #[test]
     fn test_from_parts_drops_container_without_pod() {
-        let k = TargetKey::from_parts("e", None, Some("c1"));
+        let k = TargetKey::from_parts("e", None, None, Some("c1"));
         assert_eq!(k, TargetKey::base("e"), "container without pod is meaningless, must normalize to base key");
     }
 
     #[test]
+    fn test_from_parts_drops_namespace_without_pod() {
+        let k = TargetKey::from_parts("e", None, Some("ns1"), Some("c1"));
+        assert_eq!(k, TargetKey::base("e"), "namespace without pod is meaningless, must normalize to base key");
+    }
+
+    #[test]
+    fn test_from_parts_normalizes_empty_namespace() {
+        let k = TargetKey::from_parts("e", Some("p"), Some(""), None);
+        assert_eq!(k.namespace, None, "empty namespace must normalize to None");
+        assert_eq!(k, TargetKey::k8s("e", "p", None, None));
+    }
+
+    #[test]
     fn test_k8s_constructor_normalizes_empty_container() {
-        let k = TargetKey::k8s("e", "p", Some(""));
+        let k = TargetKey::k8s("e", "p", None, Some(""));
         assert_eq!(k.container, None);
+    }
+
+    #[test]
+    fn test_k8s_constructor_normalizes_empty_namespace() {
+        let k = TargetKey::k8s("e", "p", Some(""), None);
+        assert_eq!(k.namespace, None);
     }
 
     #[test]

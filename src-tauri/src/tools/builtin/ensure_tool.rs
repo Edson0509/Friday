@@ -14,7 +14,7 @@ pub struct EnsureToolHandler {
     pub bus: crate::app::events::EventBus,
     /// jvm_* 工具共享的 JDK 布局缓存：成功后写入
     pub jdk_cache: Arc<crate::tools::builtin::jvm::jdk_cache::JdkCache>,
-    /// 目标键（env/pod/container，与池、缓存键同源——见 jdk_cache::cache_key）→ 串行化锁。
+    /// 目标键（env/pod/namespace/container，与池、缓存键同源——见 jdk_cache::cache_key）→ 串行化锁。
     /// 注：当前仅 jdk 一种包，包名不入键；未来多包时需加回。
     pub inflight: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -30,6 +30,7 @@ impl ToolHandler for EnsureToolHandler {
         };
         let java_bin = args.get("java_bin").and_then(|v| v.as_str()).unwrap_or("java");
         let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let namespace = args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
         let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
         if tool != "jdk" {
@@ -53,15 +54,15 @@ impl ToolHandler for EnsureToolHandler {
             Err(e) => return error_output("lookup_failed", &format!("查询环境失败: {e}")),
         };
 
-        // 环境类型门禁：vm 拒 pod / container 必填 pod（引导 k8s_find_pods）+ k8s 名防呆
-        if let Err(msg) = crate::tools::builtin::jvm::core::validate_target(&env, pod, container) {
+        // 环境类型门禁：vm 拒 pod/ns / container 必填 pod+namespace（引导 k8s_find_pods）+ k8s 名防呆
+        if let Err(msg) = crate::tools::builtin::jvm::core::validate_target(&env, pod, namespace, container) {
             return error_output("environment_type_mismatch", &msg);
         }
 
         // 获取 channel
         let channel = {
             let mut pool = self.exec_pool.lock().await;
-            match pool.get_or_create(&env.id, pod, container, &self.db).await {
+            match pool.get_or_create(&env.id, pod, namespace, container, &self.db).await {
                 Ok(ch) => ch,
                 Err(e) => {
                     tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "ensure_tool: failed to get exec channel");
@@ -95,10 +96,10 @@ impl ToolHandler for EnsureToolHandler {
             bus: self.bus.clone(),
         };
 
-        // (env_id, pod, container) 串行化：并发请求排队，后者进锁后 ensure 会重新查远端缓存。
+        // (env_id, pod, namespace, container) 串行化：并发请求排队，后者进锁后 ensure 会重新查远端缓存。
         // lock_key 与池键、JdkCache 键同源（TargetKey::from_parts 归一化 + cache_key），
         // 避免手写第三套键格式导致键空间错位（如 container-without-pod 与裸调用撞池键却各持不同锁）。
-        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, container);
+        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, namespace, container);
         let lock_key = crate::tools::builtin::jvm::jdk_cache::cache_key(&target);
         let per_key = {
             let mut inflight = self.inflight.lock().await;
@@ -156,12 +157,13 @@ pub fn ensure_tool_tool_def(
 ) -> ToolDef {
     ToolDef {
         name: "ensure_tool".to_string(),
-        description: "确保目标环境已装备指定诊断工具包（当前支持 jdk）。生产环境通常只有 JRE，缺少 jstat/jcmd 等诊断工具；本工具探测目标 JVM 版本并下载匹配的 JDK 到 /tmp/friday-tools（不影响系统 Java）。装备成功后即可直接调用 jvm_gc_stats / jvm_thread_dump / jvm_heap_info / jvm_vm_info / jvm_class_histogram / jvm_heap_dump 等结构化工具。重复调用安全：已装备时直接返回。JVM 诊断流程——虚机环境：list_processes 查 pid → ensure_tool → jvm_*；容器环境：k8s_find_pods 定位 Pod → ensure_tool(pod=...) → jvm_*(pod=...)。".to_string(),
+        description: "确保目标环境已装备指定诊断工具包（当前支持 jdk）。生产环境通常只有 JRE，缺少 jstat/jcmd 等诊断工具；本工具探测目标 JVM 版本并下载匹配的 JDK 到 /tmp/friday-tools（不影响系统 Java）。装备成功后即可直接调用 jvm_gc_stats / jvm_thread_dump / jvm_heap_info / jvm_vm_info / jvm_class_histogram / jvm_heap_dump 等结构化工具。重复调用安全：已装备时直接返回。JVM 诊断流程——虚机环境：list_processes 查 pid → ensure_tool → jvm_*；容器环境：k8s_find_pods 定位 Pod → ensure_tool(pod=..., namespace=...) → jvm_*(pod=..., namespace=...)。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
                 "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
+                "namespace": { "type": "string", "description": "Kubernetes namespace（容器环境必填；与 pod 一起来自 k8s_find_pods 返回；全小写）" },
                 "container": { "type": "string", "description": "容器名（多容器 Pod 时指定）" },
                 "tool": { "type": "string", "enum": ["jdk"], "description": "要装备的工具包名" },
                 "java_bin": { "type": "string", "description": "目标服务使用的 java 可执行文件路径，默认 java（多版本共存时从服务进程命令行确认后传入）" }
@@ -335,14 +337,15 @@ mod tests {
         drop(tmp);
     }
 
-    /// k8s 目标：pod 参数 → K8sJdkPackage + 容器自带 jcmd 短路 + 复合缓存键
+    /// k8s 目标：pod+namespace 参数 → K8sJdkPackage + 容器自带 jcmd 短路 + 复合缓存键
     #[tokio::test]
     async fn test_ensure_with_pod_uses_k8s_package_and_composite_cache() {
         let (tmp, db, exec_pool, cache, bus) = setup_as("container").await;
         let env_id = crate::app::environments::find_by_name(&db, "prod").await.unwrap().unwrap().id;
-        // 注入 k8s 目标通道（probe ok / musl 无 / native 命中）
+        // 注入 k8s 目标通道（probe ok / musl 无 / native 命中；键带 namespace）
+        let target = crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", Some("ns1"), None);
         exec_pool.lock().await.insert_channel(
-            crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None),
+            target.clone(),
             Arc::new(K8sNativeChannel) as Arc<dyn ExecChannel>,
         ).await;
         let jdk_cache = Arc::new(crate::tools::builtin::jvm::jdk_cache::JdkCache::new());
@@ -357,7 +360,7 @@ mod tests {
         let ctx = ToolContext { session_id: "s1".into(), channel: None };
         let out = handler
             .execute(
-                serde_json::json!({"environment": "prod", "tool": "jdk", "pod": "pod-1"}),
+                serde_json::json!({"environment": "prod", "tool": "jdk", "pod": "pod-1", "namespace": "ns1"}),
                 &ctx,
             )
             .await;
@@ -368,7 +371,7 @@ mod tests {
         assert_eq!(out.data["tool_home"], crate::exec::k8s::POD_TOOLS_DIR);
         // 复合键写入（env|pod=..）
         let layout = jdk_cache
-            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&crate::exec::pool::TargetKey::k8s(&env_id, "pod-1", None)))
+            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target))
             .await
             .expect("composite cache key must be populated");
         assert_eq!(layout.bins["jcmd"], "/usr/bin/jcmd");

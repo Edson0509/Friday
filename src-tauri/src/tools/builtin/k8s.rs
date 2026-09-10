@@ -83,8 +83,8 @@ impl ToolHandler for FindPodsHandler {
             MAX_TIMEOUT_SECS,
         );
 
-        // 发现走宿主机 base 通道（不传 pod）
-        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment, None, None).await {
+        // 发现走宿主机 base 通道（不传 pod/namespace）
+        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment, None, None, None).await {
             Ok(Some(pair)) => pair,
             Ok(None) => {
                 return error_output(
@@ -117,7 +117,7 @@ impl ToolHandler for FindPodsHandler {
         match result {
             Err(_) => {
                 tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs, "k8s_find_pods timed out, dropping connection");
-                let target = crate::exec::pool::TargetKey::from_parts(&env.id, None, None);
+                let target = crate::exec::pool::TargetKey::from_parts(&env.id, None, None, None);
                 crate::exec::pool::drop_target_and_kill(&self.core.exec_pool, &self.core.db, &target, KUBECTL_GET_PODS).await;
                 error_output("timeout_error", &format!("command timed out after {timeout_secs}s"))
             }
@@ -149,7 +149,7 @@ impl ToolHandler for FindPodsHandler {
                     data: serde_json::json!({
                         "pods": pods,
                         "count": pods.len(),
-                        "note": "多实例命中时请让用户选择目标 Pod；后续 jvm_* 工具传该 Pod 的 name 作为 pod 参数（PID 为容器内 PID，用带 pod 的 list_processes 获取）。注意：k8s 命名全小写——传 pod 参数时请使用下方返回的准确 name，勿直接用服务名。",
+                        "note": "多实例命中时请让用户选择目标 Pod；后续所有诊断工具必须同时传该 Pod 的 name 作为 pod 参数和其 namespace（PID 为容器内 PID，用带 pod 的 list_processes 获取）。k8s 命名全小写——传参请用返回的准确值，勿用服务名。",
                         "elapsed_ms": elapsed_ms,
                     }),
                     raw_stdout: Some(output.stdout),
@@ -162,7 +162,7 @@ impl ToolHandler for FindPodsHandler {
 pub fn k8s_find_pods_tool_def(core: Arc<JvmExecCore>) -> ToolDef {
     ToolDef {
         name: "k8s_find_pods".to_string(),
-        description: "容器环境的服务发现入口（虚机环境请用 list_processes）：kubectl get pods -A 按服务名过滤，返回 Pod/命名空间/容器列表/状态/节点。用户说「检查 xx 服务」且环境是容器类型时，先用本工具定位 Pod；多实例时向用户确认选哪个。之后的诊断工具传 pod（+container）参数。".to_string(),
+        description: "容器环境的服务发现入口（虚机环境请用 list_processes）：kubectl get pods -A 按服务名过滤，返回 Pod/命名空间/容器列表/状态/节点。用户说「检查 xx 服务」且环境是容器类型时，先用本工具定位 Pod；多实例时向用户确认选哪个。之后的诊断工具传 pod + namespace（+container）参数。".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -340,7 +340,7 @@ mod tests {
             // base 通道挂起（kubectl get pods 无响应）+ k8s 目标通道正常（并发容器诊断）
             let (tmp, core) = setup(Arc::new(HangingChannel)).await;
             let env = crate::app::environments::find_by_name(&core.db, "prod").await.unwrap().unwrap();
-            let k8s_key = crate::exec::pool::TargetKey::k8s(&env.id, "pod-a", None);
+            let k8s_key = crate::exec::pool::TargetKey::k8s(&env.id, "pod-a", None, None);
             core.exec_pool
                 .lock()
                 .await

@@ -4,13 +4,15 @@ use crate::tools::registry::ToolOutput;
 use std::sync::Arc;
 
 /// 环境名 → env 记录 + channel（run_command / ensure_tool 同款语义，提取共享）。
-/// pod/container：k8s 目标定位（None = 宿主机 VM 模式）。
+/// pod/namespace/container：k8s 目标定位（None = 宿主机 VM 模式）。
+/// 容器目标 pod 与 namespace 必须同时传（find_pods 返回二者；门禁见 validate_target）。
 /// Ok(None) = 环境不存在（调用方引导 list_environments）。
 pub async fn resolve_environment(
     db: &sqlx::SqlitePool,
     exec_pool: &Arc<tokio::sync::Mutex<crate::exec::pool::ExecChannelPool>>,
     environment: &str,
     pod: Option<&str>,
+    namespace: Option<&str>,
     container: Option<&str>,
 ) -> Result<Option<(crate::app::environments::EnvironmentRow, Arc<dyn ExecChannel>)>, String> {
     let env = match crate::app::environments::find_by_name(db, environment).await {
@@ -20,7 +22,7 @@ pub async fn resolve_environment(
     };
     let channel = {
         let mut pool = exec_pool.lock().await;
-        pool.get_or_create(&env.id, pod, container, db).await.map_err(|e| e.to_string())?
+        pool.get_or_create(&env.id, pod, namespace, container, db).await.map_err(|e| e.to_string())?
     };
     Ok(Some((env, channel)))
 }
@@ -34,34 +36,41 @@ pub fn error_output(error: &str, message: &str) -> ToolOutput {
 }
 
 /// 环境类型门禁 + k8s 名防呆（类型驱动差异逻辑）：
-/// - 容器环境：pod 必填（缺失引导先 k8s_find_pods）；pod/container 名做 DNS-1123 防呆校验
-/// - 虚机环境：拒绝 pod 参数
+/// - 容器环境：pod 与 namespace **都必填**（find_pods 返回二者，缺任一引导补齐）；
+///   pod/namespace/container 名做 DNS-1123 防呆校验
+/// - 虚机环境：拒绝 pod/namespace 参数（namespace 无 pod 无意义，from_parts 已归一，这里给明确报错）
 /// 防呆背景：虚机服务名常含大写，k8s 命名全小写——Agent 误把服务名当 Pod 名时
 /// 尽早拦截，避免走到 kubectl 才报模糊的 "pod not found"。
 /// 门禁在 resolve_environment 之后执行（resolve 内部急切建连）：vm+pod 误路由且宿主机不可达时会先报 connection_error——可接受的权衡，避免 resolve 内嵌门禁需要的类型化错误改造。
 pub fn validate_target(
     env: &crate::app::environments::EnvironmentRow,
     pod: Option<&str>,
+    namespace: Option<&str>,
     container: Option<&str>,
 ) -> Result<(), String> {
     match env.transport_type.as_str() {
-        "container" => match pod {
-            Some(p) => {
+        "container" => match (pod, namespace) {
+            (Some(p), Some(ns)) => {
                 validate_k8s_name("Pod", p)?;
+                validate_k8s_name("Namespace", ns)?;
                 if let Some(c) = container.filter(|c| !c.is_empty()) {
                     validate_k8s_name("容器", c)?;
                 }
                 Ok(())
             }
-            None => Err(
-                "该环境是容器环境：请先用 k8s_find_pods 定位 Pod，再带 pod 参数调用本工具。"
+            (Some(_), None) => Err(
+                "该环境是容器环境：缺少 namespace 参数。请使用 k8s_find_pods 返回的 namespace（后续所有工具需同时带 pod 和 namespace）。"
+                    .to_string(),
+            ),
+            (None, _) => Err(
+                "该环境是容器环境：请先用 k8s_find_pods 定位 Pod，再带 pod + namespace 参数调用本工具。"
                     .to_string(),
             ),
         },
-        "vm" => match pod {
-            None => Ok(()),
-            Some(_) => Err(
-                "该环境是虚机环境：不支持 pod 参数（服务应直接跑在宿主机上）。".to_string(),
+        "vm" => match (pod, namespace) {
+            (None, None) => Ok(()),
+            _ => Err(
+                "该环境是虚机环境：不支持 pod/namespace 参数（服务应直接跑在宿主机上）。".to_string(),
             ),
         },
         other => Err(format!("未知环境类型 {other:?}（支持 vm / container）")),
@@ -330,21 +339,38 @@ mod tests {
 
     #[test]
     fn test_validate_target_rules() {
-        // vm：无 pod OK，有 pod 拒绝
-        assert!(validate_target(&env_row("vm"), None, None).is_ok());
-        assert!(validate_target(&env_row("vm"), Some("p1"), None).is_err());
-        // container：有 pod OK，缺 pod 拒绝（引导 k8s_find_pods）
-        assert!(validate_target(&env_row("container"), Some("p1"), None).is_ok());
-        let err = validate_target(&env_row("container"), None, None).unwrap_err();
+        // vm：无 pod/namespace OK；带任一拒绝
+        assert!(validate_target(&env_row("vm"), None, None, None).is_ok());
+        assert!(validate_target(&env_row("vm"), Some("p1"), None, None).is_err());
+        assert!(validate_target(&env_row("vm"), None, Some("ns1"), None).is_err());
+        // container：pod + namespace 齐备 OK
+        assert!(validate_target(&env_row("container"), Some("p1"), Some("ns1"), None).is_ok());
+        // container：缺 namespace 拒绝（引导使用 find_pods 返回的 ns）
+        let err = validate_target(&env_row("container"), Some("p1"), None, None).unwrap_err();
+        assert!(err.contains("缺少 namespace"), "err: {err}");
         assert!(err.contains("k8s_find_pods"), "err: {err}");
+        // container：pod/namespace 都缺拒绝（引导 k8s_find_pods）
+        let err = validate_target(&env_row("container"), None, None, None).unwrap_err();
+        assert!(err.contains("k8s_find_pods"), "err: {err}");
+        // container：只传 namespace（无 pod）也拒绝
+        assert!(validate_target(&env_row("container"), None, Some("ns1"), None).is_err());
         // 未知类型拒绝
-        assert!(validate_target(&env_row("ssh"), None, None).is_err());
+        assert!(validate_target(&env_row("ssh"), None, None, None).is_err());
     }
 
     #[test]
     fn test_validate_target_rejects_uppercase_pod_name() {
         let env = env_row("container");
-        let err = validate_target(&env, Some("SNMPAgentService"), None).unwrap_err();
+        let err = validate_target(&env, Some("SNMPAgentService"), Some("ns1"), None).unwrap_err();
+        assert!(err.contains("全小写"), "err: {err}");
+        assert!(err.contains("k8s_find_pods"), "err: {err}");
+    }
+
+    #[test]
+    fn test_validate_target_rejects_uppercase_namespace() {
+        // namespace 同样做 DNS-1123 防呆（大写服务名误传拦截）
+        let env = env_row("container");
+        let err = validate_target(&env, Some("pod-1"), Some("OOMService"), None).unwrap_err();
         assert!(err.contains("全小写"), "err: {err}");
         assert!(err.contains("k8s_find_pods"), "err: {err}");
     }
@@ -352,20 +378,23 @@ mod tests {
     #[test]
     fn test_validate_target_rejects_uppercase_container_name() {
         let env = env_row("container");
-        assert!(validate_target(&env, Some("pod-1"), Some("Main")).is_err());
+        assert!(validate_target(&env, Some("pod-1"), Some("ns1"), Some("Main")).is_err());
         // 合法小写容器名通过
-        assert!(validate_target(&env, Some("pod-1"), Some("main")).is_ok());
+        assert!(validate_target(&env, Some("pod-1"), Some("ns1"), Some("main")).is_ok());
     }
 
     #[test]
     fn test_validate_target_accepts_valid_dns1123_names() {
         let env = env_row("container");
-        assert!(validate_target(&env, Some("snmpagent-7d9b-x2vkl"), None).is_ok());
-        assert!(validate_target(&env, Some("pod.1"), None).is_ok()); // 点号（DNS subdomain）
-        // 边角：空串/首尾连字符拒绝
-        assert!(validate_target(&env, Some(""), None).is_err());
-        assert!(validate_target(&env, Some("-pod"), None).is_err());
-        assert!(validate_target(&env, Some("pod-"), None).is_err());
+        assert!(validate_target(&env, Some("snmpagent-7d9b-x2vkl"), Some("ns1"), None).is_ok());
+        assert!(validate_target(&env, Some("pod.1"), Some("ns1"), None).is_ok()); // 点号（DNS subdomain）
+        // 边角：空串/首尾连字符拒绝（pod 与 namespace 同规则）
+        assert!(validate_target(&env, Some(""), Some("ns1"), None).is_err());
+        assert!(validate_target(&env, Some("-pod"), Some("ns1"), None).is_err());
+        assert!(validate_target(&env, Some("pod-"), Some("ns1"), None).is_err());
+        assert!(validate_target(&env, Some("pod-1"), Some(""), None).is_err());
+        assert!(validate_target(&env, Some("pod-1"), Some("-ns"), None).is_err());
+        assert!(validate_target(&env, Some("pod-1"), Some("ns-"), None).is_err());
     }
 
     #[test]
