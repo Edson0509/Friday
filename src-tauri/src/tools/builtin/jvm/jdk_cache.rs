@@ -16,17 +16,18 @@ pub struct JdkCache {
     layouts: Mutex<HashMap<String, JdkLayout>>,
 }
 
-/// 复合缓存键：VM 目标 = env_id；k8s 目标 = env|pod=..|ctr=..
+/// 复合缓存键：VM 目标 = env_id；k8s 目标 = env|pod=..|ns=..|ctr=..
 /// （JdkCache 的 HashMap<String, JdkLayout> 不变，只换 key 构造）
-/// 归一化单一权威：TargetKey::from_parts 已归一空串/无 pod 的 container，
-/// 此处不再过滤。
+/// 归一化单一权威：TargetKey::from_parts 已归一空串/无 pod 的 ns+container，
+/// 此处不再过滤。ns 入键：跨 namespace 同名 Pod 是不同目标（终审发现的键盲区）。
 pub fn cache_key(target: &crate::exec::pool::TargetKey) -> String {
     match &target.pod {
         None => target.env_id.clone(),
         Some(pod) => format!(
-            "{}|pod={}|ctr={}",
+            "{}|pod={}|ns={}|ctr={}",
             target.env_id,
             pod,
+            target.namespace.as_deref().unwrap_or("-"),
             target.container.as_deref().unwrap_or("-")
         ),
     }
@@ -97,8 +98,13 @@ mod tests {
     fn test_cache_key_composite_for_k8s() {
         use crate::exec::pool::TargetKey;
         assert_eq!(cache_key(&TargetKey::base("e1")), "e1");
-        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None, None)), "e1|pod=p1|ctr=-");
-        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None, Some("c1"))), "e1|pod=p1|ctr=c1");
+        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None, None)), "e1|pod=p1|ns=-|ctr=-");
+        assert_eq!(cache_key(&TargetKey::k8s("e1", "p1", None, Some("c1"))), "e1|pod=p1|ns=-|ctr=c1");
+        // 跨 ns 同名 Pod 是不同目标（ns 入键——终审发现的键盲区）
+        assert_ne!(
+            cache_key(&TargetKey::k8s("e1", "p1", Some("ns1"), None)),
+            cache_key(&TargetKey::k8s("e1", "p1", Some("ns2"), None))
+        );
         // from_parts 归一：空串视为未传；container/namespace without pod 归一到 base key
         assert_eq!(cache_key(&TargetKey::from_parts("e1", Some(""), None, None)), "e1");
         assert_eq!(cache_key(&TargetKey::from_parts("e1", None, None, Some("c1"))), "e1");

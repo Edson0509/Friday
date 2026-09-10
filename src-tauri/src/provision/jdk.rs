@@ -30,6 +30,14 @@ pub fn parse_probe_output(stdout: &str, stderr: &str) -> Result<JvmProbe, String
              请先通过 run_command 确认目标服务的 java 可执行文件路径，再用 java_bin 参数指定"
         ));
     }
+    // busybox/dash（精简镜像默认 sh）缺 java 时输出 `sh: java: not found`（无 "command"），
+    // 同属 java 层缺失——先于 kubectl 特征判定，防止误落 remote_exec_failed（终审发现的边界）
+    if stdout.contains(": not found") || stderr.contains(": not found") {
+        return Err(format!(
+            "probe_failed: java not found on target. stdout: {stdout:?} stderr: {stderr:?}. \
+             请先通过 run_command 确认目标服务的 java 可执行文件路径，再用 java_bin 参数指定"
+        ));
+    }
 
     // kubectl / API server 级错误（容器目标：exec 通道本身失败，java 根本没跑）。
     // 特征串出现时不能混进 parse_failed（误导排查方向），单列 remote_exec_failed
@@ -609,6 +617,15 @@ mod tests {
     fn test_parse_probe_output_java_not_found() {
         let err = parse_probe_output("---\n", "bash: java: command not found\n").unwrap_err();
         assert!(err.contains("probe_failed"), "err: {err}");
+    }
+
+    /// busybox/dash（精简镜像默认 sh）缺 java：`sh: java: not found`（无 "command"）——
+    /// 不得误落 remote_exec_failed（终审发现的边界）
+    #[test]
+    fn test_parse_probe_output_busybox_java_not_found_is_probe_failed() {
+        let err = parse_probe_output("---\n", "sh: java: not found\n").unwrap_err();
+        assert!(err.contains("probe_failed"), "err: {err}");
+        assert!(!err.contains("remote_exec_failed"), "err: {err}");
     }
 
     #[test]
