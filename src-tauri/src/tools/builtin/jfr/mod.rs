@@ -676,6 +676,7 @@ mod tests {
         assert!(calls[0].contains("JFR.start"), "calls[0]: {}", calls[0]);
         assert!(calls[0].contains("duration=10s"));
         assert!(calls[0].contains("settings=profile"));
+        assert!(calls[0].contains("disk=true"), "VM 目标默认 disk=true：{}", calls[0]);
         assert!(calls[0].contains("filename=/tmp/friday-tools/recording-1234-"));
         assert!(calls[1].contains("JFR.check"), "calls[1]: {}", calls[1]);
         assert!(calls.iter().skip(2).filter(|c| c.starts_with("stat -c %s")).count() >= 2);
@@ -981,6 +982,8 @@ mod tests {
             calls[0].contains("filename=/opt/log/dump/coredump/friday-recording-1234-"),
             "start cmd: {}", calls[0]
         );
+        // 容器目标默认 disk=false（issue #23 三轮：JFR repository 不落 /opt/tmp）
+        assert!(calls[0].contains("disk=false"), "pod 目标默认 disk=false：{}", calls[0]);
         drop(calls);
         let rid = out.data["recording_id"].as_str().unwrap();
         let done = poll_status_to_terminal(&reg, rid).await;
@@ -1004,6 +1007,7 @@ mod tests {
             serde_json::json!({"pid": "1234"}),
             serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 5}),
             serde_json::json!({"environment": "prod", "pid": "1234", "settings": "boot"}),
+            serde_json::json!({"environment": "prod", "pid": "1234", "disk": "yes"}),
             serde_json::json!({"environment": "prod", "pid": "1; rm -rf /"}),
         ] {
             let out = def(&reg, "jfr_record").handler.execute(args, &ctx()).await;

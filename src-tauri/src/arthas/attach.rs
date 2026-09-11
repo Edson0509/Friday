@@ -168,6 +168,84 @@ pub fn write_properties_command(home: &str, content: &str) -> String {
     )
 }
 
+/// 覆盖版 logback.xml（issue #23 三轮）：上游默认 `${user.home}/logs/arthas`，
+/// 容器内 user.home 常缺失 → fallback 到 java.io.tmpdir（= /opt/tmp
+/// ephemeral-storage，写满驱逐）。钉到 dump 卷下 arthas-logs（JVM 用户可写——
+/// heap dump / JFR 落同卷已验证；目录由 logback FileAppender 自动创建）。
+/// 滚动策略沿用上游（1MB/文件、10MB 总量、7 天）。
+pub fn logback_content_pod(log_dir: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- Friday override (issue #23): pin arthas logs to the dump volume (eviction-safe) -->
+    <property name="ARTHAS_LOG_PATH" value="{log_dir}" />
+    <property name="ARTHAS_LOG_FILE" value="{log_dir}/arthas.log" />
+    <property name="RESULT_LOG_FILE" value="{log_dir}/result.log" />
+
+    <appender name="ARTHAS" class="com.alibaba.arthas.deps.ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${{ARTHAS_LOG_FILE}}</file>
+        <encoder>
+            <pattern>%d{{yyyy-MM-dd HH:mm:ss}} [%thread] %-5level %logger{{36}} -%msg%n</pattern>
+        </encoder>
+        <rollingPolicy class="com.alibaba.arthas.deps.ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${{ARTHAS_LOG_FILE}}.%d{{yyyy-MM-dd}}.%i.log
+            </fileNamePattern>
+            <maxHistory>7</maxHistory>
+            <maxFileSize>1MB</maxFileSize>
+            <totalSizeCap>10MB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+
+    <appender name="RESULT" class="com.alibaba.arthas.deps.ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${{RESULT_LOG_FILE}}</file>
+        <encoder>
+            <pattern>%d{{yyyy-MM-dd HH:mm:ss}} [%thread] %-5level %logger{{36}} -%msg%n</pattern>
+        </encoder>
+        <rollingPolicy class="com.alibaba.arthas.deps.ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${{RESULT_LOG_FILE}}.%d{{yyyy-MM-dd}}.%i.log
+            </fileNamePattern>
+            <maxHistory>7</maxHistory>
+            <maxFileSize>1MB</maxFileSize>
+            <totalSizeCap>10MB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+
+    <logger name="result" level="INFO" additivity="false">
+        <appender-ref ref="RESULT" />
+    </logger>
+
+    <root level="INFO">
+        <appender-ref ref="ARTHAS" />
+    </root>
+</configuration>
+"#
+    )
+}
+
+/// 写覆盖版 logback.xml（与 arthas.properties 同目录同时机；chmod 644 同语义）
+pub fn write_logback_command(home: &str, content: &str) -> String {
+    format!(
+        "printf '%s' {} > {home}/logback.xml && chmod 644 {home}/logback.xml",
+        shell_quote_single(content)
+    )
+}
+
+/// 清理 arthas MCP server 的上传暂存目录（issue #23 三轮：UploadFileTool 在目标
+/// JVM 的 java.io.tmpdir 下 Files.createTempDirectory("arthas-mcp-uploads-")，
+/// 每次 attach 残留一个空目录——Friday 不使用 MCP upload，恒为空）。
+/// 目标 JVM 的 tmpdir 未知（-Djava.io.tmpdir 或 TMPDIR），覆盖常见位；
+/// 前缀唯一、无匹配时 glob 保持字面量由 rm -f 吞掉，安全。
+pub fn cleanup_mcp_uploads_command() -> String {
+    "for d in \"$TMPDIR\" /opt/tmp /tmp; do [ -n \"$d\" ] && rm -rf \"$d\"/arthas-mcp-uploads-* 2>/dev/null; done; true".to_string()
+}
+
+/// 清理 attach boot 日志（issue #23 三轮：容器内 /tmp 为 ephemeral-storage；
+/// --attach-only 使 boot 进程 attach 完即退，日志仅 KB 级——成功后即清，
+/// 失败路径保留供 ARTHAS_LOG_HINT 诊断）
+pub fn cleanup_boot_log_command(pid: i64) -> String {
+    format!("rm -f /tmp/arthas-friday-{pid}.log 2>/dev/null; true")
+}
+
 /// attach 命令：pid 是位置参数（arthas-boot 无 --pid 选项）；--attach-only 使 boot 进程
 /// attach 后即退出（telnet 已禁用，不启动交互 client）；--telnet-port 传有效空闲端口
 /// 骗过 boot 的预检（对 -1 会抛 port out of range 退出），agent 侧实际不绑（overrideAll）。
@@ -342,6 +420,11 @@ async fn attach_arthas_on_vm(
         }
     };
 
+    // 7.5 attach 成功——清理 boot 日志（issue #23 三轮：容器内 /tmp 为
+    //     ephemeral-storage；VM 同路径保持行为一致。失败路径保留——探活/握手
+    //     错误消息的 ARTHAS_LOG_HINT 诊断源）
+    cleanup_boot_log(channel.as_ref(), req.pid).await;
+
     progress("ready", format!("arthas 就绪（远端端口 {port}，exec HTTP 桥）"));
     let stop_handle: Arc<dyn ArthasStopHandle> = Arc::new(ProductionStopHandle {
         db: deps.db.clone(),
@@ -430,6 +513,10 @@ async fn attach_arthas_in_pod(
         &progress,
     )
     .await?;
+
+    // 8. attach 成功——清理容器内 boot 日志（issue #23 三轮：容器 /tmp 为
+    //     ephemeral-storage 且极小；--attach-only 使 boot 进程即退，日志 KB 级）
+    cleanup_boot_log(k8s_ch.as_ref(), req.pid).await;
 
     let transport_desc = if pf_lease.is_some() { "port-forward 隧道" } else { "exec HTTP 桥" };
     progress(
@@ -640,6 +727,16 @@ async fn pod_attach_prepare(
         }
     }
 
+    // 3.6 清理 arthas MCP server 上传暂存残留（issue #23 三轮：UploadFileTool 在
+    //     目标 JVM 的 java.io.tmpdir 建 arthas-mcp-uploads-*，每次 attach 残留一个
+    //     空目录——Friday 不使用 MCP upload 恒为空，前缀唯一清理安全。当前会话的
+    //     目录在 attach 后才创建，不受影响）
+    progress("cleanup", "清理 arthas-mcp-uploads 残留".to_string());
+    if let Err(e) = run_with_timeout(k8s_ch.as_ref(), &cleanup_mcp_uploads_command(), 15).await {
+        tracing::warn!(session_id = %req.session_id, env_id = %req.env_id, pod, error = %e,
+            "arthas-mcp-uploads 清理失败（best-effort）");
+    }
+
     // 4. 端口分配 + properties 写入（容器内 dist 目录；绑 0.0.0.0 供宿主侧探测/T6 隧道接入）。
     //    pod 模式端口探测走宿主机侧 podIP:port（容器内探测失明）；podIP 拿不到时
     //    降级容器内探测（旧路径，busybox 下失明，MCP 握手兜底）
@@ -651,6 +748,16 @@ async fn pod_attach_prepare(
     let token = generate_token();
     progress("write_config", format!("写入 arthas.properties（httpPort={port}，绑定 0.0.0.0）"));
     write_properties(k8s_ch.as_ref(), &arthas_home, &arthas_properties_content_pod(port, &token)).await?;
+    // 4.5 覆盖 logback.xml：arthas 日志钉到 POD_DUMP_DIR/arthas-logs（issue #23 三轮：
+    //     上游默认 user.home 缺失时落 java.io.tmpdir = /opt/tmp ephemeral-storage，
+    //     写满驱逐；同卷 heap dump/JFR 已验证 JVM 用户可写，目录由 logback 自动建）
+    progress("write_config", "覆盖 logback.xml（arthas 日志钉到 dump 卷）".to_string());
+    write_logback(
+        k8s_ch.as_ref(),
+        &arthas_home,
+        &logback_content_pod(&format!("{}/arthas-logs", crate::exec::k8s::POD_DUMP_DIR)),
+    )
+    .await?;
 
     // 5. attach（容器内 nohup；日志 /tmp/arthas-friday-{pid}.log 为 Pod 内路径，语义正确）
     progress("attach", format!("attach arthas 到 PID {}（java={java}）", req.pid));
@@ -1021,6 +1128,30 @@ async fn write_properties(
         )));
     }
     Ok(())
+}
+
+/// 写覆盖版 logback.xml（容器分支：arthas 日志钉到 dump 卷，防 /opt/tmp 驱逐）
+async fn write_logback(
+    channel: &dyn ExecChannel,
+    home: &str,
+    content: &str,
+) -> Result<(), ManagerError> {
+    let out = run_with_timeout(channel, &write_logback_command(home, content), 15).await?;
+    if out.exit_code != 0 {
+        return Err(ManagerError::Attach(format!(
+            "写入 logback.xml 失败（exit {}）: {}",
+            out.exit_code, out.stderr
+        )));
+    }
+    Ok(())
+}
+
+/// attach 成功后清理 boot 日志（best-effort：/tmp sticky 位下跨用户可能无权删，
+/// 失败仅 debug——VM /tmp 无驱逐压力，容器内 exec 用户 = JVM 用户必成）
+async fn cleanup_boot_log(channel: &dyn ExecChannel, pid: i64) {
+    if let Err(e) = run_with_timeout(channel, &cleanup_boot_log_command(pid), 15).await {
+        tracing::debug!(pid, error = %e, "arthas boot log cleanup skipped (best-effort)");
+    }
 }
 
 /// 执行 attach 命令（临时连接场景用后即断）
@@ -1416,6 +1547,52 @@ mod tests {
         }
     }
 
+    /// issue #23 三轮：覆盖版 logback.xml 把 arthas 日志钉到 dump 卷，
+    /// 不得再引用 java.io.tmpdir / user.home 兜底链
+    #[test]
+    fn test_logback_content_pod_pins_log_dir() {
+        let content = logback_content_pod("/opt/log/dump/coredump/arthas-logs");
+        assert!(content.contains("<property name=\"ARTHAS_LOG_PATH\" value=\"/opt/log/dump/coredump/arthas-logs\" />"));
+        assert!(content.contains("<property name=\"ARTHAS_LOG_FILE\" value=\"/opt/log/dump/coredump/arthas-logs/arthas.log\" />"));
+        assert!(content.contains("<property name=\"RESULT_LOG_FILE\" value=\"/opt/log/dump/coredump/arthas-logs/result.log\" />"));
+        assert!(!content.contains("java.io.tmpdir"));
+        assert!(!content.contains("user.home"));
+        // 滚动上限沿用上游（防日志本身把卷写爆）
+        assert!(content.contains("<maxFileSize>1MB</maxFileSize>"));
+        assert!(content.contains("<totalSizeCap>10MB</totalSizeCap>"));
+        // format! 的 {{ 转义不残留
+        assert!(!content.contains("{{"));
+        assert!(content.contains("${ARTHAS_LOG_FILE}"));
+    }
+
+    #[test]
+    fn test_write_logback_command_quotes_content() {
+        let cmd = write_logback_command(
+            "/opt/log/dump/coredump/friday-tools/arthas-dist",
+            "<?xml version=\"1.0\"?><configuration/>",
+        );
+        assert!(cmd.starts_with("printf '%s' '<?xml"));
+        assert!(cmd.contains("> /opt/log/dump/coredump/friday-tools/arthas-dist/logback.xml"));
+        assert!(cmd.contains("chmod 644 /opt/log/dump/coredump/friday-tools/arthas-dist/logback.xml"));
+    }
+
+    /// issue #23 三轮：清理命令覆盖 $TMPDIR / /opt/tmp / /tmp 三个常见 tmpdir，
+    /// 前缀唯一且兜底 true 保证 exit 0
+    #[test]
+    fn test_cleanup_mcp_uploads_command_covers_common_tmpdirs() {
+        let cmd = cleanup_mcp_uploads_command();
+        assert!(cmd.contains("\"$TMPDIR\""));
+        assert!(cmd.contains("/opt/tmp"));
+        assert!(cmd.contains("/tmp"));
+        assert!(cmd.contains("rm -rf \"$d\"/arthas-mcp-uploads-*"));
+        assert!(cmd.trim_end().ends_with("true"));
+    }
+
+    #[test]
+    fn test_cleanup_boot_log_command_shape() {
+        assert_eq!(cleanup_boot_log_command(4242), "rm -f /tmp/arthas-friday-4242.log 2>/dev/null; true");
+    }
+
     // ── 残留清理 / 失败收尾（RecordingChannel stub，模型对齐 provision/arthas.rs 测试）──
 
     use crate::exec::channel::ExecOutput;
@@ -1670,12 +1847,15 @@ mod tests {
         async fn close(&self, _env_id: &str, _remote_host: &str, _remote_port: u16) {}
     }
 
-    /// 容器内命令脚本：java 解析 + 写 properties + attach（残留清理/端口分配的
-    /// 探测已移宿主机侧——容器 sh 无 /dev/tcp）
+    /// 容器内命令脚本：java 解析 + mcp-uploads 残留清理 + 写 properties + 写
+    /// logback（issue #23 三轮）+ attach（残留清理/端口分配的探测已移宿主机侧
+    /// ——容器 sh 无 /dev/tcp）
     fn pod_channel_script() -> Vec<(&'static str, i32)> {
         vec![
             ("/usr/lib/jvm/java-21/bin/java", 0),
+            ("", 0), // mcp-uploads 残留清理（best-effort）
             ("", 0), // 写 properties
+            ("", 0), // 写 logback（日志钉到 dump 卷）
             ("attach-started", 0),
         ]
     }
@@ -1766,7 +1946,7 @@ mod tests {
         assert!(base_calls[13].contains("/dev/tcp/10.244.1.5/18563"), "probe: {}", base_calls[13]);
 
         let pod_calls = pod_ch.calls().await;
-        assert_eq!(pod_calls.len(), 3, "pod_calls: {pod_calls:?}");
+        assert_eq!(pod_calls.len(), 5, "pod_calls: {pod_calls:?}");
         // 容器内命令全部经 kubectl exec 包装（真实 K8sChannel 语义，-n 显式 ns）
         for c in &pod_calls {
             assert!(c.contains("kubectl exec -n 'ns1' 'svc-1' -- sh -c"), "must be kubectl-wrapped: {c}");
@@ -1778,6 +1958,10 @@ mod tests {
             pod_calls.iter().all(|c| !c.contains("/dev/tcp")),
             "no port probing inside container: {pod_calls:?}"
         );
+        // issue #23 三轮：mcp-uploads 残留清理在容器内执行（覆盖 $TMPDIR//opt/tmp//tmp 常见位）
+        let mcp_cleanup = pod_calls.iter().find(|c| c.contains("arthas-mcp-uploads-")).expect("mcp cleanup cmd");
+        assert!(mcp_cleanup.contains("/opt/tmp"), "mcp cleanup: {mcp_cleanup}");
+        assert!(mcp_cleanup.contains("\"$TMPDIR\""), "mcp cleanup: {mcp_cleanup}");
         // ⑥ properties 写到容器内 dist 目录，内容绑 0.0.0.0（宿主侧探测/T6 隧道可达）
         let write = pod_calls.iter().find(|c| c.contains("arthas.properties")).expect("write props cmd");
         assert!(
@@ -1786,14 +1970,22 @@ mod tests {
         );
         assert!(write.contains("arthas.ip=0.0.0.0"), "write: {write}");
         assert!(!write.contains("arthas.ip=127.0.0.1"), "write: {write}");
+        // issue #23 三轮：logback 覆盖写到容器内 dist 目录，内容钉到 dump 卷 arthas-logs
+        let logback = pod_calls.iter().find(|c| c.contains("logback.xml")).expect("logback write cmd");
+        assert!(
+            logback.contains("/opt/log/dump/coredump/friday-tools/arthas-dist/logback.xml"),
+            "logback: {logback}"
+        );
+        assert!(logback.contains("/opt/log/dump/coredump/arthas-logs/arthas.log"), "logback pinned to dump volume: {logback}");
+        assert!(!logback.contains("user.home"), "logback must not fall back to user.home: {logback}");
         // attach 命令：容器内 dist 目录 + arthas-boot.jar
         let attach = pod_calls.iter().find(|c| c.contains("arthas-boot.jar")).expect("attach cmd");
         assert!(attach.contains("cd /opt/log/dump/coredump/friday-tools/arthas-dist"), "attach: {attach}");
         assert!(attach.contains("--attach-only"), "attach: {attach}");
         assert!(attach.contains("1234"), "attach pid: {attach}");
-        // 容器执行不泄漏到宿主机通道（properties/attach/java 都不在 base 上）
+        // 容器执行不泄漏到宿主机通道（properties/logback/attach/java 都不在 base 上）
         assert!(
-            base_calls.iter().all(|c| !c.contains("arthas.properties") && !c.contains("arthas-boot.jar --attach-only")),
+            base_calls.iter().all(|c| !c.contains("arthas.properties") && !c.contains("arthas-boot.jar --attach-only") && !c.contains("logback.xml")),
             "container cmds must not run on base: {base_calls:?}"
         );
         // 用户对齐被跳过：双通道均无 ps -o user= / id -un
@@ -1894,7 +2086,7 @@ mod tests {
             .rposition(|c| c.contains("/dev/tcp/10.244.1.5/18563"))
             .expect("probe cmd");
         assert!(find_free_idx < last_probe_idx, "probe must follow allocation: {base_calls:?}");
-        assert!(pod_ch.calls().await.len() == 3, "no probing inside container");
+        assert!(pod_ch.calls().await.len() == 5, "no probing inside container");
     }
 
     #[tokio::test]
@@ -1907,13 +2099,16 @@ mod tests {
             ("garbage", 0), // 探活前幂等重取：仍非 IP
         ]);
         let base_ch: Arc<dyn ExecChannel> = base.clone();
-        // 容器内降级脚本：java + 残留清理探测 ×10 + 端口分配 + 写 properties + attach
+        // 容器内降级脚本：java + 残留清理探测 ×10 + mcp-uploads 清理 + 端口分配
+        // + 写 properties + 写 logback + attach
         let mut pod_script = vec![("/usr/lib/jvm/java-21/bin/java", 0)];
         for _ in 0..ARTHAS_PORT_CANDIDATES {
             pod_script.push(("free", 0));
         }
+        pod_script.push(("", 0)); // mcp-uploads 清理（issue #23 三轮）
         pod_script.push(("18563\n18564", 0));
-        pod_script.push(("", 0));
+        pod_script.push(("", 0)); // 写 properties
+        pod_script.push(("", 0)); // 写 logback（issue #23 三轮）
         pod_script.push(("attach-started", 0));
         let (pod_ch, k8s_ch) = k8s_recording_channel(pod_script);
         let deps = pod_deps();
@@ -1932,10 +2127,10 @@ mod tests {
         let base_calls = base.calls().await;
         assert_eq!(base_calls.len(), 3, "ensure + podIP ×2（早取 + 探活重取）: {base_calls:?}");
         let pod_calls = pod_ch.calls().await;
-        assert_eq!(pod_calls.len(), 14, "degraded cleanup + find-free in container: {pod_calls:?}");
+        assert_eq!(pod_calls.len(), 16, "degraded cleanup + find-free in container: {pod_calls:?}");
         // 降级路径：容器内探测 127.0.0.1（busybox 恒 free——失明但可用，行为与修复前一致）
         assert!(pod_calls[1].contains("/dev/tcp/127.0.0.1/18563"), "degraded probe: {}", pod_calls[1]);
-        assert!(pod_calls[11].contains("seq 18563 18572"), "degraded find-free: {}", pod_calls[11]);
+        assert!(pod_calls[12].contains("seq 18563 18572"), "degraded find-free: {}", pod_calls[12]);
     }
 
     #[test]

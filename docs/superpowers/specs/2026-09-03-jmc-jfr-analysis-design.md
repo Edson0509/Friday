@@ -68,7 +68,7 @@ MCP 层自动加 `friday_` 前缀。分析对象是**本机** `.jfr` 文件，�
 
 | 工具 | 关键参数 | 语义 | 风险 | 默认/上限超时 |
 |---|---|---|---|---|
-| `jfr_record` | `environment`、`pid`、`duration_secs`（10–600，默认 60）、`settings`（`profile`/`default`，默认 `profile`）、`timeout_secs`（后台落盘等待预算，不影响本调用） | 一次性定时录制：`jcmd <pid> JFR.start name=friday-<ts> settings=<档> duration=Ns filename=/tmp/friday-tools/recording-<pid>-<ts>.jfr`（容器目标落 POD_DUMP_DIR）→ `JFR.check` 校验录制确实在运行（issue #23；短 duration+慢 attach 已落盘的边角放行）→ **立即返回 `{recording_id, status: "recording", local_path, ...}`**；后台任务轮询 stat 大小稳定判定落盘 → TransferState(Download) 后台拉回 `artifacts/<session>/recording-<pid>-<ts>.jfr`（成功清理远端） | Low | JFR.start 60s / JFR.check 30s（同步阶段） |
+| `jfr_record` | `environment`、`pid`、`duration_secs`（10–600，默认 60）、`settings`（`profile`/`default`，默认 `profile`）、`disk`（布尔；容器目标默认 `false`、虚机默认 `true`）、`timeout_secs`（后台落盘等待预算，不影响本调用） | 一次性定时录制：`jcmd <pid> JFR.start name=friday-<ts> settings=<档> disk=<bool> duration=Ns filename=/tmp/friday-tools/recording-<pid>-<ts>.jfr`（容器目标落 POD_DUMP_DIR）→ `JFR.check` 校验录制确实在运行（issue #23；短 duration+慢 attach 已落盘的边角放行）→ **立即返回 `{recording_id, status: "recording", local_path, ...}`**；后台任务轮询 stat 大小稳定判定落盘 → TransferState(Download) 后台拉回 `artifacts/<session>/recording-<pid>-<ts>.jfr`（成功清理远端） | Low | JFR.start 60s / JFR.check 30s（同步阶段） |
 | `jfr_record_status` | `recording_id`（可选，缺省列出本会话全部） | 录制任务状态查询：`recording`（进行中）→ `downloading`（带 `transfer_id`，可轮询 transfer_status）→ `completed`（拉回完成且已自动预热 JMC，`local_path` 可直接分析）/ `failed`（`error_code`：pod_failed / record_not_found / transfer_failed / transfer_cancelled，`error` 附因，`note` 带恢复指引）。Downloading 阶段实时观测拉回任务终态并落档；拉回失败时主动复查 Pod 存活（见 §3.1 三级防护） | ReadOnly | 即时 |
 
 **issue #23 变更**：旧版把「等待 duration 落盘」同步阻塞在工具调用内，而部分 Agent CLI（codeagentcli）的 MCP 客户端存在不可配置的 120s 工具调用硬超时——长录制（>110s）必然被客户端取消且录制结果悬空。现行契约：录制等待在**后台任务**完成（专用连接轮询 stat、断线自动重建，对齐传输 worker「后台任务不走池」约定），工具调用本身在 JFR.start + JFR.check 后秒级返回；同 session + env + pid 活跃录制去重（`duplicate_recording` + 复用 recording_id），防客户端超时后 Agent 重试叠加录制。duration 到期但文件未出现/未稳定（后台预算 `timeout_secs` 用尽）→ 状态查询返回 `failed` + `record_not_found` 语义文案（附远端路径与已等待时长）。
@@ -80,6 +80,8 @@ MCP 层自动加 `friday_` 前缀。分析对象是**本机** `.jfr` 文件，�
 3. **拉回失败复查**：状态查询观测到拉回 Failed 时主动复查 Pod 存活——死亡 → `pod_failed` + 原传输错误 + k8s_find_pods 重查指引；存活 → `transfer_failed`（远端文件保留，file_download 断点续传）。
 
 失败 `error_code` 一览：`pod_failed` / `record_not_found` / `transfer_failed` / `transfer_cancelled`。
+
+**issue #23 三轮：ephemeral-storage 驱逐防护（disk 参数）**。JFR 的 repository chunk 即使指定 `filename` 也全程落在目标 JVM 的 `java.io.tmpdir`（企业容器镜像常指 `/opt/tmp` ephemeral-storage，写满即驱逐；本地 JDK 21 实验：录制期间 tmpdir 下出现 `<时间戳_pid>/<时间戳>.jfr` chunk，正常结束清 chunk 但目录残留到 JVM 退出，崩溃/被杀则 chunk 残留）。repository 位置运行时不可改（`jcmd help JFR.start` 无 `repository` 选项，仅 JVM 启动参数 `-XX:FlightRecorderOptions=repository=`）。对策：`disk=false`（实验验证完全不建 tmpdir repository，数据驻留 JVM 堆、录制结束直写 filename）——容器目标默认 `false`（驱逐是确定性失败 vs 堆驻留是小概率风险，实测 profile 3MB/120s），虚机默认 `true`（无驱逐压力、省堆），`disk` 参数可显式覆盖（目标内存紧张时容器也可传 `true`）。
 
 ### 3.2 分析工具（JMC 代理，21 个，全 ReadOnly）
 

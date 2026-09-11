@@ -80,16 +80,29 @@ pub fn effective_record_timeout(user: Option<i64>, duration_secs: u32) -> u64 {
     base.max(duration_secs as u64 + 120).min(1800)
 }
 
-/// JFR.start 命令构造（一次性定时录制；name/remote_path 由 handler 生成，纯函数可测）
+/// JFR.start 命令构造（一次性定时录制；name/remote_path 由 handler 生成，纯函数可测）。
+/// disk=false 时数据驻留 JVM 堆、录制结束直写 filename——彻底不落目标 JVM 的
+/// java.io.tmpdir（issue #23：该目录在容器内常为 /opt/tmp ephemeral-storage，
+/// 写满即驱逐；JFR repository 位置运行时不可改，只能用 disk=false 绕开）。
 pub fn jfr_start_command(
     jcmd: &str,
     pid: u32,
     name: &str,
     duration_secs: u32,
     settings: &str,
+    disk: bool,
     remote_path: &str,
 ) -> String {
-    format!("{jcmd} {pid} JFR.start name={name} settings={settings} duration={duration_secs}s filename={remote_path}")
+    format!("{jcmd} {pid} JFR.start name={name} settings={settings} disk={disk} duration={duration_secs}s filename={remote_path}")
+}
+
+/// jfr_record 的 disk 参数解析：缺省按目标类型（容器 false 防驱逐 / 虚机 true
+/// 无驱逐压力省堆内存）；显式传入必须是布尔值。
+pub fn resolve_record_disk(user: Option<&serde_json::Value>, pod_target: bool) -> Result<bool, String> {
+    match user {
+        None => Ok(!pod_target),
+        Some(v) => v.as_bool().ok_or_else(|| "disk 必须是布尔值（true/false）".to_string()),
+    }
 }
 
 /// JFR.check 命令构造（issue #23：JFR.start 成功后校验录制确实在运行）
@@ -164,12 +177,37 @@ mod tests {
             "friday-777",
             60,
             "profile",
+            false,
             "/tmp/friday-tools/recording-1234-777.jfr",
         );
         assert_eq!(
             cmd,
-            "/tmp/jdk/bin/jcmd 1234 JFR.start name=friday-777 settings=profile duration=60s filename=/tmp/friday-tools/recording-1234-777.jfr"
+            "/tmp/jdk/bin/jcmd 1234 JFR.start name=friday-777 settings=profile disk=false duration=60s filename=/tmp/friday-tools/recording-1234-777.jfr"
         );
+        // VM 默认 disk=true 形态
+        let cmd = jfr_start_command(
+            "/tmp/jdk/bin/jcmd",
+            1234,
+            "friday-777",
+            60,
+            "profile",
+            true,
+            "/tmp/friday-tools/recording-1234-777.jfr",
+        );
+        assert!(cmd.contains("disk=true"));
+    }
+
+    #[test]
+    fn test_resolve_record_disk_defaults_by_target() {
+        // 缺省：容器 false（防驱逐）/ 虚机 true（无压力）
+        assert_eq!(resolve_record_disk(None, true), Ok(false));
+        assert_eq!(resolve_record_disk(None, false), Ok(true));
+        // 显式覆盖
+        assert_eq!(resolve_record_disk(Some(&json!(true)), true), Ok(true));
+        assert_eq!(resolve_record_disk(Some(&json!(false)), false), Ok(false));
+        // 非布尔拒绝
+        assert!(resolve_record_disk(Some(&json!("yes")), true).is_err());
+        assert!(resolve_record_disk(Some(&json!(1)), true).is_err());
     }
 
     #[test]

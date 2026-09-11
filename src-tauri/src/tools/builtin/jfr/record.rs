@@ -474,6 +474,13 @@ impl JfrRecordHandler {
             Ok(v) => v,
             Err(e) => return error_output("invalid_args", &e),
         };
+        // issue #23 三轮：JFR repository chunk 默认落目标 JVM 的 java.io.tmpdir
+        // （容器内 = /opt/tmp ephemeral-storage，写满驱逐；repository 位置运行时
+        // 不可改）。容器目标默认 disk=false（数据驻留堆，录制结束直写 filename）
+        let disk = match super::mapping::resolve_record_disk(args.get("disk"), pod.is_some()) {
+            Ok(v) => v,
+            Err(e) => return error_output("invalid_args", &e),
+        };
         let timeout_secs = super::mapping::effective_record_timeout(
             args.get("timeout_secs").and_then(|v| v.as_i64()),
             duration_secs,
@@ -549,7 +556,7 @@ impl JfrRecordHandler {
             format!("/tmp/friday-tools/recording-{pid}-{ts}.jfr")
         };
         let name = format!("friday-{ts}");
-        let start_cmd = super::mapping::jfr_start_command(jcmd, pid, &name, duration_secs, &settings, &remote_path);
+        let start_cmd = super::mapping::jfr_start_command(jcmd, pid, &name, duration_secs, &settings, disk, &remote_path);
         let local_path = artifact_dir_for(&self.core.artifacts_dir, &ctx.session_id)
             .join(format!("recording-{pid}-{ts}.jfr"));
 
@@ -713,6 +720,7 @@ impl JfrRecordHandler {
                 "local_path": local_path.to_string_lossy(),
                 "duration_secs": duration_secs,
                 "settings": settings,
+                "disk": disk,
                 "timeout_secs": timeout_secs,
                 "note": "JFR 录制已启动，后台等待落盘（本调用已返回，录制不受影响）。请轮询 jfr_record_status(recording_id)：recording（进行中，稍候再查）→ downloading（带 transfer_id，可轮询 transfer_status 看进度）→ completed（自动预热 JMC，直接用 jfr_quick_analysis(local_path) / jfr_rules(local_path) 分析）/ failed（见 error 字段）。",
             }),
@@ -887,6 +895,7 @@ pub fn record_tool_def(
                 "pid": { "type": "string", "description": "目标 Java 进程 PID（list_processes 返回）" },
                 "duration_secs": { "type": "number", "description": "录制时长秒数，10~600，默认 60" },
                 "settings": { "type": "string", "enum": ["profile", "default"], "description": "事件档位：profile 全维度（开销 1~3%），default 低开销（<1%），默认 profile" },
+                "disk": { "type": "boolean", "description": "是否同时写磁盘（JFR repository，落目标 JVM 的 java.io.tmpdir——容器内常为 /opt/tmp ephemeral-storage，写满会驱逐 Pod）。容器目标默认 false（数据驻留 JVM 堆、录制结束直写文件；目标内存紧张时可显式传 true）；虚机目标默认 true。缺省按目标类型自动选择" },
                 "timeout_secs": { "type": "number", "description": "后台等待落盘的总超时秒数（不影响本调用——本调用在 JFR.start 后即返回），默认 600，上限 1800；实际下限为 duration_secs+120" },
                 "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
                 "namespace": { "type": "string", "description": "Kubernetes namespace（容器环境必填；与 pod 一起来自 k8s_find_pods 返回；全小写）" },
