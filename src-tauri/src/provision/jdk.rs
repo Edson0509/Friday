@@ -243,16 +243,17 @@ pub const JDK_BINS: [&str; 4] = ["jcmd", "jstat", "jstack", "jmap"];
 pub const JDK_TOOL_NAME: &str = "ensure_tool";
 
 /// java_bin 字符集白名单校验（防 shell 注入）：
-/// 非空，且所有字符都在 [A-Za-z0-9 / . _ - + ~] 内
+/// 非空，且所有字符都在 [A-Za-z0-9 / . _ - + ~ @] 内
+/// （@ 用于华为内部包管理路径 /opt/pkgs/jre@<version>/bin/java，issue #23）
 pub fn validate_java_bin(java_bin: &str) -> Result<(), String> {
     if java_bin.is_empty() {
         return Err("invalid_params: java_bin must not be empty".to_string());
     }
     if !java_bin.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, ' ' | '/' | '.' | '_' | '-' | '+' | '~')
+        c.is_ascii_alphanumeric() || matches!(c, ' ' | '/' | '.' | '_' | '-' | '+' | '~' | '@')
     }) {
         return Err(format!(
-            "invalid_params: java_bin contains disallowed characters (allowed: [A-Za-z0-9 / . _ - + ~]): {java_bin:?}"
+            "invalid_params: java_bin contains disallowed characters (allowed: [A-Za-z0-9 / . _ - + ~ @]): {java_bin:?}"
         ));
     }
     Ok(())
@@ -731,6 +732,8 @@ mod tests {
         assert!(validate_java_bin("/usr/lib/jvm/bisheng-jdk/bin/java").is_ok());
         assert!(validate_java_bin("./java21.bin").is_ok());
         assert!(validate_java_bin("/opt/jdk-21.0.11+9/bin/java").is_ok());
+        // 华为内部包管理命名（issue #23）
+        assert!(validate_java_bin("/opt/pkgs/jre@27.10.4308/bin/java").is_ok());
     }
 
     #[test]

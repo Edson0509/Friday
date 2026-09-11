@@ -84,6 +84,9 @@ pub struct RecordingState {
     pub phase: RecordingPhase,
     pub transfer_id: Option<String>,
     pub remote_size: Option<u64>,
+    /// 结构化失败码（issue #23）：pod_failed（目标 Pod 死亡）/ record_not_found
+    /// （落盘超预算）/ transfer_failed（拉回失败）/ transfer_cancelled
+    pub error_code: Option<String>,
     pub error: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -160,13 +163,14 @@ impl RecordingRegistry {
         self.evict_finished().await;
     }
 
-    /// 未终态 → Failed（录制未落盘等）
-    pub async fn mark_failed(&self, id: &str, error: String) {
+    /// 未终态 → Failed（录制未落盘 / Pod 死亡等；error_code 见 RecordingState 文档）
+    pub async fn mark_failed(&self, id: &str, error_code: &str, error: String) {
         {
             let mut recordings = self.recordings.lock().await;
             if let Some(r) = recordings.get_mut(id) {
                 if !r.phase.is_terminal() {
                     r.phase = RecordingPhase::Failed;
+                    r.error_code = Some(error_code.to_string());
                     r.error = Some(error);
                 }
             }
@@ -175,13 +179,20 @@ impl RecordingRegistry {
     }
 
     /// 状态查询观测到拉回终态时落档（仅 Downloading 可流转，幂等）
-    pub async fn mark_transfer_outcome(&self, id: &str, phase: RecordingPhase, error: Option<String>) {
+    pub async fn mark_transfer_outcome(
+        &self,
+        id: &str,
+        phase: RecordingPhase,
+        error_code: Option<String>,
+        error: Option<String>,
+    ) {
         debug_assert!(matches!(phase, RecordingPhase::Completed | RecordingPhase::Failed));
         {
             let mut recordings = self.recordings.lock().await;
             if let Some(r) = recordings.get_mut(id) {
                 if r.phase == RecordingPhase::Downloading {
                     r.phase = phase;
+                    r.error_code = error_code;
                     r.error = error;
                 }
             }
@@ -209,6 +220,15 @@ impl RecordingRegistry {
     }
 }
 
+/// 等待录制落盘的失败分类（错误码 + 上下文由调用方组装文案）
+pub(super) enum WaitFailure {
+    /// 后台预算（timeout_secs）用尽：文件未出现/未稳定
+    Deadline { waited_secs: u64 },
+    /// Pod 已死亡（kubectl stderr 死亡信号识别，issue #23）——快速失败，
+    /// 不再空转到 deadline。detail = 原始 stderr
+    PodGone { detail: String },
+}
+
 /// 后台等待录制落盘 → 移交 TransferManager 拉回。
 /// 全程不持池连接（专用连接，断线自动重建），等待时长不影响任何 MCP 调用。
 pub(super) async fn run_recording_wait(
@@ -226,7 +246,30 @@ pub(super) async fn run_recording_wait(
     );
     match wait_for_recording(&transfer, &rec, deadline).await {
         Ok(remote_size) => {
-            // 落盘稳定 → 后台拉回（成功后 hook 自动预热 JMC；pod 目标走 K8sChannel 两跳）
+            // ① P0 健康检查（issue #23）：文件就绪 ≠ Pod 存活——就绪到下载的窗口内
+            //    Pod 可能已崩溃（实测 0.6s），死 Pod 上启动拉回只会得到模糊的
+            //    "container not found"。宿主机侧 kubectl get pod 查 phase，
+            //    非 Running 直接 pod_failed 终态（带重查指引）
+            if let (Some(pod), Some(ns)) = (&rec.pod, &rec.namespace) {
+                if let Some(phase) = pod_phase(&transfer, &rec.env_id, pod, ns).await {
+                    if phase != "Running" {
+                        let error = format!(
+                            "目标 Pod 已不处于 Running 状态（phase={phase}），录制文件 {} 不可达。请重新调用 k8s_find_pods 定位新 Pod 后重新 jfr_record；若 dump 目录为共享持久卷，也可用 file_download(新 Pod, 同路径) 尝试抢救。",
+                            rec.remote_path
+                        );
+                        registry.mark_failed(&rec.id, "pod_failed", error.clone()).await;
+                        emit_progress(&bus, &rec.session_id, "record", &format!("录制已完成但目标 Pod 已死亡（phase={phase}），无法拉回"));
+                        tracing::warn!(
+                            recording_id = %rec.id, pod = %pod, phase = %phase,
+                            "recording wait: pod not running before transfer, aborting"
+                        );
+                        return;
+                    }
+                }
+                // phase 无法判定（检查失败/超时）：不阻塞拉回——拉回自身有重试与失败兜底
+            }
+
+            // ② 落盘稳定 → 后台拉回（成功后 hook 自动预热 JMC；pod 目标走 K8sChannel 两跳）
             let state = TransferState::new(
                 Direction::Download,
                 &rec.session_id,
@@ -251,26 +294,73 @@ pub(super) async fn run_recording_wait(
                 "recording wait: file ready, background download started"
             );
         }
-        Err(e) => {
-            registry.mark_failed(&rec.id, e.clone()).await;
-            emit_progress(&bus, &rec.session_id, "record", &format!("录制文件未就绪：{e}"));
+        Err(WaitFailure::Deadline { waited_secs }) => {
+            let error = format!(
+                "录制到时后文件未就绪：{}（已等待 {waited_secs}s）。远端文件可能仍在写入，可稍后用 file_download 手动拉回",
+                rec.remote_path
+            );
+            registry.mark_failed(&rec.id, "record_not_found", error.clone()).await;
+            emit_progress(&bus, &rec.session_id, "record", &format!("录制文件未就绪：{error}"));
             tracing::error!(
                 recording_id = %rec.id, session_id = %rec.session_id,
-                remote_path = %rec.remote_path, error = %e,
+                remote_path = %rec.remote_path, waited_secs,
                 "recording wait: file never materialized"
+            );
+        }
+        Err(WaitFailure::PodGone { detail }) => {
+            let error = format!(
+                "目标 Pod 已死亡，录制中断（kubectl: {detail}）。请重新调用 k8s_find_pods 定位新 Pod 后重新 jfr_record；若 dump 目录为共享持久卷，也可用 file_download(新 Pod, {}) 尝试抢救。",
+                rec.remote_path
+            );
+            registry.mark_failed(&rec.id, "pod_failed", error.clone()).await;
+            emit_progress(&bus, &rec.session_id, "record", "目标 Pod 已死亡，录制中断");
+            tracing::error!(
+                recording_id = %rec.id, session_id = %rec.session_id,
+                pod = rec.pod.as_deref().unwrap_or("-"), detail = %detail,
+                "recording wait: pod gone during recording"
             );
         }
     }
 }
 
+/// 宿主机侧查询 Pod phase（专用连接 + 15s 超时；连接层面走宿主机而非容器 exec）。
+/// None = 无法判定（命令失败/超时/输出异常）——调用方不得据此阻断流程
+async fn pod_phase(transfer: &Arc<TransferManager>, env_id: &str, pod: &str, namespace: &str) -> Option<String> {
+    const PHASE_CHECK_TIMEOUT_SECS: u64 = 15;
+    let check = async {
+        let ch = transfer.dedicated_channel(env_id, None, None, None).await.ok()?;
+        let cmd = crate::exec::k8s::pod_phase_command(pod, Some(namespace));
+        let out = ch.run(&cmd).await.ok();
+        ch.disconnect().await;
+        let out = out?;
+        if out.exit_code != 0 {
+            tracing::warn!(pod, exit_code = out.exit_code, stderr = %out.stderr, "pod phase check: kubectl failed");
+            return None;
+        }
+        let phase = out.stdout.trim().to_string();
+        if phase.is_empty() {
+            None
+        } else {
+            Some(phase)
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(PHASE_CHECK_TIMEOUT_SECS), check).await {
+        Ok(phase) => phase,
+        Err(_) => {
+            tracing::warn!(pod, "pod phase check: timed out");
+            None
+        }
+    }
+}
+
 /// 等待录制落盘：duration 到期后文件存在（size > 0）且两次轮询大小相等 → 稳定。
-/// deadline 用尽 → Err（附远端路径与已等待时长）。
+/// Pod 死亡（kubectl stderr 死亡信号）→ PodGone 快速失败；deadline 用尽 → Deadline。
 /// stat 走专用连接（懒建 + 断线重建）；全程 tokio 虚拟时钟友好。
 async fn wait_for_recording(
     transfer: &Arc<TransferManager>,
     rec: &RecordingState,
     deadline: tokio::time::Instant,
-) -> Result<u64, String> {
+) -> Result<u64, WaitFailure> {
     let start = tokio::time::Instant::now();
     let mut last_size: u64 = 0;
     let mut channel: Option<Arc<dyn ExecChannel>> = None;
@@ -279,11 +369,7 @@ async fn wait_for_recording(
             if let Some(ch) = channel.take() {
                 ch.disconnect().await;
             }
-            return Err(format!(
-                "录制到时后文件未就绪：{}（已等待 {}s）。远端文件可能仍在写入，可稍后用 file_download 手动拉回",
-                rec.remote_path,
-                start.elapsed().as_secs()
-            ));
+            return Err(WaitFailure::Deadline { waited_secs: start.elapsed().as_secs() });
         }
         tokio::time::sleep(std::time::Duration::from_secs(RECORD_POLL_INTERVAL_SECS)).await;
         // 专用连接懒建：失败不放弃，下轮重试（等待预算内自愈）
@@ -312,7 +398,17 @@ async fn wait_for_recording(
         let size: u64 = if let Some(ch) = channel.as_deref() {
             match ch.run(&stat_cmd).await {
                 Ok(o) if o.exit_code == 0 => o.stdout.trim().parse().unwrap_or(0),
-                Ok(_) => 0,
+                Ok(o) => {
+                    // Pod 死亡信号：容器不在 / completed pod / Pod 已删（issue #23——
+                    // 不再空转到 deadline，Agent 早 10 分钟拿到 pod_failed）
+                    if crate::exec::k8s::is_pod_gone_error(&o.stderr) {
+                        if let Some(ch) = channel.take() {
+                            ch.disconnect().await;
+                        }
+                        return Err(WaitFailure::PodGone { detail: o.stderr.trim().to_string() });
+                    }
+                    0
+                }
                 Err(e) => {
                     tracing::warn!(recording_id = %rec.id, error = %e, "recording wait: stat failed, dropping connection for reconnect");
                     if let Some(ch) = channel.take() {
@@ -580,6 +676,7 @@ impl JfrRecordHandler {
             phase: RecordingPhase::Recording,
             transfer_id: None,
             remote_size: None,
+            error_code: None,
             error: None,
             created_at: chrono::Utc::now(),
         };
@@ -655,7 +752,9 @@ impl JfrRecordStatusHandler {
         }
     }
 
-    /// Downloading 阶段实时观测拉回任务终态并落档（幂等；其余阶段直接返回）
+    /// Downloading 阶段实时观测拉回任务终态并落档（幂等；其余阶段直接返回）。
+    /// 拉回失败且目标为 Pod 时，主动查 Pod 存活（issue #23 P2）：死亡 → pod_failed
+    /// 结构化错误 + 重查指引；存活 → 保留原传输错误（远端文件在，可断点续传）
     async fn observe_transfer_outcome(&self, rec: &mut RecordingState) {
         if rec.phase != RecordingPhase::Downloading {
             return;
@@ -665,19 +764,47 @@ impl JfrRecordStatusHandler {
         match ts.status {
             TransferStatus::Completed => {
                 self.recordings
-                    .mark_transfer_outcome(&rec.id, RecordingPhase::Completed, None)
+                    .mark_transfer_outcome(&rec.id, RecordingPhase::Completed, None, None)
                     .await;
                 rec.phase = RecordingPhase::Completed;
             }
-            TransferStatus::Failed | TransferStatus::Cancelled => {
-                let msg = format!(
-                    "录制文件拉回失败：{}。远端文件保留",
-                    ts.error.clone().unwrap_or_else(|| "传输已取消".to_string())
-                );
+            TransferStatus::Cancelled => {
+                let msg = "录制文件拉回已取消。远端文件保留，可用 file_download 重试（断点续传）。".to_string();
                 self.recordings
-                    .mark_transfer_outcome(&rec.id, RecordingPhase::Failed, Some(msg.clone()))
+                    .mark_transfer_outcome(&rec.id, RecordingPhase::Failed, Some("transfer_cancelled".into()), Some(msg.clone()))
                     .await;
                 rec.phase = RecordingPhase::Failed;
+                rec.error_code = Some("transfer_cancelled".into());
+                rec.error = Some(msg);
+            }
+            TransferStatus::Failed => {
+                let orig = ts.error.clone().unwrap_or_else(|| "未知传输错误".to_string());
+                let (code, msg) = if let (Some(pod), Some(ns)) = (&rec.pod, &rec.namespace) {
+                    match pod_phase(&self.transfer, &rec.env_id, pod, ns).await {
+                        Some(phase) if phase != "Running" => (
+                            "pod_failed",
+                            format!(
+                                "录制文件拉回失败：目标 Pod 已不处于 Running 状态（phase={phase}），录制文件不可达。原传输错误：{orig}。请重新调用 k8s_find_pods 定位新 Pod 后重新 jfr_record；若 dump 目录为共享持久卷，也可用 file_download(新 Pod, {}) 尝试抢救。",
+                                rec.remote_path
+                            ),
+                        ),
+                        _ => (
+                            "transfer_failed",
+                            format!("录制文件拉回失败：{orig}。远端文件保留（Pod 存活），可用 file_download 重试（断点续传）"),
+                        ),
+                    }
+                } else {
+                    (
+                        "transfer_failed",
+                        format!("录制文件拉回失败：{orig}。远端文件保留，可用 file_download 重试（断点续传）"),
+                    )
+                };
+                tracing::warn!(recording_id = %rec.id, error_code = code, "recording transfer failed");
+                self.recordings
+                    .mark_transfer_outcome(&rec.id, RecordingPhase::Failed, Some(code.to_string()), Some(msg.clone()))
+                    .await;
+                rec.phase = RecordingPhase::Failed;
+                rec.error_code = Some(code.to_string());
                 rec.error = Some(msg);
             }
             _ => {}
@@ -719,7 +846,9 @@ fn recording_to_json(rec: &RecordingState) -> serde_json::Value {
         RecordingPhase::Downloading => "录制完成，后台拉回中。可轮询 transfer_status(transfer_id) 查看字节级进度；完成后自动预热 JMC。".to_string(),
         RecordingPhase::Completed => "录制拉回完成并自动预热 JMC。直接用 local_path 调 jfr_quick_analysis / jfr_rules 起步诊断。".to_string(),
         RecordingPhase::Failed => {
-            if rec.transfer_id.is_some() {
+            if rec.error_code.as_deref() == Some("pod_failed") {
+                "目标 Pod 已死亡，录制文件不可达。请重新调用 k8s_find_pods 定位新 Pod 后重新 jfr_record；若 dump 目录为共享持久卷，也可用 file_download(新 Pod, 同路径) 尝试抢救。".to_string()
+            } else if rec.transfer_id.is_some() {
                 "拉回失败：远端文件保留，可用 file_download(remote_path) 重试（断点续传）。".to_string()
             } else {
                 "录制未正常落盘：远端文件可能仍在写入，可稍后用 file_download(remote_path) 手动拉回；或检查目标 JVM 后重新 jfr_record。".to_string()
@@ -736,6 +865,7 @@ fn recording_to_json(rec: &RecordingState) -> serde_json::Value {
         "settings": rec.settings,
         "transfer_id": rec.transfer_id.clone(),
         "remote_size": rec.remote_size,
+        "error_code": rec.error_code.clone(),
         "error": rec.error.clone(),
         "note": note,
     })

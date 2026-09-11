@@ -69,9 +69,17 @@ MCP 层自动加 `friday_` 前缀。分析对象是**本机** `.jfr` 文件，�
 | 工具 | 关键参数 | 语义 | 风险 | 默认/上限超时 |
 |---|---|---|---|---|
 | `jfr_record` | `environment`、`pid`、`duration_secs`（10–600，默认 60）、`settings`（`profile`/`default`，默认 `profile`）、`timeout_secs`（后台落盘等待预算，不影响本调用） | 一次性定时录制：`jcmd <pid> JFR.start name=friday-<ts> settings=<档> duration=Ns filename=/tmp/friday-tools/recording-<pid>-<ts>.jfr`（容器目标落 POD_DUMP_DIR）→ `JFR.check` 校验录制确实在运行（issue #23；短 duration+慢 attach 已落盘的边角放行）→ **立即返回 `{recording_id, status: "recording", local_path, ...}`**；后台任务轮询 stat 大小稳定判定落盘 → TransferState(Download) 后台拉回 `artifacts/<session>/recording-<pid>-<ts>.jfr`（成功清理远端） | Low | JFR.start 60s / JFR.check 30s（同步阶段） |
-| `jfr_record_status` | `recording_id`（可选，缺省列出本会话全部） | 录制任务状态查询：`recording`（进行中）→ `downloading`（带 `transfer_id`，可轮询 transfer_status）→ `completed`（拉回完成且已自动预热 JMC，`local_path` 可直接分析）/ `failed`（录制未落盘或拉回失败，`error` 附因，远端文件保留可 file_download 重试）。Downloading 阶段实时观测拉回任务终态并落档 | ReadOnly | 即时 |
+| `jfr_record_status` | `recording_id`（可选，缺省列出本会话全部） | 录制任务状态查询：`recording`（进行中）→ `downloading`（带 `transfer_id`，可轮询 transfer_status）→ `completed`（拉回完成且已自动预热 JMC，`local_path` 可直接分析）/ `failed`（`error_code`：pod_failed / record_not_found / transfer_failed / transfer_cancelled，`error` 附因，`note` 带恢复指引）。Downloading 阶段实时观测拉回任务终态并落档；拉回失败时主动复查 Pod 存活（见 §3.1 三级防护） | ReadOnly | 即时 |
 
 **issue #23 变更**：旧版把「等待 duration 落盘」同步阻塞在工具调用内，而部分 Agent CLI（codeagentcli）的 MCP 客户端存在不可配置的 120s 工具调用硬超时——长录制（>110s）必然被客户端取消且录制结果悬空。现行契约：录制等待在**后台任务**完成（专用连接轮询 stat、断线自动重建，对齐传输 worker「后台任务不走池」约定），工具调用本身在 JFR.start + JFR.check 后秒级返回；同 session + env + pid 活跃录制去重（`duplicate_recording` + 复用 recording_id），防客户端超时后 Agent 重试叠加录制。duration 到期但文件未出现/未稳定（后台预算 `timeout_secs` 用尽）→ 状态查询返回 `failed` + `record_not_found` 语义文案（附远端路径与已等待时长）。
+
+**issue #23 二轮：Pod 死亡三级防护**（容器目标实测：文件就绪到下载的 0.6s 窗口内 Pod OOM 崩溃，拉回只得模糊的 "container not found"）：
+
+1. **等待期快速失败**：stat 轮询的 stderr 识别 Pod 死亡信号（`container not found` / `completed pod` / `(NotFound)`，`exec/k8s.rs::is_pod_gone_error`；API server 抖动/Unauthorized/文件不存在不误判）→ 立即 `pod_failed`，不空转到 deadline；
+2. **拉回前健康检查**：文件稳定后、启动拉回前，宿主机侧 `kubectl get pod -n <ns> <pod> -o jsonpath='{.status.phase}'`（专用连接 + 15s 超时，失败不阻断拉回），非 Running → `pod_failed`（带 phase 与重查指引）；
+3. **拉回失败复查**：状态查询观测到拉回 Failed 时主动复查 Pod 存活——死亡 → `pod_failed` + 原传输错误 + k8s_find_pods 重查指引；存活 → `transfer_failed`（远端文件保留，file_download 断点续传）。
+
+失败 `error_code` 一览：`pod_failed` / `record_not_found` / `transfer_failed` / `transfer_cancelled`。
 
 ### 3.2 分析工具（JMC 代理，21 个，全 ReadOnly）
 
@@ -215,7 +223,7 @@ scripts/fetch-jmc-jar.ps1（读清单 → 下载 → 校验 sha256 → 幂等/.d
 
 1. **单元测试（mock client，`JmcClient` trait 注入）**：懒启动仅一次；invalidate 后懒重建；空闲回收时序；传输错误 invalidate；预热失败不阻断后续 query；超时不杀进程；
 2. **mapping 纯函数**：jcmd 参数构造（duration 边界 10/600/越界、settings 白名单）、async:false 注入、compare 双路径映射、代理参数透传；
-3. **录制链路**（issue #23 异步管线）：mock SSH channel + TransferManager channel_factory 注入验证——JFR.start 命令形态、JFR.check 校验（未在运行 → `record_verify_failed`；短 duration 已落盘放行）、**工具调用立即返回 recording_id**（虚拟时钟断言不阻塞 duration）、后台 stat 大小稳定判定、TransferState 构造（远端清理标志/本地路径/pod 定位）、`jfr_record_status` 轮询至 completed/failed、落盘超预算后台失败（record_not_found 语义）、同 JVM 活跃录制去重；
+3. **录制链路**（issue #23 异步管线 + Pod 死亡三级防护）：mock SSH channel + TransferManager channel_factory 注入验证——JFR.start 命令形态、JFR.check 校验（未在运行 → `record_verify_failed`；短 duration 已落盘放行）、**工具调用立即返回 recording_id**（虚拟时钟断言不阻塞 duration）、后台 stat 大小稳定判定、TransferState 构造（远端清理标志/本地路径/pod 定位）、`jfr_record_status` 轮询至 completed/failed、落盘超预算后台失败（record_not_found）、同 JVM 活跃录制去重；Pod 死亡三路——等待期 stat stderr 死亡信号快速失败、拉回前 phase 检查中止（显式 -n + jsonpath）、拉回失败后复查富化 pod_failed（均断言不启动拉回 / 重查指引）；
 4. **预热联动**：transfer completed 回调扩展名分发（.jfr 触发 JMC、.hprof 仍触发 MAT、其他不触发）；预热失败不影响 transfer 终态；
 5. **集成测试 `#[ignore]`**（需本机 Java 21+ + fetch 脚本已跑）：测试内用 `jcmd JFR.start` 对自身 JVM 录制生成样例 `.jfr` → 真实 spawn → `jfr_overview` → `jfr_rules` → 传输错误 invalidate → 重建；同时充当降级 JAR 的 Java 21 兼容性验证；
 6. **prompt**：TOOL_GUIDANCE 含 jfr_* 关键词与 JDK 8 兜底指引；

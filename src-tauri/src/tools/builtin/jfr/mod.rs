@@ -342,13 +342,33 @@ mod tests {
     const SID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
     /// JFR 感知的可编程 mock channel（对齐 heap_dump.rs 的 DumpChannel 模式）。
-    /// JFR.start / JFR.check / stat 按 run 路由；download 落 stat_size 字节的本地
-    /// 文件（供拉回 worker 完成大小校验 → rename → completed 全链路）。
+    /// JFR.start / JFR.check / stat / kubectl get pod 按 run 路由；download 落
+    /// stat_size 字节的本地文件（供拉回 worker 完成大小校验 → rename → completed
+    /// 全链路）。stat_pod_gone 模拟 stat 级 Pod 死亡；pod_phases 依次应答宿主机
+    /// 侧 Pod phase 查询（耗尽后默认 Running）；download_io_err 模拟本地写失败
+    /// （worker 立即终态 Failed，供拉回失败 + Pod 死亡富化用例）。
     struct JfrChannel {
         start_exit: i32,
         check_stdout: &'static str,
         stat_size: &'static str,
+        stat_pod_gone: bool,
+        pod_phases: std::sync::Mutex<std::collections::VecDeque<&'static str>>,
+        download_io_err: bool,
         calls: TokioMutex<Vec<String>>,
+    }
+
+    impl JfrChannel {
+        fn new(check_stdout: &'static str, stat_size: &'static str) -> Self {
+            Self {
+                start_exit: 0,
+                check_stdout,
+                stat_size,
+                stat_pod_gone: false,
+                pod_phases: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                download_io_err: false,
+                calls: TokioMutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait]
@@ -372,7 +392,22 @@ mod tests {
                     exit_code: 0,
                 });
             }
+            if cmd.contains("kubectl get pod") {
+                let phase = self.pod_phases.lock().unwrap().pop_front().unwrap_or("Running");
+                return Ok(ExecOutput {
+                    stdout: format!("{phase}\n"),
+                    stderr: String::new(),
+                    exit_code: 0,
+                });
+            }
             if cmd.starts_with("stat -c %s") {
+                if self.stat_pod_gone {
+                    return Ok(ExecOutput {
+                        stdout: String::new(),
+                        stderr: "error: Internal error occurred: unable to upgrade connection: container not found (\"svc\")\n".to_string(),
+                        exit_code: 1,
+                    });
+                }
                 return Ok(ExecOutput {
                     stdout: self.stat_size.to_string(),
                     stderr: String::new(),
@@ -398,6 +433,13 @@ mod tests {
             // 对齐真实 SshTransport::download：落盘前创建父目录
             if let Some(parent) = local.parent() {
                 std::fs::create_dir_all(parent)?;
+            }
+            if self.download_io_err {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "simulated local write failure",
+                )
+                .into());
             }
             let n: usize = self.stat_size.trim().parse().unwrap_or(0);
             std::fs::write(local, vec![b'x'; n])?;
@@ -516,12 +558,7 @@ mod tests {
     const CHECK_RUNNING: &str = "Recording 1: name=friday duration=10s (running)\n";
 
     fn std_channel(stat: &'static str) -> Arc<JfrChannel> {
-        Arc::new(JfrChannel {
-            start_exit: 0,
-            check_stdout: CHECK_RUNNING,
-            stat_size: stat,
-            calls: TokioMutex::new(Vec::new()),
-        })
+        Arc::new(JfrChannel::new(CHECK_RUNNING, stat))
     }
 
     /// 虚拟时钟起搏器：常驻 1ms 定时任务，把 auto-advance 的推进粒度钳制在 1ms。
@@ -649,12 +686,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_start_failure_passthrough_with_jdk8_hint() {
-        let ch = Arc::new(JfrChannel {
-            start_exit: 1,
-            check_stdout: CHECK_RUNNING,
-            stat_size: "0",
-            calls: TokioMutex::new(Vec::new()),
-        });
+        let mut raw = JfrChannel::new(CHECK_RUNNING, "0");
+        raw.start_exit = 1;
+        let ch = Arc::new(raw);
         let (tmp, reg) = registry(ch, Arc::new(MockJmcClient::ok("S"))).await;
         let out = def(&reg, "jfr_record")
             .handler
@@ -673,12 +707,10 @@ mod tests {
     /// 不存在 → record_verify_failed 快速失败，且不注册录制任务
     #[tokio::test]
     async fn test_record_verify_failed_when_check_not_running() {
-        let ch = Arc::new(JfrChannel {
-            start_exit: 0,
-            check_stdout: "Could not find recording with name friday-777\n",
-            stat_size: "0",
-            calls: TokioMutex::new(Vec::new()),
-        });
+        let ch = Arc::new(JfrChannel::new(
+            "Could not find recording with name friday-777\n",
+            "0",
+        ));
         let (tmp, reg) = registry(ch, Arc::new(MockJmcClient::ok("S"))).await;
         let out = def(&reg, "jfr_record")
             .handler
@@ -698,12 +730,10 @@ mod tests {
     /// 已非空 → 放行，交给后台等待稳定判定
     #[tokio::test]
     async fn test_record_check_passes_when_file_already_written() {
-        let ch = Arc::new(JfrChannel {
-            start_exit: 0,
-            check_stdout: "Could not find recording with name friday-777\n",
-            stat_size: "100",
-            calls: TokioMutex::new(Vec::new()),
-        });
+        let ch = Arc::new(JfrChannel::new(
+            "Could not find recording with name friday-777\n",
+            "100",
+        ));
         let (tmp, reg) = registry(ch, Arc::new(MockJmcClient::ok("S"))).await;
         tokio::time::pause();
         let pacer = spawn_auto_advance_pacer();
@@ -741,10 +771,128 @@ mod tests {
         let rid = out.data["recording_id"].as_str().unwrap();
         let done = poll_status_to_terminal(&reg, rid).await;
         assert_eq!(done["status"], "failed", "final: {done}");
+        assert_eq!(done["error_code"], "record_not_found", "final: {done}");
         assert!(
             done["error"].as_str().unwrap().contains("friday-tools"),
             "error should mention remote path: {}",
             done["error"]
+        );
+        pacer.abort();
+        drop(tmp);
+    }
+
+    /// issue #23 P0 回归①：录制等待期间 Pod 死亡（stat 返回 container not found）→
+    /// 快速失败 pod_failed（不空转到 deadline），不启动拉回
+    #[tokio::test]
+    async fn test_record_pod_gone_during_wait_fails_fast() {
+        let mut raw = JfrChannel::new(CHECK_RUNNING, "0");
+        raw.stat_pod_gone = true;
+        let ch = Arc::new(raw);
+        let (tmp, reg, mgr) = registry_pod_target(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        tokio::time::pause();
+        let pacer = spawn_auto_advance_pacer();
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30, "pod": "pod-1", "namespace": "ns1"}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let rid = out.data["recording_id"].as_str().unwrap();
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "failed", "final: {done}");
+        assert_eq!(done["error_code"], "pod_failed", "final: {done}");
+        let err = done["error"].as_str().unwrap();
+        assert!(err.contains("container not found"), "err: {err}");
+        assert!(err.contains("k8s_find_pods"), "err must guide re-find pods: {err}");
+        assert!(done["transfer_id"].is_null(), "no transfer should start");
+        // 未执行拉回链路（无 rm -f 清理）；也未做拉回前健康检查（等待期已终态）
+        let calls = ch.calls.lock().await;
+        assert!(!calls.iter().any(|c| c.starts_with("rm -f")), "no cleanup expected: {calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("kubectl get pod")), "no phase check needed: {calls:?}");
+        // 注册表无残留拉回任务
+        assert!(mgr.list_for_session(SID).await.is_empty());
+        pacer.abort();
+        drop(tmp);
+    }
+
+    /// issue #23 P0 回归②：文件就绪但拉回前健康检查发现 Pod 已死（phase=Failed）→
+    /// pod_failed 终态，不启动拉回
+    #[tokio::test]
+    async fn test_record_pod_dead_before_transfer_aborts() {
+        let mut raw = JfrChannel::new(CHECK_RUNNING, "54321");
+        raw.pod_phases.lock().unwrap().push_back("Failed");
+        let ch = Arc::new(raw);
+        let (tmp, reg, mgr) = registry_pod_target(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        tokio::time::pause();
+        let pacer = spawn_auto_advance_pacer();
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30, "pod": "pod-1", "namespace": "ns1"}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let rid = out.data["recording_id"].as_str().unwrap();
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "failed", "final: {done}");
+        assert_eq!(done["error_code"], "pod_failed", "final: {done}");
+        let err = done["error"].as_str().unwrap();
+        assert!(err.contains("phase=Failed"), "err: {err}");
+        assert!(err.contains("k8s_find_pods"), "err must guide re-find pods: {err}");
+        assert!(done["transfer_id"].is_null(), "no transfer should start");
+        // 命令序列：JFR.start → JFR.check → stat 轮询 → kubectl get pod（健康检查，显式 -n）→ 无拉回
+        let calls = ch.calls.lock().await;
+        let phase_calls = calls.iter().filter(|c| c.contains("kubectl get pod")).count();
+        assert_eq!(phase_calls, 1, "exactly one phase check: {calls:?}");
+        assert!(
+            calls.iter().any(|c| c.contains("kubectl get pod") && c.contains("-n 'ns1'")
+                && c.contains("jsonpath='{.status.phase}'")),
+            "phase check with explicit ns: {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("rm -f")), "no cleanup expected: {calls:?}");
+        assert!(mgr.list_for_session(SID).await.is_empty());
+        pacer.abort();
+        drop(tmp);
+    }
+
+    /// issue #23 P2 回归：拉回失败 + Pod 已死 → 状态查询主动查 Pod 存活，
+    /// 返回 pod_failed + 重查指引（而非裸传输错误）
+    #[tokio::test]
+    async fn test_record_transfer_fail_with_dead_pod_reports_pod_failed() {
+        let mut raw = JfrChannel::new(CHECK_RUNNING, "54321");
+        raw.pod_phases.lock().unwrap().push_back("Running"); // 拉回前健康检查通过
+        raw.pod_phases.lock().unwrap().push_back("Failed"); // 拉回失败后的复查：已死
+        raw.download_io_err = true; // 拉回 worker 立即终态 Failed
+        let ch = Arc::new(raw);
+        let (tmp, reg, _mgr) = registry_pod_target(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        tokio::time::pause();
+        let pacer = spawn_auto_advance_pacer();
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30, "pod": "pod-1", "namespace": "ns1"}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let rid = out.data["recording_id"].as_str().unwrap();
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "failed", "final: {done}");
+        assert_eq!(done["error_code"], "pod_failed", "final: {done}");
+        let err = done["error"].as_str().unwrap();
+        assert!(err.contains("phase=Failed"), "err: {err}");
+        assert!(err.contains("原传输错误"), "err must keep original transfer error: {err}");
+        assert!(err.contains("k8s_find_pods"), "err must guide re-find pods: {err}");
+        assert!(!done["transfer_id"].is_null(), "transfer was started (then failed)");
+        // 两次 phase 查询：拉回前 1 次（Running）+ 失败富化 1 次（Failed）
+        let calls = ch.calls.lock().await;
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("kubectl get pod")).count(),
+            2,
+            "phase checks: {calls:?}"
         );
         pacer.abort();
         drop(tmp);

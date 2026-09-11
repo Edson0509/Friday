@@ -69,6 +69,32 @@ pub fn pkill_pattern(command: &str) -> String {
     out
 }
 
+/// kubectl 错误 stderr → Pod 已死亡/不可 exec 判定（issue #23）。
+/// 只匹配确定性的死亡信号（容器不在/completed pod/Pod 对象已删）；
+/// API server 抖动、Unauthorized、文件不存在（stat: No such file）等
+/// 非死亡错误必须继续等待/重试，不得误判。
+pub fn is_pod_gone_error(stderr: &str) -> bool {
+    // error: Internal error occurred: unable to upgrade connection: container not found ("svc")
+    stderr.contains("container not found")
+        // error: cannot exec into a container in a completed pod; current phase is Failed
+        || stderr.contains("completed pod")
+        // Error from server (NotFound): pods "svc-1" not found
+        || stderr.contains("(NotFound)")
+}
+
+/// 宿主机侧查询 Pod phase（kubectl 显式 -n；None 时省略——依赖 kubeconfig
+/// context 当前 ns）。引号风格对齐 arthas 的 pod_ip_command（bash -lc 包裹
+/// 下原始单引号经 shell_quote_single 逃逸，生产已验证）。
+pub fn pod_phase_command(pod: &str, namespace: Option<&str>) -> String {
+    let ns = namespace
+        .map(|n| format!("-n {} ", shell_quote_single(n)))
+        .unwrap_or_default();
+    format!(
+        "kubectl get pod {} {ns}-o jsonpath='{{.status.phase}}'",
+        shell_quote_single(pod)
+    )
+}
+
 /// Pod 内路径校验：必须绝对路径且不含 NUL
 pub fn validate_pod_path(path: &str) -> Result<(), String> {
     if !path.starts_with('/') {
@@ -346,6 +372,40 @@ mod tests {
         assert!(p.starts_with("[j]"), "first char must be bracketed for self-exclusion: {p}");
         // wrapper cmdline 含 [j]stat 字面量，pattern [j]stat 不匹配它
         assert!(!p.contains("[j][j]"), "no double bracketing: {p}");
+    }
+
+    #[test]
+    fn test_is_pod_gone_error_matches_death_signals() {
+        // issue #23 实测 stderr
+        assert!(is_pod_gone_error(
+            "error: Internal error occurred: unable to upgrade connection: container not found (\"snmpagentservice\")\n"
+        ));
+        assert!(is_pod_gone_error(
+            "error: cannot exec into a container in a completed pod; current phase is Failed\n"
+        ));
+        assert!(is_pod_gone_error("Error from server (NotFound): pods \"svc-1\" not found\n"));
+    }
+
+    #[test]
+    fn test_is_pod_gone_error_rejects_non_death_errors() {
+        // 文件尚未写入（stat 级失败，不是 Pod 死亡）
+        assert!(!is_pod_gone_error("stat: can't stat '/opt/log/dump/coredump/x.jfr': No such file or directory\n"));
+        // kubectl/API server 级瞬态错误（必须继续等待/重试）
+        assert!(!is_pod_gone_error("error: You must be logged in to the server (Unauthorized)\n"));
+        assert!(!is_pod_gone_error("error: unable to connect to a server to reconcile\n"));
+        assert!(!is_pod_gone_error(""));
+    }
+
+    #[test]
+    fn test_pod_phase_command_shape() {
+        assert_eq!(
+            pod_phase_command("svc-1", Some("ns1")),
+            "kubectl get pod 'svc-1' -n 'ns1' -o jsonpath='{.status.phase}'"
+        );
+        assert_eq!(
+            pod_phase_command("svc-1", None),
+            "kubectl get pod 'svc-1' -o jsonpath='{.status.phase}'"
+        );
     }
 
     #[test]
