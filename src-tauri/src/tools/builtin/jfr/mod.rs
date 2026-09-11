@@ -342,14 +342,16 @@ mod tests {
     const SID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
     /// JFR 感知的可编程 mock channel（对齐 heap_dump.rs 的 DumpChannel 模式）。
-    /// JFR.start / JFR.check / stat / kubectl get pod 按 run 路由；download 落
-    /// stat_size 字节的本地文件（供拉回 worker 完成大小校验 → rename → completed
-    /// 全链路）。stat_pod_gone 模拟 stat 级 Pod 死亡；pod_phases 依次应答宿主机
-    /// 侧 Pod phase 查询（耗尽后默认 Running）；download_io_err 模拟本地写失败
-    /// （worker 立即终态 Failed，供拉回失败 + Pod 死亡富化用例）。
+    /// VM.version / JFR.start / JFR.check / stat / kubectl get pod 按 run 路由；
+    /// download 落 stat_size 字节的本地文件（供拉回 worker 完成大小校验 →
+    /// rename → completed 全链路）。stat_pod_gone 模拟 stat 级 Pod 死亡；
+    /// pod_phases 依次应答宿主机侧 Pod phase 查询（耗尽后默认 Running）；
+    /// download_io_err 模拟本地写失败（worker 立即终态 Failed，供拉回失败 +
+    /// Pod 死亡富化用例）。
     struct JfrChannel {
         start_exit: i32,
         check_stdout: &'static str,
+        vm_version: &'static str,
         stat_size: &'static str,
         stat_pod_gone: bool,
         pod_phases: std::sync::Mutex<std::collections::VecDeque<&'static str>>,
@@ -362,6 +364,7 @@ mod tests {
             Self {
                 start_exit: 0,
                 check_stdout,
+                vm_version: VM_VERSION_21,
                 stat_size,
                 stat_pod_gone: false,
                 pod_phases: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -378,6 +381,13 @@ mod tests {
             cmd: &str,
         ) -> Result<ExecOutput, Box<dyn std::error::Error + Send + Sync>> {
             self.calls.lock().await.push(cmd.to_string());
+            if cmd.contains("VM.version") {
+                return Ok(ExecOutput {
+                    stdout: self.vm_version.to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                });
+            }
             if cmd.contains("JFR.start") {
                 return Ok(ExecOutput {
                     stdout: String::new(),
@@ -556,6 +566,10 @@ mod tests {
     }
 
     const CHECK_RUNNING: &str = "Recording 1: name=friday duration=10s (running)\n";
+    /// VM.version 预检的默认 mock 输出（JDK 21 实测形态）
+    const VM_VERSION_21: &str = "1234:\nOpenJDK 64-Bit Server VM version 21.0.10+7-LTS\nJDK 21.0.10\n";
+    /// JDK 8 旧式（1.x）
+    const VM_VERSION_8: &str = "1234:\n1.8.0_392\n";
 
     fn std_channel(stat: &'static str) -> Arc<JfrChannel> {
         Arc::new(JfrChannel::new(CHECK_RUNNING, stat))
@@ -670,16 +684,17 @@ mod tests {
         let local = done["local_path"].as_str().unwrap();
         assert_eq!(std::fs::metadata(local).map(|m| m.len()).unwrap_or(0), 54321);
 
-        // 命令序列：JFR.start → JFR.check（校验在运行）→ 若干 stat 轮询（后台等待 +
-        // 拉回 worker stat）→ rm -f（成功后清理远端）
+        // 命令序列：VM.version（版本预检）→ JFR.start → JFR.check（校验在运行）→
+        // 若干 stat 轮询（后台等待 + 拉回 worker stat）→ rm -f（成功后清理远端）
         let calls = ch.calls.lock().await;
-        assert!(calls[0].contains("JFR.start"), "calls[0]: {}", calls[0]);
-        assert!(calls[0].contains("duration=10s"));
-        assert!(calls[0].contains("settings=profile"));
-        assert!(calls[0].contains("disk=true"), "VM 目标默认 disk=true：{}", calls[0]);
-        assert!(calls[0].contains("filename=/tmp/friday-tools/recording-1234-"));
-        assert!(calls[1].contains("JFR.check"), "calls[1]: {}", calls[1]);
-        assert!(calls.iter().skip(2).filter(|c| c.starts_with("stat -c %s")).count() >= 2);
+        assert!(calls[0].contains("VM.version"), "calls[0]: {}", calls[0]);
+        assert!(calls[1].contains("JFR.start"), "calls[1]: {}", calls[1]);
+        assert!(calls[1].contains("duration=10s"));
+        assert!(calls[1].contains("settings=profile"));
+        assert!(calls[1].contains("disk=true"), "VM 目标默认 disk=true：{}", calls[1]);
+        assert!(calls[1].contains("filename=/tmp/friday-tools/recording-1234-"));
+        assert!(calls[2].contains("JFR.check"), "calls[2]: {}", calls[2]);
+        assert!(calls.iter().skip(3).filter(|c| c.starts_with("stat -c %s")).count() >= 2);
         assert!(calls.iter().any(|c| c.starts_with("rm -f")), "remote cleanup expected: {calls:?}");
         pacer.abort();
         drop(tmp);
@@ -925,6 +940,58 @@ mod tests {
         drop(tmp);
     }
 
+    /// issue #23 四轮回归：目标 JVM 为 JDK 8（VM.version 解析出主版本 8）→
+    /// 版本预检快速失败 jfr_not_supported（附 arthas_profiler 指引），
+    /// 不再执行注定失败的 JFR.start
+    #[tokio::test]
+    async fn test_record_jdk8_precheck_fails_fast() {
+        let mut raw = JfrChannel::new(CHECK_RUNNING, "0");
+        raw.vm_version = VM_VERSION_8;
+        let ch = Arc::new(raw);
+        let (tmp, reg) = registry(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234"}), &ctx())
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "jfr_not_supported");
+        let msg = out.data["message"].as_str().unwrap();
+        assert!(msg.contains("JDK 8"), "msg: {msg}");
+        assert!(msg.contains("arthas_profiler"), "msg: {msg}");
+        // 预检快速失败：VM.version 已执行、JFR.start 未执行
+        let calls = ch.calls.lock().await;
+        assert!(calls.iter().any(|c| c.contains("VM.version")), "calls: {calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("JFR.start")), "calls: {calls:?}");
+        drop(tmp);
+    }
+
+    /// VM.version 预检自身失败（exit≠0）不阻断：继续 JFR.start 流程（兜底语义）
+    #[tokio::test]
+    async fn test_record_version_precheck_failure_does_not_block() {
+        let mut raw = JfrChannel::new(CHECK_RUNNING, "54321");
+        raw.vm_version = ""; // 空输出 → 解析 None → 放行
+        let ch = Arc::new(raw);
+        let (tmp, reg) = registry(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        tokio::time::pause();
+        let pacer = spawn_auto_advance_pacer();
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let rid = out.data["recording_id"].as_str().unwrap();
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "completed", "final: {done}");
+        let calls = ch.calls.lock().await;
+        assert!(calls.iter().any(|c| c.contains("VM.version")));
+        assert!(calls.iter().any(|c| c.contains("JFR.start")), "calls: {calls:?}");
+        pacer.abort();
+        drop(tmp);
+    }
+
     #[tokio::test]
     async fn test_record_status_unknown_id() {
         let (tmp, reg) = registry(std_channel("1"), Arc::new(MockJmcClient::ok("S"))).await;
@@ -979,11 +1046,11 @@ mod tests {
         assert!(out.success, "out: {}", out.data);
         let calls = ch.calls.lock().await;
         assert!(
-            calls[0].contains("filename=/opt/log/dump/coredump/friday-recording-1234-"),
-            "start cmd: {}", calls[0]
+            calls[1].contains("filename=/opt/log/dump/coredump/friday-recording-1234-"),
+            "start cmd: {}", calls[1]
         );
         // 容器目标默认 disk=false（issue #23 三轮：JFR repository 不落 /opt/tmp）
-        assert!(calls[0].contains("disk=false"), "pod 目标默认 disk=false：{}", calls[0]);
+        assert!(calls[1].contains("disk=false"), "pod 目标默认 disk=false：{}", calls[1]);
         drop(calls);
         let rid = out.data["recording_id"].as_str().unwrap();
         let done = poll_status_to_terminal(&reg, rid).await;

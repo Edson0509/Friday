@@ -216,7 +216,8 @@ scripts/fetch-jmc-jar.ps1（读清单 → 下载 → 校验 sha256 → 幂等/.d
 | `jmc_unavailable` | JAR 缺失 / spawn 失败 / 握手超时 | 提示运行 `scripts/fetch-jmc-jar.ps1`；附 stderr 摘要 |
 | `jmc_timeout` | 上游工具调用超时（默认/上限截断） | 不杀工人进程；引导调大 timeout_secs 或缩小时间窗 |
 | `upstream_error` | 上游返回 is_error（文件损坏/路径不存在等） | 原样透传上游文本 |
-| `record_failed` | `JFR.start` 失败（JDK 8 不支持/权限） | 透传 jcmd stderr；JDK 8 场景引导 arthas_profiler |
+| `record_failed` | `JFR.start` 失败（权限等） | 透传 jcmd stderr |
+| `jfr_not_supported` | 版本预检确认目标 JVM 为 JDK < 11（issue #23 四轮：`VM.version` 先行，JDK 8 上 JFR.start 只会得到模糊 exit 1） | 附实测版本与 arthas_profiler 指引（OpenJDK 8 无 JFR；Oracle 8 需启动参数、运行时不可补开）。预检自身失败不阻断，交 `record_failed` 兜底 |
 | `record_not_found` | duration 到期后文件未出现/大小不稳定 | 附远端路径与已等待时长 |
 
 日志（遵从[日志规范](../../architecture/logging-standard.md)）：manager 启动/退出/invalidate `info!`/`error!` 带完整 stderr；工具入口 `#[instrument]`（session_id/local_path/工具名）；JFR.start/JFR.check 的 jcmd 命令与输出全量记录。
@@ -225,7 +226,7 @@ scripts/fetch-jmc-jar.ps1（读清单 → 下载 → 校验 sha256 → 幂等/.d
 
 1. **单元测试（mock client，`JmcClient` trait 注入）**：懒启动仅一次；invalidate 后懒重建；空闲回收时序；传输错误 invalidate；预热失败不阻断后续 query；超时不杀进程；
 2. **mapping 纯函数**：jcmd 参数构造（duration 边界 10/600/越界、settings 白名单）、async:false 注入、compare 双路径映射、代理参数透传；
-3. **录制链路**（issue #23 异步管线 + Pod 死亡三级防护）：mock SSH channel + TransferManager channel_factory 注入验证——JFR.start 命令形态、JFR.check 校验（未在运行 → `record_verify_failed`；短 duration 已落盘放行）、**工具调用立即返回 recording_id**（虚拟时钟断言不阻塞 duration）、后台 stat 大小稳定判定、TransferState 构造（远端清理标志/本地路径/pod 定位）、`jfr_record_status` 轮询至 completed/failed、落盘超预算后台失败（record_not_found）、同 JVM 活跃录制去重；Pod 死亡三路——等待期 stat stderr 死亡信号快速失败、拉回前 phase 检查中止（显式 -n + jsonpath）、拉回失败后复查富化 pod_failed（均断言不启动拉回 / 重查指引）；
+3. **录制链路**（issue #23 异步管线 + Pod 死亡三级防护 + 版本预检）：mock SSH channel + TransferManager channel_factory 注入验证——VM.version 版本预检（JDK 8 → `jfr_not_supported` 快速失败且不执行 JFR.start；预检失败不阻断）、JFR.start 命令形态、JFR.check 校验（未在运行 → `record_verify_failed`；短 duration 已落盘放行）、**工具调用立即返回 recording_id**（虚拟时钟断言不阻塞 duration）、后台 stat 大小稳定判定、TransferState 构造（远端清理标志/本地路径/pod 定位）、`jfr_record_status` 轮询至 completed/failed、落盘超预算后台失败（record_not_found）、同 JVM 活跃录制去重；Pod 死亡三路——等待期 stat stderr 死亡信号快速失败、拉回前 phase 检查中止（显式 -n + jsonpath）、拉回失败后复查富化 pod_failed（均断言不启动拉回 / 重查指引）；
 4. **预热联动**：transfer completed 回调扩展名分发（.jfr 触发 JMC、.hprof 仍触发 MAT、其他不触发）；预热失败不影响 transfer 终态；
 5. **集成测试 `#[ignore]`**（需本机 Java 21+ + fetch 脚本已跑）：测试内用 `jcmd JFR.start` 对自身 JVM 录制生成样例 `.jfr` → 真实 spawn → `jfr_overview` → `jfr_rules` → 传输错误 invalidate → 重建；同时充当降级 JAR 的 Java 21 兼容性验证；
 6. **prompt**：TOOL_GUIDANCE 含 jfr_* 关键词与 JDK 8 兜底指引；

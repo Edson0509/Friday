@@ -161,6 +161,18 @@ fn body_prefix(body: &str) -> String {
     }
 }
 
+/// curl 退出码 → 语义后缀（issue #23 四轮：exit 7 实为「连接被拒」而非
+/// 「curl 不可用」，旧文案误导排查方向）
+fn curl_exit_hint(code: i32) -> &'static str {
+    match code {
+        7 => "（连接被拒——目标端口未监听：服务未启动完成或进程已退出）",
+        6 => "（无法解析主机）",
+        28 => "（操作超时）",
+        126 | 127 => "（目标机无 curl：命令不存在或不可执行）",
+        _ => "",
+    }
+}
+
 /// MCP-over-exec HTTP 桥：rmcp StreamableHttpClient 的 ssh exec + curl 实现。
 /// 目标机 curl 直接打 http://127.0.0.1:{port}/mcp，绕过 sshd AllowTcpForwarding 限制。
 /// uri/token/session_id 均由 rmcp 参数流入（auth_header 为裸 token，Bearer 前缀在此拼接）；
@@ -185,8 +197,9 @@ impl ExecHttpBridge {
         if output.exit_code != 0 {
             tracing::warn!(exit_code = output.exit_code, stderr = %output.stderr, "arthas mcp bridge curl 非零退出");
             return Err(StreamableHttpError::Client(BridgeError::Curl(format!(
-                "curl 退出码 {}（目标 curl 不可用或连接失败）: {}",
+                "curl 退出码 {}{}: {}",
                 output.exit_code,
+                curl_exit_hint(output.exit_code),
                 output.stderr.trim()
             ))));
         }
@@ -816,6 +829,35 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StreamableHttpError::Client(_)), "err: {err}");
         assert!(err.to_string().contains("curl"), "err: {err}");
+    }
+
+    /// issue #23 四轮：exit 7 是「连接被拒」（目标未监听），不是「curl 不可用」
+    #[tokio::test]
+    async fn test_curl_exit_hints_distinguish_refused_from_missing() {
+        assert!(curl_exit_hint(7).contains("连接被拒"), "hint: {}", curl_exit_hint(7));
+        assert!(curl_exit_hint(7).contains("未监听"), "hint: {}", curl_exit_hint(7));
+        assert!(curl_exit_hint(127).contains("无 curl"), "hint: {}", curl_exit_hint(127));
+        assert!(curl_exit_hint(126).contains("无 curl"), "hint: {}", curl_exit_hint(126));
+        assert!(curl_exit_hint(28).contains("超时"), "hint: {}", curl_exit_hint(28));
+        assert_eq!(curl_exit_hint(1), "");
+        // 错误消息带语义后缀（完整链路）
+        let channel = RecordingChannel::new(vec![(
+            "curl: (7) Failed to connect to 127.0.0.1 port 18563",
+            7,
+        )]);
+        let b = bridge(channel);
+        let err = b
+            .post_message(
+                Arc::from("http://127.0.0.1:18563/mcp"),
+                client_message(),
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("连接被拒"), "err: {err}");
+        assert!(err.to_string().contains("未监听"), "err: {err}");
     }
 
     // ── delete_session ──

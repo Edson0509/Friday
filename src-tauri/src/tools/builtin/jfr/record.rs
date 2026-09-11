@@ -34,6 +34,9 @@ const RECORD_POLL_INTERVAL_SECS: u64 = 3;
 /// 工具调用本身不等录制落盘（issue #23 根因）
 const RECORD_START_TIMEOUT_SECS: u64 = 60;
 const RECORD_CHECK_TIMEOUT_SECS: u64 = 30;
+/// VM.version 版本预检超时（issue #23 四轮）。同步阶段总预算 60+30+15=105s，
+/// 仍留出 MCP 客户端 120s 硬超时的余量
+const RECORD_VERSION_TIMEOUT_SECS: u64 = 15;
 /// 终态记录保留上限（LRU 淘汰防泄漏，对齐 TransferManager）
 const MAX_FINISHED_RECORDS: usize = 100;
 
@@ -542,6 +545,45 @@ impl JfrRecordHandler {
                 }),
                 raw_stdout: None,
             };
+        }
+
+        // 目标 JVM 版本预检（issue #23 四轮：JDK 8 上 JFR.start 只会得到模糊的
+        // exit 1，agent 难以定位——VM.version 先行给出确定的结构化指引）。
+        // 预检自身失败（超时/exit≠0/无法解析）不阻断，交 JFR.start 失败路径兜底
+        let version_cmd = super::mapping::vm_version_command(jcmd, pid);
+        let version_output = match tokio::time::timeout(
+            std::time::Duration::from_secs(RECORD_VERSION_TIMEOUT_SECS),
+            channel.run(&version_cmd),
+        )
+        .await
+        {
+            Ok(Ok(o)) if o.exit_code == 0 => Some(o),
+            Ok(Ok(o)) => {
+                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, pid, exit_code = o.exit_code, "VM.version 预检失败（不阻断，继续 JFR.start）");
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, pid, error = %e, "VM.version 预检执行失败（不阻断，继续 JFR.start）");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, pid, timeout_secs = RECORD_VERSION_TIMEOUT_SECS, "VM.version 预检超时（不阻断，继续 JFR.start）");
+                None
+            }
+        };
+        if let Some(output) = &version_output {
+            if let Some(major) = super::mapping::parse_vm_major_version(&output.stdout) {
+                if major < 11 {
+                    tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, pid, major, "target JVM does not support hot JFR");
+                    return error_output(
+                        "jfr_not_supported",
+                        &format!(
+                            "目标 JVM 为 JDK {major}（VM.version: {}），不支持 JFR 热开启：OpenJDK 8 无 JFR；Oracle JDK 8 需启动参数 -XX:+UnlockCommercialVMOption -XX:+FlightRecorder（运行时无法补开，Friday 不支持该场景）。此类场景改用 arthas_profiler（async-profiler 火焰图）。",
+                            output.stdout.trim()
+                        ),
+                    );
+                }
+            }
         }
 
         // ① 一次性定时录制（文件名 Friday 固定构造——不开放自定义，注入面）。

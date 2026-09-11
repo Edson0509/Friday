@@ -207,8 +207,9 @@ pub async fn establish_pf_tunnel(
         tracing::warn!(pod, mcp_port, error = %e, "清残留 kubectl port-forward 失败（best-effort 继续）");
     }
 
-    // ② 起 pf + 解析 PID
-    let out = run_timed(base, &pf_start_command(pod, namespace, container, mcp_port), 15).await?;
+    // ② 起 pf + 解析 PID（issue #23 四轮：kubectl 冷启动/API 慢时 nohup 返回
+    //    可超 15s——放宽到 30s；失败后调用方有 T7 宿主机侧桥兜底，不再致命）
+    let out = run_timed(base, &pf_start_command(pod, namespace, container, mcp_port), 30).await?;
     if out.exit_code != 0 {
         return Err(format!(
             "kubectl port-forward 启动失败（exit {}）: {}",

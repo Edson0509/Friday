@@ -105,9 +105,50 @@ pub fn resolve_record_disk(user: Option<&serde_json::Value>, pod_target: bool) -
     }
 }
 
-/// JFR.check 命令构造（issue #23：JFR.start 成功后校验录制确实在运行）
+/// jfr_check_command 命令构造（issue #23：JFR.start 成功后校验录制确实在运行）
 pub fn jfr_check_command(jcmd: &str, pid: u32, name: &str) -> String {
     format!("{jcmd} {pid} JFR.check name={name}")
+}
+
+/// jcmd VM.version 命令构造（issue #23 四轮：JFR.start 前的目标 JVM 版本预检）
+pub fn vm_version_command(jcmd: &str, pid: u32) -> String {
+    format!("{jcmd} {pid} VM.version")
+}
+
+/// VM.version 输出 → 主版本号（issue #23 四轮）。识别两类形态：
+/// - 旧式 1.x：`1234:\n1.8.0_392` → 8
+/// - 新式：`OpenJDK 64-Bit Server VM version 21.0.10+7-LTS` / `JDK 21.0.10` /
+///   `11.0.21+9-LTS` → 21 / 11
+/// jcmd 自带 `pid:` 头行跳过；行内扫描首个「数字+.」版本串（"64-Bit" 等裸数字
+/// 不匹配）；无法解析 → None（调用方不得据此阻断）。
+pub fn parse_vm_major_version(stdout: &str) -> Option<u32> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        // jcmd 头行（"12345:"）
+        if line.ends_with(':') && line.trim_end_matches(':').chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        for (i, c) in line.char_indices() {
+            if !c.is_ascii_digit() {
+                continue;
+            }
+            let rest = &line[i..];
+            // 版本串必须形如 N. 或 N_（排除行内裸数字，如 "64-Bit"）
+            let after_digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            if !after_digits.starts_with('.') && !after_digits.starts_with('_') {
+                continue;
+            }
+            let mut parts = rest.split(|c: char| c == '.' || c == '_' || c == '-' || c == '+');
+            let Ok(major) = parts.next().unwrap_or("").parse::<u32>() else { continue };
+            if major == 1 {
+                // 旧式 1.x：主版本 = 次号（1.8.0_392 → 8）
+                let Ok(minor) = parts.next().unwrap_or("").parse::<u32>() else { continue };
+                return Some(minor);
+            }
+            return Some(major);
+        }
+    }
+    None
 }
 
 /// JFR.check 输出判定：JDK 11+ 输出形如 `Recording 1: name=... duration=30s (running)`。
@@ -214,6 +255,39 @@ mod tests {
     fn test_jfr_check_command_shape() {
         let cmd = jfr_check_command("/tmp/jdk/bin/jcmd", 1234, "friday-777");
         assert_eq!(cmd, "/tmp/jdk/bin/jcmd 1234 JFR.check name=friday-777");
+    }
+
+    #[test]
+    fn test_vm_version_command_shape() {
+        assert_eq!(vm_version_command("/tmp/jdk/bin/jcmd", 1234), "/tmp/jdk/bin/jcmd 1234 VM.version");
+    }
+
+    /// issue #23 四轮：VM.version 输出形态实测（JDK 21 本地验证）+ JDK 8 旧式
+    #[test]
+    fn test_parse_vm_major_version_formats() {
+        // JDK 11+ 实测形态（jcmd 自带 pid 头行）
+        assert_eq!(
+            parse_vm_major_version("102668:\nOpenJDK 64-Bit Server VM version 21.0.10+7-LTS\nJDK 21.0.10\n"),
+            Some(21)
+        );
+        assert_eq!(parse_vm_major_version("1234:\n11.0.21+9-LTS\n"), Some(11));
+        assert_eq!(parse_vm_major_version("1234:\n17.0.10\n"), Some(17));
+        // JDK 8 旧式（1.x → 主版本取次号）
+        assert_eq!(parse_vm_major_version("1234:\n1.8.0_392\n"), Some(8));
+        // Oracle JDK 8：可能带 vendor 行，版本行在后
+        assert_eq!(
+            parse_vm_major_version("1234:\nJava HotSpot(TM) 64-Bit Server VM\n1.8.0_292\n"),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn test_parse_vm_major_version_unparseable_is_none() {
+        assert_eq!(parse_vm_major_version(""), None);
+        assert_eq!(parse_vm_major_version("1234:\n"), None);
+        assert_eq!(parse_vm_major_version("garbage output"), None);
+        // 裸数字不误配（无 . 或 _ 后缀）
+        assert_eq!(parse_vm_major_version("JDK 21"), None);
     }
 
     #[test]

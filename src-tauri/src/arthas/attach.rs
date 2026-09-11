@@ -576,11 +576,15 @@ impl PodMcpConnector for ProductionPodMcpConnector {
     }
 }
 
-/// 容器分支 MCP 通路编排（T6 主路径）：① port-forward 隧道（宿主机 nohup pf
-/// + TunnelManager direct-tcpip）+ rmcp 原生 reqwest transport 握手；
-/// ② 任一步失败 → 拆隧道（kill pf + close）→ 降级 exec HTTP 桥（T5 路径，
-/// 容器需 curl）。返回 (client, pf lease)——lease=Some 表示隧道模式
-/// （stop 走隧道原生 HTTP，见 run_production_stop）。
+/// 容器分支 MCP 通路编排（三级降级链，issue #23 四轮）：
+/// ① T6 主路径：port-forward 隧道（宿主机 nohup pf + TunnelManager direct-tcpip）
+///   + rmcp 原生 reqwest transport 握手——不经 exec 通道、不依赖任何 curl；
+/// ② T7 降级：宿主机侧 exec 桥——base 通道上 curl 直打 http://{podIP}:{port}/mcp，
+///   依赖宿主机 curl + 宿主→Pod 网络可达（探活同路径），**不依赖容器内 curl**
+///   （实测存在无 curl 的精简镜像，此前 pf 失败 + 容器无 curl = arthas 全断）；
+/// ③ T5 兜底：容器内 exec 桥（kubectl exec + 容器内 curl 127.0.0.1）——容器
+///   无 curl 时不可用，但宿主→Pod 网络被策略拦截时是唯一通路。
+/// 返回 (client, pf lease)——lease=Some 表示隧道模式（stop 走隧道原生 HTTP）。
 async fn establish_pod_mcp(
     base: &Arc<dyn ExecChannel>,
     k8s_ch: &Arc<dyn ExecChannel>,
@@ -609,9 +613,48 @@ async fn establish_pod_mcp(
                 }
                 Err(e) => {
                     tracing::warn!(env_id, pod, url = %url, error = %e,
-                        "原生 MCP 握手失败，拆除隧道并降级 exec HTTP 桥（容器内 curl）");
-                    progress("bridge", "原生握手失败，拆除隧道并降级 exec HTTP 桥（容器内 curl）".to_string());
+                        "原生 MCP 握手失败，拆除隧道并降级宿主机侧 podIP 桥");
+                    progress("bridge", "原生握手失败，拆除隧道并降级宿主机侧 podIP HTTP 桥（不依赖容器内 curl）".to_string());
                     teardown_pf(base.as_ref(), tunnels, env_id, lease.pf_pid, Some(lease.host_port)).await;
+                    pod_ip_bridge_fallback(base, k8s_ch, connector, env_id, pod, namespace, mcp_port, token, progress).await
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(env_id, pod, mcp_port, error = %e,
+                "port-forward 隧道建立失败，降级宿主机侧 podIP 桥");
+            progress("bridge", format!("隧道建立失败（{e}），降级宿主机侧 podIP HTTP 桥（不依赖容器内 curl）"));
+            pod_ip_bridge_fallback(base, k8s_ch, connector, env_id, pod, namespace, mcp_port, token, progress).await
+        }
+    }
+}
+
+/// T7 降级路径（issue #23 四轮）：宿主机侧 exec 桥——base 通道上 curl 直打
+/// podIP:mcp_port。podIP 不可查 / 桥握手失败 → T5 容器内 exec 桥兜底。
+async fn pod_ip_bridge_fallback(
+    base: &Arc<dyn ExecChannel>,
+    k8s_ch: &Arc<dyn ExecChannel>,
+    connector: &dyn PodMcpConnector,
+    env_id: &str,
+    pod: &str,
+    namespace: Option<&str>,
+    mcp_port: u16,
+    token: &str,
+    progress: &(dyn Fn(&str, String) + Sync),
+) -> Result<(Arc<dyn ArthasClient>, Option<PfLease>), ManagerError> {
+    match get_pod_ip(base.as_ref(), pod, namespace).await {
+        Ok(pod_ip) => {
+            let url = format!("http://{pod_ip}:{mcp_port}/mcp");
+            progress("bridge", format!("MCP 握手（宿主机侧 podIP HTTP 桥 {url}）"));
+            match connector.connect_bridge(base, &url).await {
+                Ok(client) => {
+                    tracing::info!(env_id, pod, mcp_port, pod_ip, "pod arthas mcp established via host pod-ip bridge");
+                    Ok((client, None))
+                }
+                Err(e) => {
+                    tracing::warn!(env_id, pod, url = %url, error = %e,
+                        "宿主机侧 podIP 桥握手失败，降级容器内 exec 桥（kubectl exec + 容器内 curl）");
+                    progress("bridge", format!("宿主机侧桥失败（{e}），降级容器内 exec 桥"));
                     pod_bridge_fallback(k8s_ch, connector, mcp_port, token, progress)
                         .await
                         .map(|c| (c, None))
@@ -619,9 +662,7 @@ async fn establish_pod_mcp(
             }
         }
         Err(e) => {
-            tracing::warn!(env_id, pod, mcp_port, error = %e,
-                "port-forward 隧道建立失败，降级 exec HTTP 桥（容器需 curl）");
-            progress("bridge", format!("隧道建立失败（{e}），降级 exec HTTP 桥（容器内 curl）"));
+            tracing::warn!(env_id, pod, error = %e, "podIP 查询失败，跳过宿主机侧桥，直接容器内 exec 桥");
             pod_bridge_fallback(k8s_ch, connector, mcp_port, token, progress)
                 .await
                 .map(|c| (c, None))
@@ -629,8 +670,10 @@ async fn establish_pod_mcp(
     }
 }
 
-/// MCP 兜底路径：exec HTTP 桥（T5 主路径，T6 起降级兜底；容器需 curl）。
-/// 桥也失败 → cleanup_partial_attach（best-effort 停 arthas）后报错。
+/// MCP 兜底路径（T5）：容器内 exec HTTP 桥（kubectl exec + 容器内 curl 打
+/// 127.0.0.1——容器无 curl 时不可用，issue #23 四轮实测）。桥也失败 →
+/// cleanup_partial_attach（best-effort 停 arthas）后报错（附诊断指引——
+/// 三级通路全失败通常意味着 arthas 本身没起来，boot 日志是第一诊断源）。
 async fn pod_bridge_fallback(
     k8s_ch: &Arc<dyn ExecChannel>,
     connector: &dyn PodMcpConnector,
@@ -644,7 +687,11 @@ async fn pod_bridge_fallback(
         Ok(client) => Ok(client),
         Err(e) => {
             cleanup_partial_attach(k8s_ch.as_ref(), mcp_port, token).await;
-            Err(ManagerError::Attach(format!("arthas MCP 握手失败: {e}")))
+            Err(ManagerError::Attach(format!(
+                "arthas MCP 握手失败（port-forward 隧道 → 宿主机侧 podIP 桥 → 容器内 exec 桥三级通路均失败）: {e}。\
+                 排查建议：① 容器内 cat /tmp/arthas-friday-<pid>.log 查看 arthas 启动日志（attach 失败原因都在这里）；\
+                 ② 确认目标 JVM 内存/权限允许 attach（高压 JVM 的 attach 可能极慢或被拒）"
+            )))
         }
     }
 }
@@ -2484,6 +2531,118 @@ mod tests {
         );
         // 失败路径 pf 已被 kill（清残留）
         assert!(ev.iter().any(|e| e.starts_with("base:kill 4242")), "ev: {ev:?}");
+    }
+
+    /// issue #23 四轮：pf 失败 → T7 宿主机侧 podIP 桥成功（不触容器内桥——
+    /// 无 curl 容器的主降级路径）
+    #[tokio::test]
+    async fn test_establish_pod_mcp_pf_fail_falls_back_to_host_pod_ip_bridge() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        // pf 启动即失败（exit 1，无日志轮询）→ T7：get_pod_ip → 10.244.1.5 → 桥握手成功
+        let base = ScriptedEventChannel::new(
+            events.clone(),
+            "base",
+            vec![
+                ("", 0),           // pf 清残留
+                ("", 1),           // pf 启动失败（exit 1）
+                ("10.244.1.5", 0), // T7: get_pod_ip
+            ],
+        );
+        let base_ch: Arc<dyn ExecChannel> = base;
+        let k8s_ch: Arc<dyn ExecChannel> = ScriptedEventChannel::new(events.clone(), "k8s", vec![]);
+        let tunnels = MockTunnels::new(events.clone(), vec![]); // open 不应被调
+        let connector = ScriptedConnector::new(events.clone(), vec![], vec![Ok(())]);
+
+        let (client, lease) = establish_pod_mcp(
+            &base_ch,
+            &k8s_ch,
+            tunnels.as_ref(),
+            &connector,
+            "env-1",
+            "svc-1",
+            Some("ns1"),
+            None,
+            18563,
+            "tok123",
+            &fast_pf_params(),
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        client.shutdown().await;
+        assert!(lease.is_none(), "host bridge session has no pf lease");
+
+        let ev = events.lock().await.clone();
+        // T7 桥握手（podIP URL，非 127.0.0.1）
+        assert!(
+            ev.iter().any(|e| e == "bridge-connect:http://10.244.1.5:18563/mcp"),
+            "ev: {ev:?}"
+        );
+        // 容器内桥未被触（T7 已成功）
+        assert!(
+            !ev.iter().any(|e| e == "bridge-connect:http://127.0.0.1:18563/mcp"),
+            "ev: {ev:?}"
+        );
+        // get_pod_ip 走宿主机 kubectl get pod + 显式 -n
+        assert!(
+            ev.iter().any(|e| e.starts_with("base:kubectl get pod") && e.contains("-n 'ns1'")),
+            "ev: {ev:?}"
+        );
+        assert!(!ev.iter().any(|e| e.starts_with("tunnels-open:")), "ev: {ev:?}");
+    }
+
+    /// issue #23 四轮：pf 失败 → T7 桥也失败 → T5 容器内桥兜底成功
+    #[tokio::test]
+    async fn test_establish_pod_mcp_host_bridge_fail_falls_to_container_bridge() {
+        let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let base = ScriptedEventChannel::new(
+            events.clone(),
+            "base",
+            vec![
+                ("", 0),           // pf 清残留
+                ("", 1),           // pf 启动失败
+                ("10.244.1.5", 0), // T7: get_pod_ip
+            ],
+        );
+        let base_ch: Arc<dyn ExecChannel> = base;
+        let k8s_ch: Arc<dyn ExecChannel> = ScriptedEventChannel::new(events.clone(), "k8s", vec![]);
+        let tunnels = MockTunnels::new(events.clone(), vec![]);
+        // 桥队列：T7 失败 → T5 成功
+        let connector = ScriptedConnector::new(
+            events.clone(),
+            vec![],
+            vec![Err("host bridge boom".to_string()), Ok(())],
+        );
+
+        let (client, lease) = establish_pod_mcp(
+            &base_ch,
+            &k8s_ch,
+            tunnels.as_ref(),
+            &connector,
+            "env-1",
+            "svc-1",
+            Some("ns1"),
+            None,
+            18563,
+            "tok123",
+            &fast_pf_params(),
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        client.shutdown().await;
+        assert!(lease.is_none());
+
+        let ev = events.lock().await.clone();
+        let host_idx = ev
+            .iter()
+            .position(|e| e == "bridge-connect:http://10.244.1.5:18563/mcp")
+            .expect("host bridge attempt");
+        let container_idx = ev
+            .iter()
+            .position(|e| e == "bridge-connect:http://127.0.0.1:18563/mcp")
+            .expect("container bridge fallback");
+        assert!(host_idx < container_idx, "T7 before T5: {ev:?}");
     }
 
     #[tokio::test]
