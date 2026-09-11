@@ -1,12 +1,9 @@
 pub mod mapping;
+pub mod record;
 
-use crate::app::events::{AppEvent, EventBus};
-use crate::exec::channel::ExecChannel;
+use crate::app::events::EventBus;
 use crate::jfr::{JmcError, JmcManager};
-use crate::tools::builtin::jvm::core::{
-    clamp_or, error_output, is_jdk_missing, parse_pid, require_bins, resolve_environment,
-    validate_target, JvmExecCore,
-};
+use crate::tools::builtin::jvm::core::{clamp_or, error_output, JvmExecCore};
 use crate::tools::builtin::run_command::{artifact_dir_for, truncate_output};
 use crate::tools::category::ToolCategory;
 use crate::tools::registry::{ToolContext, ToolDef, ToolHandler, ToolOutput};
@@ -19,16 +16,6 @@ use std::sync::Arc;
 type Timeouts = (u64, u64);
 const QUERY: Timeouts = (60, 300);
 const HEAVY: Timeouts = (300, 1800);
-
-/// 录制落盘轮询间隔（虚拟时钟友好，测试 start_paused 可瞬时推进）
-const RECORD_POLL_INTERVAL_SECS: u64 = 3;
-
-/// jfr_record：一次性定时录制 + 后台拉回
-pub struct JfrRecordHandler {
-    pub core: Arc<JvmExecCore>,
-    pub bus: EventBus,
-    pub transfer: Arc<crate::transfer::TransferManager>,
-}
 
 /// jfr_compare / 代理分析工具
 pub struct JfrProxyHandler {
@@ -45,217 +32,12 @@ pub enum JfrToolKind {
 }
 
 #[async_trait]
-impl ToolHandler for JfrRecordHandler {
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolOutput {
-        self.execute_record(&args, ctx).await
-    }
-}
-
-#[async_trait]
 impl ToolHandler for JfrProxyHandler {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolOutput {
         match self.kind {
             JfrToolKind::Compare => self.execute_compare(&args, ctx).await,
             JfrToolKind::Proxy(kind) => self.execute_proxy(kind, &args, ctx).await,
         }
-    }
-}
-
-impl JfrRecordHandler {
-    async fn execute_record(&self, args: &serde_json::Value, ctx: &ToolContext) -> ToolOutput {
-        let Some(environment) = args.get("environment").and_then(|v| v.as_str()) else {
-            return error_output("invalid_args", "missing required parameter: environment");
-        };
-        let Some(pid) = args.get("pid").and_then(|v| parse_pid(v)) else {
-            return error_output("invalid_args", "pid 必须是正整数字符串");
-        };
-        let pod = args.get("pod").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-        let namespace = args.get("namespace").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-        let container = args.get("container").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-        let (duration_secs, settings) = match mapping::validate_record_params(args) {
-            Ok(v) => v,
-            Err(e) => return error_output("invalid_args", &e),
-        };
-        let timeout_secs = mapping::effective_record_timeout(
-            args.get("timeout_secs").and_then(|v| v.as_i64()),
-            duration_secs,
-        );
-
-        let (env, channel) = match resolve_environment(&self.core.db, &self.core.exec_pool, environment, pod, namespace, container).await {
-            Ok(Some(pair)) => pair,
-            Ok(None) => {
-                return error_output(
-                    "environment_not_found",
-                    &format!(
-                        "环境「{environment}」不存在。请先调用 list_environments 查看可用环境；若无匹配，请让用户在右侧「环境」面板添加。"
-                    ),
-                );
-            }
-            Err(e) => return error_output("connection_error", &e),
-        };
-
-        // 环境类型门禁：vm 拒 pod/ns / container 必填 pod+namespace（引导 k8s_find_pods）+ k8s 名防呆
-        if let Err(msg) = validate_target(&env, pod, namespace, container) {
-            return error_output("environment_type_mismatch", &msg);
-        }
-
-        let target = crate::exec::pool::TargetKey::from_parts(&env.id, pod, namespace, container);
-
-        // JDK 路径：查缓存，miss 引导 ensure_tool
-        let Some(layout) = self
-            .core
-            .jdk_cache
-            .get(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target))
-            .await
-        else {
-            tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk not provisioned (cache miss)");
-            return error_output(
-                "jdk_not_provisioned",
-                "该环境尚未装备 JDK。请先调用 ensure_tool(environment, tool=\"jdk\"；容器内服务需同时传 pod/namespace/container) 装备，然后重试本工具。",
-            );
-        };
-        let bins = match require_bins(&layout, &["jcmd"]) {
-            Ok(b) => b,
-            Err(e) => return error_output("jdk_not_provisioned", &e),
-        };
-        let jcmd = &bins[0];
-
-        // ① 一次性定时录制（文件名 Friday 固定构造——不开放自定义，注入面）。
-        // 容器目标落 POD_DUMP_DIR（coredump 卷，用户环境实际存在）；VM 保持 /tmp/friday-tools
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let remote_path = if target.pod.is_some() {
-            format!("{}/friday-recording-{pid}-{ts}.jfr", crate::exec::k8s::POD_DUMP_DIR)
-        } else {
-            format!("/tmp/friday-tools/recording-{pid}-{ts}.jfr")
-        };
-        let name = format!("friday-{ts}");
-        let start_cmd = mapping::jfr_start_command(jcmd, pid, &name, duration_secs, &settings, &remote_path);
-
-        tracing::info!(session_id = %ctx.session_id, env_id = %env.id, pid, command = %start_cmd, "jfr record: starting");
-        self.emit_progress(
-            &ctx.session_id,
-            "record",
-            &format!("JFR 录制已启动（{duration_secs}s，settings={settings}），等待落盘…"),
-        );
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let start_timeout = timeout_secs.min(120);
-        let start_output = match tokio::time::timeout(
-            std::time::Duration::from_secs(start_timeout),
-            channel.run(&start_cmd),
-        )
-        .await
-        {
-            Err(_) => {
-                tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, timeout_secs = start_timeout, "JFR.start timed out, dropping connection");
-                crate::exec::pool::drop_target_and_kill(&self.core.exec_pool, &self.core.db, &target, &start_cmd).await;
-                return error_output(
-                    "timeout_error",
-                    &format!("JFR.start 超时（{start_timeout}s）；ssh 连接已断开"),
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::error!(session_id = %ctx.session_id, env_id = %env.id, error = %e, "JFR.start exec failed");
-                return error_output("connection_error", &e.to_string());
-            }
-            Ok(Ok(output)) => {
-                if is_jdk_missing(output.exit_code, &output.stderr) {
-                    tracing::warn!(session_id = %ctx.session_id, env_id = %env.id, "jdk missing on remote, clearing cache");
-                    self.core
-                        .jdk_cache
-                        .clear(&crate::tools::builtin::jvm::jdk_cache::cache_key(&target))
-                        .await;
-                    return error_output(
-                        "jdk_missing_on_remote",
-                        "远端 JDK 已不存在（可能 /tmp 被清理）。请重新调用 ensure_tool 装备后重试。",
-                    );
-                }
-                if output.exit_code != 0 {
-                    // JFR.start 失败：透传 jcmd 输出 + 兼容性提示（JDK 8 场景）
-                    tracing::error!(session_id = %ctx.session_id, env_id = %env.id, exit_code = output.exit_code, "JFR.start command failed");
-                    return ToolOutput {
-                        success: false,
-                        data: serde_json::json!({
-                            "error": "record_failed",
-                            "message": "JFR.start 失败。目标 JVM 兼容性：JDK 11+ 开箱即用；Oracle JDK 8 需启动参数 -XX:+UnlockCommercialVMOption -XX:+FlightRecorder；OpenJDK 8 无 JFR——此类场景改用 arthas_profiler。",
-                            "stdout": output.stdout,
-                            "stderr": output.stderr,
-                            "exit_code": output.exit_code,
-                        }),
-                        raw_stdout: Some(output.stdout),
-                    };
-                }
-                output
-            }
-        };
-
-        // ② 等待录制落盘：duration 到期 + 文件大小稳定（两次轮询相等且非零）
-        let remote_size = match wait_for_recording(&channel, &remote_path, duration_secs, deadline).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(session_id = %ctx.session_id, env_id = %env.id, remote_path, "recording file never materialized");
-                return error_output("record_not_found", &e);
-            }
-        };
-
-        // ③ 后台拉回：TransferManager（MCP 同步调用返回，Agent 轮询 transfer_status）。
-        //    pod 目标 state 带 pod/namespace/container，worker 专用连接走 K8sChannel 两跳拉回
-        let session_dir = artifact_dir_for(&self.core.artifacts_dir, &ctx.session_id);
-        let local_path = session_dir.join(format!("recording-{pid}-{ts}.jfr"));
-        let state = crate::transfer::state::TransferState::new(
-            crate::transfer::state::Direction::Download,
-            &ctx.session_id,
-            &env.id,
-            &remote_path,
-            local_path.clone(),
-            true, // 下载成功后清理远端（Friday 自己生成的文件）
-            pod,
-            namespace,
-            container,
-        );
-        let transfer_id = self.transfer.start(state).await;
-
-        self.emit_progress(
-            &ctx.session_id,
-            "download",
-            "录制完成，后台拉回已启动（轮询 transfer_status 获取进度）",
-        );
-
-        tracing::info!(
-            session_id = %ctx.session_id, env_id = %env.id, pid,
-            transfer_id = %transfer_id,
-            remote_path, remote_size, duration_secs, settings,
-            "jfr recording complete, background download started"
-        );
-
-        ToolOutput {
-            success: true,
-            data: serde_json::json!({
-                "transfer_id": transfer_id,
-                "remote_path": remote_path,
-                "remote_size": remote_size,
-                "duration_secs": duration_secs,
-                "settings": settings,
-                "local_path": local_path.to_string_lossy(),
-                "note": "JFR 录制完成，正在后台拉回。请轮询 transfer_status(transfer_id)；completed 后自动预热 JMC 分析，用 jfr_quick_analysis(local_path) / jfr_rules(local_path) 起步诊断；failed 时远端文件保留，可用 file_download 重试（断点续传）。",
-            }),
-            raw_stdout: Some(start_output.stdout),
-        }
-    }
-
-    fn emit_progress(&self, session_id: &str, stage: &str, detail: &str) {
-        self.bus.emit(
-            session_id,
-            AppEvent::ProvisionProgress {
-                session_id: session_id.to_string(),
-                tool: "jfr_record".to_string(),
-                stage: stage.to_string(),
-                detail: detail.to_string(),
-            },
-        );
     }
 }
 
@@ -361,38 +143,6 @@ impl JfrProxyHandler {
     }
 }
 
-/// 等待录制落盘：duration 到期后文件存在（size > 0）且两次轮询大小相等 → 稳定。
-/// deadline 用尽 → Err（附远端路径与已等待时长）。
-/// 全程 tokio 虚拟时钟友好（测试 start_paused 瞬时推进）。
-async fn wait_for_recording(
-    channel: &Arc<dyn ExecChannel>,
-    remote_path: &str,
-    duration_secs: u32,
-    deadline: tokio::time::Instant,
-) -> Result<u64, String> {
-    let start = tokio::time::Instant::now();
-    let mut last_size: u64 = 0;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "录制到时后文件未就绪：{remote_path}（已等待 {}s）。远端文件可能仍在写入，可稍后用 file_download 手动拉回",
-                start.elapsed().as_secs()
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(RECORD_POLL_INTERVAL_SECS)).await;
-        let stat_cmd = format!("stat -c %s {remote_path}");
-        let size: u64 = match channel.run(&stat_cmd).await {
-            Ok(o) if o.exit_code == 0 => o.stdout.trim().parse().unwrap_or(0),
-            _ => 0,
-        };
-        let elapsed = start.elapsed().as_secs();
-        if elapsed >= duration_secs as u64 && size > 0 && size == last_size {
-            return Ok(size);
-        }
-        last_size = size;
-    }
-}
-
 /// 结果组装：64KB 头部截断 + 完整结果落盘 session artifacts（复用 run_command 机制）。
 /// success=false 用于上游业务错误透传（upstream_is_error 标记，无 error code）。
 async fn render(
@@ -469,39 +219,6 @@ fn resolve_existing_file(raw: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-fn record_tool_def(
-    core: &Arc<JvmExecCore>,
-    bus: &EventBus,
-    transfer: &Arc<crate::transfer::TransferManager>,
-) -> ToolDef {
-    ToolDef {
-        name: "jfr_record".to_string(),
-        description: "对目标 JVM 热开启 JFR 飞行录制并后台拉回（jcmd JFR.start，目标需 JDK 11+，profile 档开销约 1~3%，不中断服务）。一次性定时录制 duration_secs 秒（10~600，默认 60）后自动落盘 → 后台拉回（返回 transfer_id，轮询 transfer_status）→ completed 后自动预热 JMC 分析，直接用 jfr_quick_analysis / jfr_rules 起步。⚠ 目标 JDK 8 不支持热开启 JFR（Oracle JDK 8 需启动参数，OpenJDK 8 无 JFR），此类场景改用 arthas_profiler。需先 ensure_tool 装备 JDK。".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "environment": { "type": "string", "description": "目标环境名称（list_environments 返回的 name）" },
-                "pid": { "type": "string", "description": "目标 Java 进程 PID（list_processes 返回）" },
-                "duration_secs": { "type": "number", "description": "录制时长秒数，10~600，默认 60" },
-                "settings": { "type": "string", "enum": ["profile", "default"], "description": "事件档位：profile 全维度（开销 1~3%），default 低开销（<1%），默认 profile" },
-                "timeout_secs": { "type": "number", "description": "总超时秒数（含录制等待与落盘轮询），默认 600，上限 1800；实际下限为 duration_secs+120" },
-                "pod": { "type": "string", "description": "Kubernetes Pod 名（容器环境必填；虚机环境不支持；全小写，须为 k8s_find_pods 返回的准确名，勿用服务名）" },
-                "namespace": { "type": "string", "description": "Kubernetes namespace（容器环境必填；与 pod 一起来自 k8s_find_pods 返回；全小写）" },
-                "container": { "type": "string", "description": "容器名（多容器 Pod 时指定；缺省用 Pod 默认容器）" }
-            },
-            "required": ["environment", "pid"]
-        }),
-        risk_level: RiskLevel::Low,
-        category: ToolCategory::Jfr,
-        needs_channel: false,
-        handler: Arc::new(JfrRecordHandler {
-            core: core.clone(),
-            bus: bus.clone(),
-            transfer: transfer.clone(),
-        }),
-    }
-}
-
 fn proxy_tool_def(
     name: &str,
     description: &str,
@@ -547,7 +264,7 @@ fn proxy_tool_def(
     }
 }
 
-/// 注册全部 jfr_* 工具（lib.rs 调用）：1 录制 + 20 代理 + 1 对比
+/// 注册全部 jfr_* 工具（lib.rs 调用）：1 录制 + 1 录制状态 + 20 代理 + 1 对比
 pub fn register_all(
     registry: &mut crate::tools::registry::ToolRegistry,
     jmc: Arc<JmcManager>,
@@ -556,7 +273,10 @@ pub fn register_all(
     transfer: Arc<crate::transfer::TransferManager>,
     artifacts_dir: PathBuf,
 ) {
-    registry.register(record_tool_def(&core, &bus, &transfer));
+    // 录制注册表：jfr_record（写入/流转）与 jfr_record_status（查询/观测）共享
+    let recordings = Arc::new(record::RecordingRegistry::new());
+    registry.register(record::record_tool_def(&core, &bus, &transfer, &recordings));
+    registry.register(record::record_status_tool_def(&transfer, &recordings));
 
     // (Friday 名, 描述, 代理类型, 超时档)
     let proxies: &[(&str, &str, mapping::JfrProxyKind, Timeouts)] = &[
@@ -621,9 +341,12 @@ mod tests {
 
     const SID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
-    /// JFR 感知的可编程 mock channel（对齐 heap_dump.rs 的 DumpChannel 模式）
+    /// JFR 感知的可编程 mock channel（对齐 heap_dump.rs 的 DumpChannel 模式）。
+    /// JFR.start / JFR.check / stat 按 run 路由；download 落 stat_size 字节的本地
+    /// 文件（供拉回 worker 完成大小校验 → rename → completed 全链路）。
     struct JfrChannel {
         start_exit: i32,
+        check_stdout: &'static str,
         stat_size: &'static str,
         calls: TokioMutex<Vec<String>>,
     }
@@ -642,6 +365,13 @@ mod tests {
                     exit_code: self.start_exit,
                 });
             }
+            if cmd.contains("JFR.check") {
+                return Ok(ExecOutput {
+                    stdout: self.check_stdout.to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                });
+            }
             if cmd.starts_with("stat -c %s") {
                 return Ok(ExecOutput {
                     stdout: self.stat_size.to_string(),
@@ -658,6 +388,22 @@ mod tests {
         async fn is_alive(&self) -> bool {
             true
         }
+        async fn download(
+            &self,
+            _remote_path: &str,
+            local: &std::path::Path,
+            _offset: u64,
+            _progress: &(dyn Fn(u64, u64) + Sync),
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // 对齐真实 SshTransport::download：落盘前创建父目录
+            if let Some(parent) = local.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let n: usize = self.stat_size.trim().parse().unwrap_or(0);
+            std::fs::write(local, vec![b'x'; n])?;
+            _progress(n as u64, 1024);
+            Ok(())
+        }
     }
 
     async fn setup_as(channel: Arc<dyn ExecChannel>, transport: &str) -> (tempfile::TempDir, Arc<JvmExecCore>, Arc<crate::transfer::TransferManager>) {
@@ -666,11 +412,19 @@ mod tests {
         // auto-advance 会在真实连接完成前把时钟推到超时点（PoolTimedOut，且嵌套
         // runtime 建 pool 会产生随其销毁的僵尸连接）。
         let (tmp, core, env_id) =
-            crate::tools::builtin::jvm::core::test_support::setup_env_with_channel(transport, channel).await;
+            crate::tools::builtin::jvm::core::test_support::setup_env_with_channel(transport, channel.clone()).await;
         let mut bins = HashMap::new();
         bins.insert("jcmd".to_string(), "/tmp/jdk/bin/jcmd".to_string());
         core.jdk_cache.set(&env_id, JdkLayout { tool_home: "/tmp/jdk".into(), bins }).await;
-        let mgr = Arc::new(crate::transfer::TransferManager::new(core.db.clone(), EventBus::disabled()));
+        // 后台等待/拉回 worker 走 TransferManager 专用连接：注入 factory 返回同一 mock，
+        // 同时规避 paused 时钟下的真实 SSH 建连
+        let mut tm = crate::transfer::TransferManager::new(core.db.clone(), EventBus::disabled());
+        let ch = channel.clone();
+        tm.set_channel_factory(Arc::new(move || {
+            let ch = ch.clone();
+            Box::pin(async move { Ok(ch) })
+        }));
+        let mgr = Arc::new(tm);
         (tmp, core, mgr)
     }
 
@@ -759,8 +513,15 @@ mod tests {
         p
     }
 
+    const CHECK_RUNNING: &str = "Recording 1: name=friday duration=10s (running)\n";
+
     fn std_channel(stat: &'static str) -> Arc<JfrChannel> {
-        Arc::new(JfrChannel { start_exit: 0, stat_size: stat, calls: TokioMutex::new(Vec::new()) })
+        Arc::new(JfrChannel {
+            start_exit: 0,
+            check_stdout: CHECK_RUNNING,
+            stat_size: stat,
+            calls: TokioMutex::new(Vec::new()),
+        })
     }
 
     /// 虚拟时钟起搏器：常驻 1ms 定时任务，把 auto-advance 的推进粒度钳制在 1ms。
@@ -775,11 +536,31 @@ mod tests {
         })
     }
 
+    /// 轮询 jfr_record_status 直到终态（completed/failed）。返回最后一次响应的
+    /// data JSON（含 status/transfer_id/local_path 等）。虚拟时钟下由 auto-advance
+    /// 推进等待时长；pacer 需保持运行。迭代上限兜底防死循环。
+    async fn poll_status_to_terminal(reg: &ToolRegistry, rid: &str) -> serde_json::Value {
+        for _ in 0..5000 {
+            let out = def(reg, "jfr_record_status")
+                .handler
+                .execute(serde_json::json!({"recording_id": rid}), &ctx())
+                .await;
+            assert!(out.success, "status out: {}", out.data);
+            let status = out.data["status"].as_str().unwrap().to_string();
+            if status == "completed" || status == "failed" {
+                return out.data;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("recording {rid} never reached terminal state");
+    }
+
     #[tokio::test]
-    async fn test_register_all_twenty_two_tools() {
+    async fn test_register_all_twenty_three_tools() {
         let (tmp, reg) = registry(std_channel("1"), Arc::new(MockJmcClient::ok("S"))).await;
         let expected = [
             "jfr_record",
+            "jfr_record_status",
             "jfr_overview",
             "jfr_rules",
             "jfr_quick_analysis",
@@ -802,27 +583,30 @@ mod tests {
             "jfr_request_waterfall",
             "jfr_compare",
         ];
-        assert_eq!(expected.len(), 22);
+        assert_eq!(expected.len(), 23);
         for name in expected {
             let d = def(&reg, name);
             assert_eq!(d.category, ToolCategory::Jfr, "{name}");
             assert!(!d.needs_channel, "{name}");
         }
         assert_eq!(def(&reg, "jfr_record").risk_level, RiskLevel::Low);
+        assert_eq!(def(&reg, "jfr_record_status").risk_level, RiskLevel::ReadOnly);
         assert_eq!(def(&reg, "jfr_overview").risk_level, RiskLevel::ReadOnly);
         assert_eq!(def(&reg, "jfr_compare").risk_level, RiskLevel::ReadOnly);
         drop(tmp);
     }
 
+    /// issue #23 核心回归：jfr_record 在 JFR.start + JFR.check 后**立即返回**
+    /// recording_id（不等 duration 落盘，不超 MCP 客户端 120s 硬超时）；后台等待
+    /// 落盘 → 拉回 → completed 全链路经 jfr_record_status 轮询闭环。
     /// 录制流程开始前手动 pause 时钟 + 起搏器任务（setup 走真实时钟）。
-    /// 起搏器把 auto-advance 的推进粒度钳制在 1ms：无起搏时 pending 的远期定时器
-    /// （sqlx 30s acquire 超时）会在真实 IO 完成前被瞬间穿透（PoolTimedOut）。
     #[tokio::test]
-    async fn test_record_full_flow_starts_background_download() {
+    async fn test_record_returns_immediately_and_completes_via_status_poll() {
         let ch = std_channel("54321");
         let (tmp, reg) = registry(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
         tokio::time::pause();
         let pacer = spawn_auto_advance_pacer();
+        let start = tokio::time::Instant::now();
         let out = def(&reg, "jfr_record")
             .handler
             .execute(
@@ -830,26 +614,47 @@ mod tests {
                 &ctx(),
             )
             .await;
-        pacer.abort();
+        // 立即返回：工具调用本身不等待 duration（虚拟时钟仅推进了 start/check 的 0s）
+        assert!(start.elapsed().as_secs() < 10, "jfr_record must not block for duration");
         assert!(out.success, "out: {}", out.data);
-        let tid = out.data["transfer_id"].as_str().unwrap();
-        assert!(!tid.is_empty());
+        let rid = out.data["recording_id"].as_str().unwrap();
+        assert!(!rid.is_empty());
+        assert_eq!(out.data["status"], "recording");
+        assert!(out.data["note"].as_str().unwrap().contains("jfr_record_status"));
         assert!(out.data["local_path"].as_str().unwrap().ends_with(".jfr"));
-        assert_eq!(out.data["remote_size"], 54321);
-        // 命令序列：JFR.start → 若干 stat 轮询
+
+        // 后台链路：等待落盘 → 拉回 → completed
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "completed", "final: {done}");
+        assert_eq!(done["remote_size"], 54321);
+        let tid = done["transfer_id"].as_str().unwrap();
+        assert!(!tid.is_empty());
+        // 本地文件真实落盘（download mock 写入 stat_size 字节）
+        let local = done["local_path"].as_str().unwrap();
+        assert_eq!(std::fs::metadata(local).map(|m| m.len()).unwrap_or(0), 54321);
+
+        // 命令序列：JFR.start → JFR.check（校验在运行）→ 若干 stat 轮询（后台等待 +
+        // 拉回 worker stat）→ rm -f（成功后清理远端）
         let calls = ch.calls.lock().await;
-        assert!(calls[0].contains("JFR.start"));
+        assert!(calls[0].contains("JFR.start"), "calls[0]: {}", calls[0]);
         assert!(calls[0].contains("duration=10s"));
         assert!(calls[0].contains("settings=profile"));
         assert!(calls[0].contains("filename=/tmp/friday-tools/recording-1234-"));
-        assert!(calls.iter().skip(1).all(|c| c.starts_with("stat -c %s")));
-        assert!(calls.len() >= 2);
+        assert!(calls[1].contains("JFR.check"), "calls[1]: {}", calls[1]);
+        assert!(calls.iter().skip(2).filter(|c| c.starts_with("stat -c %s")).count() >= 2);
+        assert!(calls.iter().any(|c| c.starts_with("rm -f")), "remote cleanup expected: {calls:?}");
+        pacer.abort();
         drop(tmp);
     }
 
     #[tokio::test]
     async fn test_record_start_failure_passthrough_with_jdk8_hint() {
-        let ch = Arc::new(JfrChannel { start_exit: 1, stat_size: "0", calls: TokioMutex::new(Vec::new()) });
+        let ch = Arc::new(JfrChannel {
+            start_exit: 1,
+            check_stdout: CHECK_RUNNING,
+            stat_size: "0",
+            calls: TokioMutex::new(Vec::new()),
+        });
         let (tmp, reg) = registry(ch, Arc::new(MockJmcClient::ok("S"))).await;
         let out = def(&reg, "jfr_record")
             .handler
@@ -864,9 +669,63 @@ mod tests {
         drop(tmp);
     }
 
-    /// 录制流程开始前手动 pause 时钟 + 起搏器（同上）
+    /// issue #23 问题 2 回归：JFR.start exit 0 但 JFR.check 未确认在运行且远端文件
+    /// 不存在 → record_verify_failed 快速失败，且不注册录制任务
     #[tokio::test]
-    async fn test_record_file_never_materializes() {
+    async fn test_record_verify_failed_when_check_not_running() {
+        let ch = Arc::new(JfrChannel {
+            start_exit: 0,
+            check_stdout: "Could not find recording with name friday-777\n",
+            stat_size: "0",
+            calls: TokioMutex::new(Vec::new()),
+        });
+        let (tmp, reg) = registry(ch, Arc::new(MockJmcClient::ok("S"))).await;
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234"}), &ctx())
+            .await;
+        assert!(!out.success, "out: {}", out.data);
+        assert_eq!(out.data["error"], "record_verify_failed");
+        assert!(out.data["message"].as_str().unwrap().contains("friday-tools"));
+        // 未注册录制任务：会话列表为空
+        let list = def(&reg, "jfr_record_status").handler.execute(serde_json::json!({}), &ctx()).await;
+        assert!(list.success);
+        assert_eq!(list.data["recordings"].as_array().unwrap().len(), 0);
+        drop(tmp);
+    }
+
+    /// 短 duration + 慢 attach 边角：JFR.check 已查不到（录制瞬间完成）但远端文件
+    /// 已非空 → 放行，交给后台等待稳定判定
+    #[tokio::test]
+    async fn test_record_check_passes_when_file_already_written() {
+        let ch = Arc::new(JfrChannel {
+            start_exit: 0,
+            check_stdout: "Could not find recording with name friday-777\n",
+            stat_size: "100",
+            calls: TokioMutex::new(Vec::new()),
+        });
+        let (tmp, reg) = registry(ch, Arc::new(MockJmcClient::ok("S"))).await;
+        tokio::time::pause();
+        let pacer = spawn_auto_advance_pacer();
+        let out = def(&reg, "jfr_record")
+            .handler
+            .execute(
+                serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 10, "timeout_secs": 30}),
+                &ctx(),
+            )
+            .await;
+        assert!(out.success, "out: {}", out.data);
+        let rid = out.data["recording_id"].as_str().unwrap();
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "completed", "final: {done}");
+        pacer.abort();
+        drop(tmp);
+    }
+
+    /// 落盘等待超预算（后台，不再阻塞工具调用）：jfr_record 本身成功返回，
+    /// 轮询到 failed（record_not_found 语义文案 + 远端路径）
+    #[tokio::test]
+    async fn test_record_file_never_materializes_fails_in_background() {
         let (tmp, reg) = registry(std_channel("0"), Arc::new(MockJmcClient::ok("S"))).await;
         tokio::time::pause();
         let pacer = spawn_auto_advance_pacer();
@@ -877,10 +736,64 @@ mod tests {
                 &ctx(),
             )
             .await;
+        assert!(out.success, "out: {}", out.data);
+        assert_eq!(out.data["status"], "recording");
+        let rid = out.data["recording_id"].as_str().unwrap();
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "failed", "final: {done}");
+        assert!(
+            done["error"].as_str().unwrap().contains("friday-tools"),
+            "error should mention remote path: {}",
+            done["error"]
+        );
         pacer.abort();
-        assert!(!out.success, "out: {}", out.data);
-        assert_eq!(out.data["error"], "record_not_found", "out: {}", out.data);
-        assert!(out.data["message"].as_str().unwrap().contains("friday-tools"));
+        drop(tmp);
+    }
+
+    /// issue #23 典型场景回归：客户端超时后 Agent 重试 jfr_record —— 同 JVM 已有
+    /// 活跃录制时拒绝重复启动并复用 recording_id（不再叠加录制开销）
+    #[tokio::test]
+    async fn test_record_duplicate_active_recording_reuses_id() {
+        let ch = std_channel("54321");
+        let (tmp, reg) = registry(ch.clone(), Arc::new(MockJmcClient::ok("S"))).await;
+        let first = def(&reg, "jfr_record")
+            .handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 60}), &ctx())
+            .await;
+        assert!(first.success, "out: {}", first.data);
+        let rid = first.data["recording_id"].as_str().unwrap().to_string();
+        let second = def(&reg, "jfr_record")
+            .handler
+            .execute(serde_json::json!({"environment": "prod", "pid": "1234", "duration_secs": 60}), &ctx())
+            .await;
+        assert!(!second.success, "out: {}", second.data);
+        assert_eq!(second.data["error"], "duplicate_recording");
+        assert_eq!(second.data["recording_id"].as_str().unwrap(), rid);
+        assert!(second.data["note"].as_str().unwrap().contains("jfr_record_status"));
+        // 第二次调用未再执行 JFR.start（calls 只有第一次的 start + check）
+        let calls = ch.calls.lock().await;
+        assert_eq!(calls.iter().filter(|c| c.contains("JFR.start")).count(), 1);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_record_status_unknown_id() {
+        let (tmp, reg) = registry(std_channel("1"), Arc::new(MockJmcClient::ok("S"))).await;
+        let out = def(&reg, "jfr_record_status")
+            .handler
+            .execute(serde_json::json!({"recording_id": "nope"}), &ctx())
+            .await;
+        assert!(!out.success);
+        assert_eq!(out.data["error"], "invalid_args");
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn test_record_status_empty_lists_session_recordings() {
+        let (tmp, reg) = registry(std_channel("1"), Arc::new(MockJmcClient::ok("S"))).await;
+        let out = def(&reg, "jfr_record_status").handler.execute(serde_json::json!({}), &ctx()).await;
+        assert!(out.success);
+        assert_eq!(out.data["recordings"].as_array().unwrap().len(), 0);
         drop(tmp);
     }
 
@@ -900,7 +813,7 @@ mod tests {
 
     /// 容器目标：录制落 POD_DUMP_DIR（coredump 卷），文件名 friday- 前缀；
     /// 拉回任务 state 带 pod/namespace（worker 专用连接走 K8sChannel 两跳）。
-    /// 起搏器说明同 test_record_full_flow_starts_background_download。
+    /// 起搏器说明同 test_record_returns_immediately_and_completes_via_status_poll。
     #[tokio::test]
     async fn test_record_pod_target_uses_pod_dump_dir() {
         let ch = std_channel("54321");
@@ -914,7 +827,6 @@ mod tests {
                 &ctx(),
             )
             .await;
-        pacer.abort();
         assert!(out.success, "out: {}", out.data);
         let calls = ch.calls.lock().await;
         assert!(
@@ -922,12 +834,17 @@ mod tests {
             "start cmd: {}", calls[0]
         );
         drop(calls);
+        let rid = out.data["recording_id"].as_str().unwrap();
+        let done = poll_status_to_terminal(&reg, rid).await;
+        assert_eq!(done["status"], "completed", "final: {done}");
         // 拉回任务带 pod/namespace 定位
-        let tid = out.data["transfer_id"].as_str().unwrap();
+        let tid = done["transfer_id"].as_str().unwrap();
         let st = mgr.get(tid).await.unwrap();
         assert_eq!(st.pod.as_deref(), Some("pod-1"));
         assert_eq!(st.namespace.as_deref(), Some("ns1"));
         assert!(st.container.is_none());
+        assert!(st.cleanup_remote_on_success, "Friday 生成的录制文件成功后清理远端");
+        pacer.abort();
         drop(tmp);
     }
 

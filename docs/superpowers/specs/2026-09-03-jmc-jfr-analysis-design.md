@@ -49,11 +49,11 @@ JDK 8 目标调用 `jfr_record` 走 `record_failed` 错误路径（jcmd 错误�
 | # | 决策点 | 结论 |
 |---|--------|------|
 | 1 | 链路范围 | 完整闭环：`jfr_record`（录制+落盘+拉回）→ `.jfr` 下载完成自动预热 → `jfr_*` 分析 |
-| 2 | 录制模型 | 一次性定时录制：`jcmd JFR.start settings=<档> duration=Ns filename=...`，无远程会话状态管理 |
+| 2 | 录制模型 | 一次性定时录制：`jcmd JFR.start settings=<档> duration=Ns filename=...`，无远程会话状态管理；**异步管线**（issue #23）：工具调用只做 JFR.start + JFR.check 校验后立即返回 `recording_id`，落盘等待在后台任务完成，Agent 轮询 `jfr_record_status` 至终态 |
 | 3 | 上游依赖 | 不 fork：Friday 仓库内 `jmc-jar.yml` workflow（clone 上游 pinned commit SHA → 命令行参数降 `maven.compiler.release` 21 + `--enable-preview`（上游用了 21 预览语法 unnamed variable，22 转正）→ JDK 25 toolchain 构建 → fat JAR 发 Friday 自身 Releases，tag `jmc-v*`）；升级 = 改 workflow 里的 SHA 重跑（已评审定案，替代 fork 方案） |
 | 4 | Java 依赖 | JMC worker 要求本机 Java ≥21（降级后与 heap analyzer 统一；降级失败回退 ≥25，见 §9 风险闸门）；复用 `analyzer::java::detect_java`；spawn 参数带 `--enable-preview`（运行 21 预览字节码所需，对回退到 25 的非预览产物无害） |
 | 5 | Friday 侧会话模型 | 无状态代理（方案 1）：无 open/close 工具、无 session 层；文件内存归上游缓存（TTL/驱逐），Friday 只管 worker 进程生命周期 |
-| 6 | 工具面 | 精选 22 个（§3）：1 录制 + 21 分析；剔除 async 任务轮询（强制 `async:false`）、JMX 直连、内部工具、call_tree 交互树、冗余对 |
+| 6 | 工具面 | 精选 23 个（§3）：1 录制 + 1 录制状态轮询（issue #23）+ 21 分析；剔除 async 任务轮询（强制 `async:false`）、JMX 直连、内部工具、call_tree 交互树、冗余对 |
 | 7 | worker 进程数 | 全局唯一，懒启动；`-Xmx4g` 常量起步（JFR 缓存为主要内存消费者，先简单后调优） |
 | 8 | 回收 | 空闲 15min 自动退出（idle reaper 30s tick）；传输错误 invalidate + 懒重建；无会话关闭联动（无会话表） |
 | 9 | 预热 | `.jfr` 下载完成后台调 `jfr_overview` 触发上游缓存加载，`provision_progress`（tool=`jfr_record`、stage=`analyze`），1800s 硬超时 |
@@ -68,9 +68,10 @@ MCP 层自动加 `friday_` 前缀。分析对象是**本机** `.jfr` 文件，�
 
 | 工具 | 关键参数 | 语义 | 风险 | 默认/上限超时 |
 |---|---|---|---|---|
-| `jfr_record` | `environment`、`pid`、`duration_secs`（10–600，默认 60）、`settings`（`profile`/`default`，默认 `profile`） | 一次性定时录制：`jcmd <pid> JFR.start name=friday-<ts> settings=<档> duration=Ns filename=/tmp/friday-tools/recording-<pid>-<ts>.jfr` → 轮询 `JFR.check` + stat 大小稳定判定落盘 → TransferState(Download) 后台拉回 `artifacts/<session>/recording-<pid>-<ts>.jfr`（成功清理远端）→ 返回 `{transfer_id, local_path}` | Low | 600s / 1800s |
+| `jfr_record` | `environment`、`pid`、`duration_secs`（10–600，默认 60）、`settings`（`profile`/`default`，默认 `profile`）、`timeout_secs`（后台落盘等待预算，不影响本调用） | 一次性定时录制：`jcmd <pid> JFR.start name=friday-<ts> settings=<档> duration=Ns filename=/tmp/friday-tools/recording-<pid>-<ts>.jfr`（容器目标落 POD_DUMP_DIR）→ `JFR.check` 校验录制确实在运行（issue #23；短 duration+慢 attach 已落盘的边角放行）→ **立即返回 `{recording_id, status: "recording", local_path, ...}`**；后台任务轮询 stat 大小稳定判定落盘 → TransferState(Download) 后台拉回 `artifacts/<session>/recording-<pid>-<ts>.jfr`（成功清理远端） | Low | JFR.start 60s / JFR.check 30s（同步阶段） |
+| `jfr_record_status` | `recording_id`（可选，缺省列出本会话全部） | 录制任务状态查询：`recording`（进行中）→ `downloading`（带 `transfer_id`，可轮询 transfer_status）→ `completed`（拉回完成且已自动预热 JMC，`local_path` 可直接分析）/ `failed`（录制未落盘或拉回失败，`error` 附因，远端文件保留可 file_download 重试）。Downloading 阶段实时观测拉回任务终态并落档 | ReadOnly | 即时 |
 
-录制等待（JFR.check 轮询 + 大小稳定判定）在工具调用超时预算内同步完成；duration 到期但文件未出现/未稳定 → `record_not_found`（附远端路径与已等待时长）。
+**issue #23 变更**：旧版把「等待 duration 落盘」同步阻塞在工具调用内，而部分 Agent CLI（codeagentcli）的 MCP 客户端存在不可配置的 120s 工具调用硬超时——长录制（>110s）必然被客户端取消且录制结果悬空。现行契约：录制等待在**后台任务**完成（专用连接轮询 stat、断线自动重建，对齐传输 worker「后台任务不走池」约定），工具调用本身在 JFR.start + JFR.check 后秒级返回；同 session + env + pid 活跃录制去重（`duplicate_recording` + 复用 recording_id），防客户端超时后 Agent 重试叠加录制。duration 到期但文件未出现/未稳定（后台预算 `timeout_secs` 用尽）→ 状态查询返回 `failed` + `record_not_found` 语义文案（附远端路径与已等待时长）。
 
 ### 3.2 分析工具（JMC 代理，21 个，全 ReadOnly）
 
@@ -117,24 +118,32 @@ src-tauri/src/jfr/                  # 引擎层（管进程、管协议；无会
                                     #   ClientFactory 注入缝（对齐 analyzer 模式）
 
 src-tauri/src/tools/builtin/jfr/    # 工具契约层（薄层）
-├── mod.rs                          # JfrToolHandler（录制分支 + 代理分支）
-│                                   #   render()：64KB 截断 + artifacts jfr-<uuid>.md
-│                                   #   register_all()（category: ToolCategory::Jfr）
-└── mapping.rs                      # 纯函数：jcmd 参数构造（duration/settings 白名单校验）
-                                    #   + 代理工具名/参数映射 + async:false 注入
+├── mod.rs                          # JfrProxyHandler（代理分支）+ render()
+│                                   #   + register_all()（category: ToolCategory::Jfr）
+├── record.rs                       # issue #23 异步录制管线：RecordingRegistry（内存态注册表，
+│                                   #   LRU 终态淘汰）+ run_recording_wait 后台落盘等待
+│                                   #   （专用连接 stat 轮询/断线重建）+ JfrRecordHandler /
+│                                   #   JfrRecordStatusHandler + 工具 def
+└── mapping.rs                      # 纯函数：jcmd 参数构造（duration/settings 白名单校验、
+                                    #   JFR.check 命令与输出判定）+ 代理工具名/参数映射 + async:false 注入
 ```
 
 链路：
 
 ```
 agent CLI ──HTTP──▶ Friday MCP server (ToolRegistry: jfr_* 工具)
-                        │ handler（Friday 原生契约）
-                        ├── jfr_record ──▶ jdk_cache/JFR.start ──▶ TransferManager 拉回
-                        │                                                    │ .jfr 完成
-                        ▼                                                    ▼
-                  JmcManager ◀────────── download_complete_hook（扩展名分发）
-                   （Rust 托管层）──stdio(MCP)──▶ jmc-mcp JAR（vendored，降级构建）
-                                               （vendored, JVM 工人进程）
+                         │ handler（Friday 原生契约）
+                         ├── jfr_record ──▶ jdk_cache/JFR.start + JFR.check 校验
+                         │        │            │ 秒级返回 recording_id
+                         │        ▼            ▼
+                         │   RecordingRegistry ◀── run_recording_wait（后台 stat 轮询）
+                         │        │ 稳定后 start
+                         ├── jfr_record_status ──▶ registry 查询 + 拉回终态观测
+                         │                                    │
+                         ▼                                    ▼
+                   JmcManager ◀────────── download_complete_hook（扩展名分发）
+                    （Rust 托管层）──stdio(MCP)──▶ jmc-mcp JAR（vendored，降级构建）
+                                                （vendored, JVM 工人进程）
 ```
 
 ### 工件分发链
@@ -206,7 +215,7 @@ scripts/fetch-jmc-jar.ps1（读清单 → 下载 → 校验 sha256 → 幂等/.d
 
 1. **单元测试（mock client，`JmcClient` trait 注入）**：懒启动仅一次；invalidate 后懒重建；空闲回收时序；传输错误 invalidate；预热失败不阻断后续 query；超时不杀进程；
 2. **mapping 纯函数**：jcmd 参数构造（duration 边界 10/600/越界、settings 白名单）、async:false 注入、compare 双路径映射、代理参数透传；
-3. **录制链路**：mock SSH channel（run_command 测试模式）验证 JFR.start 命令形态、JFR.check 轮询与大小稳定判定、TransferState 构造（远端清理标志/本地路径）；`record_not_found` 路径；
+3. **录制链路**（issue #23 异步管线）：mock SSH channel + TransferManager channel_factory 注入验证——JFR.start 命令形态、JFR.check 校验（未在运行 → `record_verify_failed`；短 duration 已落盘放行）、**工具调用立即返回 recording_id**（虚拟时钟断言不阻塞 duration）、后台 stat 大小稳定判定、TransferState 构造（远端清理标志/本地路径/pod 定位）、`jfr_record_status` 轮询至 completed/failed、落盘超预算后台失败（record_not_found 语义）、同 JVM 活跃录制去重；
 4. **预热联动**：transfer completed 回调扩展名分发（.jfr 触发 JMC、.hprof 仍触发 MAT、其他不触发）；预热失败不影响 transfer 终态；
 5. **集成测试 `#[ignore]`**（需本机 Java 21+ + fetch 脚本已跑）：测试内用 `jcmd JFR.start` 对自身 JVM 录制生成样例 `.jfr` → 真实 spawn → `jfr_overview` → `jfr_rules` → 传输错误 invalidate → 重建；同时充当降级 JAR 的 Java 21 兼容性验证；
 6. **prompt**：TOOL_GUIDANCE 含 jfr_* 关键词与 JDK 8 兜底指引；

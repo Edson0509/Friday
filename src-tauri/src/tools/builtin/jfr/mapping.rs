@@ -92,6 +92,17 @@ pub fn jfr_start_command(
     format!("{jcmd} {pid} JFR.start name={name} settings={settings} duration={duration_secs}s filename={remote_path}")
 }
 
+/// JFR.check 命令构造（issue #23：JFR.start 成功后校验录制确实在运行）
+pub fn jfr_check_command(jcmd: &str, pid: u32, name: &str) -> String {
+    format!("{jcmd} {pid} JFR.check name={name}")
+}
+
+/// JFR.check 输出判定：JDK 11+ 输出形如 `Recording 1: name=... duration=30s (running)`。
+/// 大小写不敏感匹配 "running"（容错不同 JDK 版本措辞）。
+pub fn recording_check_passes(stdout: &str, stderr: &str) -> bool {
+    format!("{stdout}\n{stderr}").to_lowercase().contains("running")
+}
+
 /// 代理工具：local_path → jfr_file_path + args 透传合并；路径与 async 为 handler
 /// 权威值，合并后强制写入（透传对象不得覆盖）；async 固定 false（禁用上游后台
 /// 任务模式，靠 Friday 超时分层，spec §3.2）。
@@ -159,6 +170,31 @@ mod tests {
             cmd,
             "/tmp/jdk/bin/jcmd 1234 JFR.start name=friday-777 settings=profile duration=60s filename=/tmp/friday-tools/recording-1234-777.jfr"
         );
+    }
+
+    #[test]
+    fn test_jfr_check_command_shape() {
+        let cmd = jfr_check_command("/tmp/jdk/bin/jcmd", 1234, "friday-777");
+        assert_eq!(cmd, "/tmp/jdk/bin/jcmd 1234 JFR.check name=friday-777");
+    }
+
+    #[test]
+    fn test_recording_check_passes_running_states() {
+        // JDK 11+ 典型输出
+        assert!(recording_check_passes(
+            "Recording 1: name=friday-777 duration=300s (running)\n",
+            ""
+        ));
+        // 大小写容错 + stderr 输出
+        assert!(recording_check_passes("", "Recording 1: name=x (RUNNING)\n"));
+    }
+
+    #[test]
+    fn test_recording_check_rejects_non_running() {
+        // 找不到录制（JFR.start 静默失败场景，issue #23 问题 2）
+        assert!(!recording_check_passes("Could not find recording with name friday-777\n", ""));
+        // 空输出
+        assert!(!recording_check_passes("", ""));
     }
 
     #[test]
